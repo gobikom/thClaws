@@ -4026,15 +4026,7 @@ impl Provider for NoopProvider {
 /// own auth). Mirrors `gui::kind_has_credentials` without the
 /// `#[cfg(feature = "gui")]` gate so the shared worker can call it.
 fn kind_has_credentials(kind: crate::providers::ProviderKind) -> bool {
-    use crate::providers::ProviderKind;
-    match kind {
-        ProviderKind::AgentSdk => true,
-        ProviderKind::Ollama | ProviderKind::OllamaAnthropic => true,
-        other => other
-            .api_key_env()
-            .map(|v| std::env::var(v).is_ok())
-            .unwrap_or(false),
-    }
+    crate::providers::kind_has_credentials(Some(kind))
 }
 
 /// Auto-compact at 80% of `agent.budget_tokens`. Cheap drop-oldest

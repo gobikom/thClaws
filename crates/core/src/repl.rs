@@ -5,6 +5,7 @@
 //! be smoke-tested manually by running the `thclaws` binary.
 
 use crate::agent::{Agent, AgentEvent};
+use rustyline::error::ReadlineError;
 use crate::config::{AppConfig, ProjectConfig};
 use crate::context::ProjectContext;
 use crate::error::{Error, Result};
@@ -32,6 +33,13 @@ const COLOR_BOLD: &str = "\x1b[1m";
 const COLOR_RED: &str = "\x1b[31m";
 
 const REPL_PROMPT: &str = "❯ ";
+
+#[derive(Debug)]
+enum ReadlineOutcome {
+    Line(String),
+    Eof,
+    TransientError,
+}
 
 fn readline_config() -> rustyline::Config {
     let builder = rustyline::Config::builder();
@@ -4829,6 +4837,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     // ── Normal interactive REPL ──────────────────────────────────────
     // Uses select! to race user input against team inbox messages so the
     // lead can respond to teammates without the user needing to press Enter.
+    let mut eof_retries: u8 = 0;
     loop {
         // Drain Cardputer reset notifications quietly — when the user
         // hits Backspace on the device we zero the session counter so
@@ -4885,9 +4894,16 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     if !trimmed.is_empty() {
                         let _ = rl.add_history_entry(&trimmed);
                     }
-                    Some(trimmed)
+                    ReadlineOutcome::Line(trimmed)
                 }
-                Err(_) => None, // EOF / Ctrl-C / error
+                Err(ReadlineError::Eof | ReadlineError::Interrupted) => ReadlineOutcome::Eof,
+                Err(
+                    ReadlineError::Io(_)
+                    | ReadlineError::Errno(_)
+                    | ReadlineError::WindowResized,
+                ) => ReadlineOutcome::TransientError,
+                #[allow(unreachable_patterns)]
+                Err(_) => ReadlineOutcome::TransientError,
             }
         });
 
@@ -4901,8 +4917,12 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             tokio::select! {
                 result = &mut readline_task => {
                     match result {
-                        Ok(Some(l)) => { line = l; break; }
-                        _ => {
+                        Ok(ReadlineOutcome::Line(l)) => {
+                            eof_retries = 0;
+                            line = l;
+                            break;
+                        }
+                        Ok(ReadlineOutcome::Eof) => {
                             // M6.35 HOOK2: fire session_end before tearing down.
                             crate::hooks::fire_session(
                                 &hooks_arc,
@@ -4914,6 +4934,29 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             crate::team::kill_my_teammates();
                             println!("{COLOR_DIM}bye{COLOR_RESET}");
                             return Ok(());
+                        }
+                        Ok(ReadlineOutcome::TransientError) | Err(_) => {
+                            eof_retries += 1;
+                            if eof_retries >= 3 {
+                                eprintln!(
+                                    "{COLOR_YELLOW}[session] stdin unavailable after 3 retries — exiting{COLOR_RESET}"
+                                );
+                                crate::hooks::fire_session(
+                                    &hooks_arc,
+                                    crate::hooks::HookEvent::SessionEnd,
+                                    &session.id,
+                                    &config.model,
+                                );
+                                crate::team::kill_my_teammates();
+                                println!("{COLOR_DIM}bye{COLOR_RESET}");
+                                return Ok(());
+                            }
+                            eprintln!(
+                                "{COLOR_YELLOW}[session] transient stdin error (attempt {eof_retries}/3) — retrying in 1s{COLOR_RESET}"
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            line = String::new();
+                            break;
                         }
                     }
                 }
@@ -8903,6 +8946,29 @@ mod tests {
         );
         #[cfg(not(windows))]
         assert_eq!(readline_config().behavior(), rustyline::Behavior::Stdio);
+    }
+
+    #[test]
+    fn readline_outcome_variants_are_distinct() {
+        let outcomes = [
+            ReadlineOutcome::Line("hello".into()),
+            ReadlineOutcome::Eof,
+            ReadlineOutcome::TransientError,
+        ];
+        let mut saw_line = false;
+        let mut saw_eof = false;
+        let mut saw_transient = false;
+        for o in &outcomes {
+            match o {
+                ReadlineOutcome::Line(s) => {
+                    assert_eq!(s, "hello");
+                    saw_line = true;
+                }
+                ReadlineOutcome::Eof => saw_eof = true,
+                ReadlineOutcome::TransientError => saw_transient = true,
+            }
+        }
+        assert!(saw_line && saw_eof && saw_transient);
     }
 
     #[test]

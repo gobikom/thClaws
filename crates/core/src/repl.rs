@@ -38,7 +38,7 @@ const REPL_PROMPT: &str = "❯ ";
 enum ReadlineOutcome {
     Line(String),
     Eof,
-    TransientError,
+    TransientError(String),
 }
 
 fn readline_config() -> rustyline::Config {
@@ -4897,13 +4897,13 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     ReadlineOutcome::Line(trimmed)
                 }
                 Err(ReadlineError::Eof | ReadlineError::Interrupted) => ReadlineOutcome::Eof,
-                Err(
-                    ReadlineError::Io(_)
+                Err(ref e @ (ReadlineError::Io(_)
                     | ReadlineError::Errno(_)
-                    | ReadlineError::WindowResized,
-                ) => ReadlineOutcome::TransientError,
+                    | ReadlineError::WindowResized)) => {
+                    ReadlineOutcome::TransientError(format!("{e}"))
+                }
                 #[allow(unreachable_patterns)]
-                Err(_) => ReadlineOutcome::TransientError,
+                Err(e) => ReadlineOutcome::TransientError(format!("{e}")),
             }
         });
 
@@ -4935,11 +4935,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             println!("{COLOR_DIM}bye{COLOR_RESET}");
                             return Ok(());
                         }
-                        Ok(ReadlineOutcome::TransientError) | Err(_) => {
+                        Ok(ReadlineOutcome::TransientError(ref reason)) => {
                             eof_retries += 1;
                             if eof_retries >= 3 {
                                 eprintln!(
-                                    "{COLOR_YELLOW}[session] stdin unavailable after 3 retries — exiting{COLOR_RESET}"
+                                    "{COLOR_YELLOW}[session] stdin unavailable after 3 retries ({reason}) — exiting{COLOR_RESET}"
                                 );
                                 crate::hooks::fire_session(
                                     &hooks_arc,
@@ -4952,8 +4952,31 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 return Ok(());
                             }
                             eprintln!(
-                                "{COLOR_YELLOW}[session] transient stdin error (attempt {eof_retries}/3) — retrying in 1s{COLOR_RESET}"
+                                "{COLOR_YELLOW}[session] transient stdin error (attempt {eof_retries}/3): {reason} — retrying in 1s{COLOR_RESET}"
                             );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            line = String::new();
+                            break;
+                        }
+                        Err(join_err) => {
+                            eprintln!(
+                                "{COLOR_YELLOW}[session] readline task failed: {join_err} — retrying{COLOR_RESET}"
+                            );
+                            eof_retries += 1;
+                            if eof_retries >= 3 {
+                                eprintln!(
+                                    "{COLOR_YELLOW}[session] readline task failing persistently — exiting{COLOR_RESET}"
+                                );
+                                crate::hooks::fire_session(
+                                    &hooks_arc,
+                                    crate::hooks::HookEvent::SessionEnd,
+                                    &session.id,
+                                    &config.model,
+                                );
+                                crate::team::kill_my_teammates();
+                                println!("{COLOR_DIM}bye{COLOR_RESET}");
+                                return Ok(());
+                            }
                             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                             line = String::new();
                             break;
@@ -8953,7 +8976,7 @@ mod tests {
         let outcomes = [
             ReadlineOutcome::Line("hello".into()),
             ReadlineOutcome::Eof,
-            ReadlineOutcome::TransientError,
+            ReadlineOutcome::TransientError("test EIO".into()),
         ];
         let mut saw_line = false;
         let mut saw_eof = false;
@@ -8965,7 +8988,10 @@ mod tests {
                     saw_line = true;
                 }
                 ReadlineOutcome::Eof => saw_eof = true,
-                ReadlineOutcome::TransientError => saw_transient = true,
+                ReadlineOutcome::TransientError(reason) => {
+                    assert!(!reason.is_empty());
+                    saw_transient = true;
+                }
             }
         }
         assert!(saw_line && saw_eof && saw_transient);

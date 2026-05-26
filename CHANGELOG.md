@@ -7,6 +7,118 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Telegram channels + forum-topic routing (Tier 2).** The bot can post
+  to a broadcast **channel**, and comments on those posts (which land in
+  the channel's linked **discussion group**) reach the agent. Supergroup
+  **forum topics** route to different agents: `channels[].topicRouting`
+  maps a topic id to an `agentId` (an AgentDef under `.thclaws/agents/`),
+  falling back to the channel's default agent. Replies go back into the
+  originating topic, with the "General" topic's `message_thread_id=1`
+  send quirk handled. A `getChatMember` admin-rights probe returns a
+  clear error when the bot isn't an admin that can post. Per-topic
+  multi-agent routing is honoured by headless `thclaws --telegram`; the
+  GUI runs its single shared session.
+- **Telegram streaming preview edits (Tier 3.1).** Opt-in via
+  `streamPreview` in the Telegram config: instead of one reply at the end
+  of a turn, post a placeholder and **edit it in place** as the agent
+  generates (rate-limited to avoid Telegram's same-message edit
+  throttling), then swap in the final formatted reply. Headless-only for
+  now.
+
+## [0.19.0] — 2026-05-25
+
+Telegram bot adapter — chat with your local thClaws agent from Telegram.
+
+### Added
+
+- **Telegram bot adapter (Tier 1).** Create a bot with `@BotFather`,
+  connect it from the desktop (Settings → **Telegram Connect**) or run it
+  headless with `thclaws --telegram`, and DM your local agent from
+  anywhere. The agent and all its tools stay on your machine; Telegram is
+  only the chat surface, and there is **no relay** — thClaws talks to the
+  Bot API directly via long-polling (works behind NAT).
+
+  - DM + basic group support; pairing-code onboarding (the owner approves
+    new users from the GUI); HTML-formatted replies chunked to Telegram's
+    4096-character message limit.
+  - Tool calls that need approval surface as **inline-keyboard buttons**
+    (Allow / Always / Deny) via a new `telegramgated` permission mode —
+    approve `Bash`/`Edit`/`Write` from your phone.
+  - `thclaws telegram status | pair` CLI; env-first token
+    (`TELEGRAM_BOT_TOKEN`), `TELEGRAM_OWNER_ID` for instant headless
+    allowlisting.
+  - Docs: new Chapter 23 in the EN + TH user manuals and
+    `telegram-bridge.md` in the technical manual.
+
+### Fixed
+
+- **Agent SDK: avoid `ARG_MAX` on large system prompts**
+  ([#124](https://github.com/thClaws/thClaws/pull/124),
+  [@gobikom](https://github.com/gobikom)). The Agent SDK provider passed
+  the assembled system prompt as a single `--system-prompt` CLI argument;
+  with MCP tools + CLAUDE.md + skills + memory + KMS it can exceed Linux's
+  128 KB `MAX_ARG_STRLEN` → `spawn claude: Argument list too long`,
+  blocking `agent/claude-*` models in `--cli` when MCP servers are
+  registered. The prompt is now written to a temp file and passed via
+  `--system-prompt-file`.
+
+### Default model — no change
+
+Default stays `claude-sonnet-4-6`.
+
+## [0.18.0] — 2026-05-24
+
+One-shot schedules ("run once in 15 minutes / tomorrow at 9am"), plus
+two community fixes.
+
+### Added
+
+- **One-shot / relative-delay schedules**
+  ([#122](https://github.com/thClaws/thClaws/issues/122),
+  design by [@ultramcu](https://github.com/ultramcu)). Schedules can now
+  run **once** at a future time or after a relative delay, alongside the
+  existing recurring cron jobs:
+
+  ```sh
+  thclaws schedule add report --at "2026-05-24T15:30:00Z" --prompt "…"
+  thclaws schedule add check  --in 15m                    --prompt "…"
+  ```
+
+  `--in` accepts `s`/`m`/`h`/`d` (and a bare integer as seconds);
+  `--at` takes an RFC 3339 timestamp. Both are mutually exclusive with
+  `--cron`. A one-shot fires once, then auto-disables. **Catch-up by
+  design:** a fire time already in the past when the scheduler ticks
+  (e.g. the daemon was down over the slot) runs immediately rather than
+  being lost — the footgun of hand-writing a cron for a single minute,
+  where a missed slot silently waits a year. `schedule list` shows
+  `once@<time> (pending|fired)`; the new on-disk `runAt` field is
+  optional, so existing `schedules.json` files stay compatible.
+
+### Fixed
+
+- **Edit: reject an empty `old_string`**
+  ([#121](https://github.com/thClaws/thClaws/pull/121),
+  [@ultramcu](https://github.com/ultramcu)). An empty `old_string`
+  matches between every character, so with `replace_all` it would inject
+  the replacement throughout the file and corrupt it. The Edit tool now
+  rejects it up front.
+
+- **ChatGptCodex credentials detected from the auth file**
+  ([#123](https://github.com/thClaws/thClaws/pull/123),
+  [@gobikom](https://github.com/gobikom)). `kind_has_credentials()` only
+  probed env vars, but ChatGptCodex (ChatGPT subscription) authenticates
+  via a file-based OAuth token — so it was wrongly reported as having no
+  credentials, and interactive `--cli` / GUI / `--serve` triggered the
+  model-fallback path and overwrote `settings.json`. It now resolves the
+  Codex auth store (honoring token expiry), and the shared-session
+  worker delegates to the same canonical check so all surfaces agree.
+
+### Default model — no change
+
+Default stays `claude-sonnet-4-6`.
+
 ## [0.17.1] — 2026-05-24
 
 KMS + Files management in the GUI, a LINE reconnect fix, and a clearer

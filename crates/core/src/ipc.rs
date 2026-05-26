@@ -295,6 +295,9 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
             let entry = crate::schedule::Schedule {
                 id: id.clone(),
                 cron,
+                // GUI schedule-add is recurring-only for now; one-shot
+                // (--at/--in) is CLI-only until the modal mirrors it.
+                run_at: None,
                 cwd: std::path::PathBuf::from(cwd),
                 prompt,
                 model,
@@ -752,6 +755,90 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                 "ok": true,
             });
             (ctx.dispatch)(payload.to_string());
+        }
+
+        // ── Telegram bridge wiring (dev-plan/29 Tier 1) ────────────
+        // The GUI TelegramConnectModal hits these; the polling session
+        // itself lives on the worker so its cancel token sits on one
+        // tokio task (mirrors the LINE handlers above).
+        "telegram_status" => {
+            // Live status (pending pairings + counts) lives in the
+            // worker's in-memory handle — ask it to broadcast a fresh
+            // snapshot rather than reading disk. The worker answers with
+            // a disconnected payload when no session is active.
+            let _ = ctx.shared.input_tx.send(ShellInput::TelegramStatusRequest);
+        }
+        "telegram_connect" => {
+            let token = msg
+                .get("bot_token")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            // A blank token is only valid when TELEGRAM_BOT_TOKEN is set
+            // — let the worker's getMe be the final arbiter, but catch an
+            // obviously-malformed pasted token here for a fast error.
+            if !token.is_empty() {
+                if let Err(e) = crate::telegram::config::validate_token(&token) {
+                    let payload = serde_json::json!({
+                        "type": "telegram_connect_ack",
+                        "ok": false,
+                        "error": e.to_string(),
+                    });
+                    (ctx.dispatch)(payload.to_string());
+                    return true;
+                }
+            }
+            // Merge onto any existing on-disk config so we don't clobber
+            // allow_from / policy when the user re-pastes a token.
+            let mut cfg = crate::telegram::TelegramConfig::load()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            cfg.enabled = true;
+            if !token.is_empty() {
+                cfg.bot_token = Some(token);
+            }
+            if let Err(e) = cfg.save() {
+                let payload = serde_json::json!({
+                    "type": "telegram_connect_ack",
+                    "ok": false,
+                    "error": format!("save config: {e}"),
+                });
+                (ctx.dispatch)(payload.to_string());
+                return true;
+            }
+            let _ = ctx.shared.input_tx.send(ShellInput::TelegramConnect(cfg));
+            let payload = serde_json::json!({
+                "type": "telegram_connect_ack",
+                "ok": true,
+            });
+            (ctx.dispatch)(payload.to_string());
+        }
+        "telegram_disconnect" => {
+            let _ = ctx.shared.input_tx.send(ShellInput::TelegramDisconnect);
+            let payload = serde_json::json!({
+                "type": "telegram_disconnect_ack",
+                "ok": true,
+            });
+            (ctx.dispatch)(payload.to_string());
+        }
+        "telegram_pairing_approve" => {
+            if let Some(code) = msg.get("code").and_then(|v| v.as_str()) {
+                let _ = ctx
+                    .shared
+                    .input_tx
+                    .send(ShellInput::TelegramPairingApprove {
+                        code: code.to_string(),
+                    });
+            }
+        }
+        "telegram_pairing_reject" => {
+            if let Some(code) = msg.get("code").and_then(|v| v.as_str()) {
+                let _ = ctx.shared.input_tx.send(ShellInput::TelegramPairingReject {
+                    code: code.to_string(),
+                });
+            }
         }
 
         // ── Working directory (M6.36 SERVE9d — migrated from gui.rs) ─

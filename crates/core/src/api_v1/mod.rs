@@ -200,11 +200,18 @@ pub async fn spawn_loopback() -> std::io::Result<String> {
     }
 
     let bind = format!("{bind_host}:{port}");
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    // Advertise via 127.0.0.1 in the URL even when bound to 0.0.0.0 —
-    // in-process callers always want loopback, and the env var
-    // override is purely for in-from-the-container reach.
-    let url = format!("http://127.0.0.1:{port}");
+    let listener = match tokio::net::TcpListener::bind(&bind).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!(
+                "\x1b[33m[api_v1] loopback port {port} in use — falling back to OS-assigned port\x1b[0m"
+            );
+            tokio::net::TcpListener::bind(format!("{bind_host}:0")).await?
+        }
+        Err(e) => return Err(e),
+    };
+    let actual_port = listener.local_addr()?.port();
+    let url = format!("http://127.0.0.1:{actual_port}");
     let _ = LOOPBACK_URL.set(url.clone());
 
     let app = axum::Router::new().merge(router());

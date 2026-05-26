@@ -621,6 +621,7 @@ pub async fn dispatch(
                     crate::permissions::PermissionMode::Ask => "ask",
                     crate::permissions::PermissionMode::Plan => "plan",
                     crate::permissions::PermissionMode::LineGated => "linegated",
+                    crate::permissions::PermissionMode::TelegramGated => "telegramgated",
                 };
                 emit(
                     events_tx,

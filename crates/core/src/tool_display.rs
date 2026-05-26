@@ -2,6 +2,9 @@
 //! heartbeat text, and result summaries. Used by the REPL, team loops,
 //! shared-session worker, and event renderer to avoid divergent label logic.
 
+use regex::Regex;
+use serde_json::Value;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 // ── constants ──────────────────────────────────────────────────────
@@ -17,39 +20,63 @@ pub(crate) const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 
 // ── secret redaction ───────────────────────────────────────────────
 
-/// Secret patterns to redact from tool previews. Each tuple is
-/// `(prefix_to_match, replacement_text)`. The replacement must NOT
-/// contain the prefix itself, otherwise the `find()` loop re-matches
-/// forever.
-const SECRET_PATTERNS: &[(&str, &str)] = &[
-    ("token=", "<redacted>"),
-    ("api_key=", "<redacted>"),
-    ("apikey=", "<redacted>"),
-    ("password=", "<redacted>"),
-    ("secret=", "<redacted>"),
-    ("Bearer ", "<redacted>"),
-    ("Authorization: ", "<redacted>"),
-];
+struct RedactionPattern {
+    regex: Regex,
+    replacement: &'static str,
+}
+
+static REDACTION_PATTERNS: OnceLock<Vec<RedactionPattern>> = OnceLock::new();
+
+fn redaction_patterns() -> &'static [RedactionPattern] {
+    REDACTION_PATTERNS.get_or_init(|| {
+        vec![
+            RedactionPattern {
+                regex: Regex::new(r"(?i)\b(authorization\s*:\s*bearer\s+)[^\s;&]+").unwrap(),
+                replacement: "${1}<redacted>",
+            },
+            RedactionPattern {
+                regex: Regex::new(r"(?i)\b(bearer\s+)[^\s;&]+").unwrap(),
+                replacement: "${1}<redacted>",
+            },
+            RedactionPattern {
+                regex: Regex::new(
+                    r"(?i)(--(?:api-key|api_key|token|password|secret)(?:=|\s+))[^\s;&]+",
+                )
+                .unwrap(),
+                replacement: "${1}<redacted>",
+            },
+            RedactionPattern {
+                regex: Regex::new(r"(?i)\b(api[_-]?key|apikey|token|password|secret)=([^\s;&]+)")
+                    .unwrap(),
+                replacement: "${1}=<redacted>",
+            },
+        ]
+    })
+}
 
 /// Redact known secret patterns from `s`. Case-sensitive to avoid
 /// false positives on words like "secretary". Advances past each
 /// replacement to prevent infinite loops.
 fn redact_secrets(s: &str) -> String {
     let mut out = s.to_string();
-    for (pat, repl) in SECRET_PATTERNS {
-        let mut search_from = 0;
-        while let Some(pos) = out[search_from..].find(pat) {
-            let abs_pos = search_from + pos;
-            let val_start = abs_pos + pat.len();
-            let val_end = out[val_start..]
-                .find(|c: char| c == ' ' || c == '&' || c == ';' || c == '\n')
-                .map_or(out.len(), |i| val_start + i);
-            out.replace_range(abs_pos..val_end, repl);
-            // Advance past the replacement so we don't re-match it.
-            search_from = abs_pos + repl.len();
-        }
+    for pat in redaction_patterns() {
+        out = pat.regex.replace_all(&out, pat.replacement).into_owned();
     }
     out
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub(crate) fn redact_json_value(value: &Value) -> Value {
+    match value {
+        Value::String(s) => Value::String(redact_secrets(s)),
+        Value::Array(items) => Value::Array(items.iter().map(redact_json_value).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact_json_value(v)))
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
 }
 
 // ── sanitization ───────────────────────────────────────────────────
@@ -73,6 +100,10 @@ fn truncate(s: &str, cap: usize) -> String {
     }
 }
 
+fn preview(s: &str, cap: usize) -> String {
+    truncate(&sanitize_label_field(&redact_secrets(s)), cap)
+}
+
 // ── label building ─────────────────────────────────────────────────
 
 /// Build a compact tool label suitable for inline display.
@@ -89,39 +120,39 @@ pub(crate) fn tool_label(name: &str, input: &serde_json::Value) -> String {
         "Bash" => input
             .get("command")
             .and_then(|v| v.as_str())
-            .map(|c| truncate(&sanitize_label_field(&redact_secrets(c)), PREVIEW_CAP)),
+            .map(|c| preview(c, PREVIEW_CAP)),
         "Read" | "Write" | "Edit" => input
             .get("path")
             .and_then(|v| v.as_str())
-            .map(|p| p.to_string()),
+            .map(|p| preview(p, PREVIEW_CAP)),
         "Glob" => input
             .get("pattern")
             .and_then(|v| v.as_str())
-            .map(|p| truncate(p, PREVIEW_CAP)),
+            .map(|p| preview(p, PREVIEW_CAP)),
         "Grep" => input
             .get("pattern")
             .and_then(|v| v.as_str())
-            .map(|p| truncate(p, PREVIEW_CAP)),
+            .map(|p| preview(p, PREVIEW_CAP)),
         "WebFetch" => input
             .get("url")
             .and_then(|v| v.as_str())
-            .map(|u| truncate(u, 60)),
+            .map(|u| preview(u, 60)),
         "WebSearch" => input
             .get("query")
             .and_then(|v| v.as_str())
-            .map(|q| truncate(&sanitize_label_field(q), PREVIEW_CAP)),
+            .map(|q| preview(q, PREVIEW_CAP)),
         "Skill" => input
             .get("name")
             .and_then(|v| v.as_str())
-            .map(|n| n.to_string()),
+            .map(|n| preview(n, PREVIEW_CAP)),
         "Task" => input
             .get("agent")
             .and_then(|v| v.as_str())
-            .map(|a| format!("agent={a}")),
+            .map(|a| format!("agent={}", preview(a, PREVIEW_CAP))),
         "AskUserQuestion" => input
             .get("question")
             .and_then(|v| v.as_str())
-            .map(|q| truncate(&sanitize_label_field(q), PREVIEW_CAP)),
+            .map(|q| preview(q, PREVIEW_CAP)),
         _ => None,
     };
 
@@ -189,6 +220,9 @@ impl ActiveToolDisplay {
         if since_start < HEARTBEAT_FIRST_AFTER {
             return false;
         }
+        if self.last_heartbeat_at == self.started_at {
+            return true;
+        }
         since_last >= HEARTBEAT_EVERY
     }
 }
@@ -219,6 +253,8 @@ pub(crate) fn next_heartbeat_delay(
             let elapsed = td.started_at.elapsed();
             if elapsed < HEARTBEAT_FIRST_AFTER {
                 HEARTBEAT_FIRST_AFTER - elapsed
+            } else if td.last_heartbeat_at == td.started_at {
+                Duration::ZERO
             } else {
                 let since_last = td.last_heartbeat_at.elapsed();
                 if since_last >= HEARTBEAT_EVERY {
@@ -308,23 +344,67 @@ mod tests {
     #[test]
     fn redact_token() {
         let result = redact_secrets("curl -H token=abc123 https://api.example.com");
-        assert!(result.contains("<redacted>"));
+        assert!(result.contains("token=<redacted>"));
         assert!(!result.contains("abc123"));
     }
 
     #[test]
     fn redact_bearer() {
         let result = redact_secrets("Authorization: Bearer sk-12345");
-        assert!(result.contains("<redacted>"));
+        assert!(result.contains("Authorization: Bearer <redacted>"));
         assert!(!result.contains("sk-12345"));
     }
 
     #[test]
     fn redact_api_key() {
         let result = redact_secrets("api_key=deadbeef123&other=val");
-        assert!(result.contains("<redacted>"));
+        assert!(result.contains("api_key=<redacted>"));
         assert!(!result.contains("deadbeef"));
         assert!(result.contains("&other=val"));
+    }
+
+    #[test]
+    fn redact_case_insensitive_and_cli_flags() {
+        let result = redact_secrets("TOKEN=abc --token def --api-key=ghi authorization:bearer jkl");
+        assert!(result.contains("TOKEN=<redacted>"));
+        assert!(result.contains("--token <redacted>"));
+        assert!(result.contains("--api-key=<redacted>"));
+        assert!(result.contains("authorization:bearer <redacted>"));
+        assert!(!result.contains("abc"));
+        assert!(!result.contains("def"));
+        assert!(!result.contains("ghi"));
+        assert!(!result.contains("jkl"));
+    }
+
+    #[test]
+    fn labels_redact_non_bash_fields() {
+        let web = tool_label(
+            "WebFetch",
+            &json!({"url": "https://example.com/?token=abc"}),
+        );
+        let grep = tool_label("Grep", &json!({"pattern": "API_KEY=secret"}));
+        let question = tool_label(
+            "AskUserQuestion",
+            &json!({"question": "Use Authorization: Bearer sk-123?"}),
+        );
+        assert!(web.contains("token=<redacted>"));
+        assert!(grep.contains("API_KEY=<redacted>"));
+        assert!(question.contains("Bearer <redacted>"));
+        assert!(!web.contains("abc"));
+        assert!(!grep.contains("secret"));
+        assert!(!question.contains("sk-123"));
+    }
+
+    #[test]
+    fn redact_json_value_redacts_nested_strings() {
+        let redacted = redact_json_value(&json!({
+            "command": "curl -H 'Authorization: Bearer sk-123'",
+            "nested": { "url": "https://example.com/?token=abc" },
+            "todos": [{ "content": "normal task", "status": "pending" }]
+        }));
+        assert_eq!(redacted["todos"][0]["content"], "normal task");
+        assert!(!redacted.to_string().contains("sk-123"));
+        assert!(!redacted.to_string().contains("token=abc"));
     }
 
     #[test]
@@ -365,6 +445,39 @@ mod tests {
     fn active_tool_heartbeat_not_due_immediately() {
         let td = ActiveToolDisplay::new("test".to_string());
         assert!(!td.heartbeat_due());
+    }
+
+    #[test]
+    fn active_tool_first_heartbeat_due_after_first_interval() {
+        let mut td = ActiveToolDisplay::new("test".to_string());
+        let start = std::time::Instant::now() - HEARTBEAT_FIRST_AFTER;
+        td.started_at = start;
+        td.last_heartbeat_at = start;
+        assert!(td.heartbeat_due());
+    }
+
+    #[test]
+    fn active_tool_second_heartbeat_waits_for_repeat_interval() {
+        let mut td = ActiveToolDisplay::new("test".to_string());
+        td.started_at = std::time::Instant::now() - HEARTBEAT_FIRST_AFTER - Duration::from_secs(1);
+        td.last_heartbeat_at = std::time::Instant::now();
+        assert!(!td.heartbeat_due());
+        td.last_heartbeat_at = std::time::Instant::now() - HEARTBEAT_EVERY;
+        assert!(td.heartbeat_due());
+    }
+
+    #[test]
+    fn next_heartbeat_delay_handles_empty_and_due() {
+        let empty = std::collections::HashMap::new();
+        assert_eq!(next_heartbeat_delay(&empty), HEARTBEAT_EVERY);
+
+        let mut active = std::collections::HashMap::new();
+        let mut td = ActiveToolDisplay::new("test".to_string());
+        let start = std::time::Instant::now() - HEARTBEAT_FIRST_AFTER;
+        td.started_at = start;
+        td.last_heartbeat_at = start;
+        active.insert("1".to_string(), td);
+        assert_eq!(next_heartbeat_delay(&active), Duration::ZERO);
     }
 
     #[test]

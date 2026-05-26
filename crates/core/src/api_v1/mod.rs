@@ -74,12 +74,12 @@ pub fn router() -> Router {
 ///     not per-request).
 ///   - `THCLAWS_API_TOKEN=<value>` → request must carry
 ///     `Authorization: Bearer <value>` with constant-time match.
-/// Inserted by the loopback listener middleware to bypass token auth.
+pub struct AuthOk;
+
+/// Marker inserted by the loopback router layer to bypass token auth.
 /// Only the loopback router carries this — the `--serve` router does not.
 #[derive(Clone)]
 struct LoopbackBypass;
-
-pub struct AuthOk;
 
 impl<S: Send + Sync> FromRequestParts<S> for AuthOk {
     type Rejection = Response;
@@ -174,10 +174,11 @@ pub const LOOPBACK_BIND_ENV: &str = "THCLAWS_LOOPBACK_BIND";
 /// Out-of-process MCP servers relying on a fixed port must read the
 /// returned URL rather than assuming [`LOOPBACK_DEFAULT_PORT`].
 ///
-/// Auth is forced to `disable-auth` because the listener is
-/// loopback-only — the safety boundary is the bind address, not a
-/// bearer token an out-of-process MCP server would need to discover
-/// from us anyway.
+/// Auth bypass is handled via a per-request [`LoopbackBypass`]
+/// extension injected by the loopback router layer — the `--serve`
+/// router does NOT carry this extension, so its token check remains
+/// intact. The safety boundary is the bind address, not a bearer
+/// token an out-of-process MCP server would need to discover.
 ///
 /// Run once at startup. Logs the bound URL to stderr; returns it so the
 /// caller can stash it for in-process clients. Idempotent — a second
@@ -202,17 +203,34 @@ pub async fn spawn_loopback() -> std::io::Result<String> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
-    // Warn when bind_host is non-loopback — the listener runs with auth
-    // bypass (LoopbackBypass extension), so binding 0.0.0.0 exposes /v1
-    // to the network without authentication.
-    if let Ok(addr) = bind_host.parse::<std::net::IpAddr>() {
-        if !addr.is_loopback() {
+    // Reject non-loopback bind unless explicitly opted in — the
+    // listener runs with unconditional auth bypass (LoopbackBypass
+    // extension), so binding 0.0.0.0 exposes /v1 to the network.
+    match bind_host.parse::<std::net::IpAddr>() {
+        Ok(addr) if !addr.is_loopback() => {
+            if std::env::var("THCLAWS_LOOPBACK_INSECURE").as_deref() != Ok("1") {
+                eprintln!(
+                    "\x1b[31m[api_v1] REFUSED: loopback listener cannot bind {bind_host} (non-loopback) \
+                     — unauthenticated /v1 would be network-exposed. \
+                     Set THCLAWS_LOOPBACK_INSECURE=1 to override (Docker/WSL only).\x1b[0m"
+                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("loopback listener refuses non-loopback bind {bind_host} without THCLAWS_LOOPBACK_INSECURE=1"),
+                ));
+            }
             eprintln!(
-                "\x1b[31m[api_v1] WARNING: loopback listener binding to {bind_host} (non-loopback) \
-                 — /v1 API will be network-exposed without authentication. \
-                 Only safe behind a host firewall.\x1b[0m"
+                "\x1b[33m[api_v1] WARNING: loopback listener binding {bind_host} (non-loopback, THCLAWS_LOOPBACK_INSECURE=1) \
+                 — /v1 API network-exposed without authentication.\x1b[0m"
             );
         }
+        Err(_) => {
+            eprintln!(
+                "\x1b[33m[api_v1] WARNING: cannot parse THCLAWS_LOOPBACK_BIND='{bind_host}' as IP — \
+                 cannot verify loopback safety.\x1b[0m"
+            );
+        }
+        _ => {}
     }
 
     let bind = format!("{bind_host}:{port}");

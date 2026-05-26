@@ -4887,7 +4887,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 if let Some(td) = active_tools.get_mut(&id) {
                                     let hb = crate::tool_display::format_tool_heartbeat(&td.label, td.elapsed());
                                     println!("{COLOR_DIM}{hb}{COLOR_RESET}");
-                                    lead_log!("{COLOR_DIM}{hb}{COLOR_RESET}");
+                                    lead_log!("{COLOR_DIM}{hb}{COLOR_RESET}\n");
                                     let _ = std::io::stdout().flush();
                                     td.last_heartbeat_at = std::time::Instant::now();
                                 }
@@ -8834,7 +8834,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         if let Some(td) = active_tools.get_mut(&id) {
                             let hb = crate::tool_display::format_tool_heartbeat(&td.label, td.elapsed());
                             println!("{COLOR_DIM}{hb}{COLOR_RESET}");
-                            lead_log!("{COLOR_DIM}{hb}{COLOR_RESET}");
+                            lead_log!("{COLOR_DIM}{hb}{COLOR_RESET}\n");
                             let _ = std::io::stdout().flush();
                             td.last_heartbeat_at = std::time::Instant::now();
                         }

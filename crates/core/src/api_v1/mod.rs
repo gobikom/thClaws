@@ -74,12 +74,20 @@ pub fn router() -> Router {
 ///     not per-request).
 ///   - `THCLAWS_API_TOKEN=<value>` → request must carry
 ///     `Authorization: Bearer <value>` with constant-time match.
+/// Inserted by the loopback listener middleware to bypass token auth.
+/// Only the loopback router carries this — the `--serve` router does not.
+#[derive(Clone)]
+struct LoopbackBypass;
+
 pub struct AuthOk;
 
 impl<S: Send + Sync> FromRequestParts<S> for AuthOk {
     type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if parts.extensions.get::<LoopbackBypass>().is_some() {
+            return Ok(AuthOk);
+        }
         let expected = match auth_token() {
             AuthMode::Disabled => {
                 return Err((StatusCode::NOT_FOUND, "api disabled").into_response());
@@ -194,15 +202,17 @@ pub async fn spawn_loopback() -> std::io::Result<String> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string());
 
-    // Force disable-auth so out-of-process clients on the same host
-    // (HTTP-transport MCP servers, host scripts) don't need to learn a
-    // per-process bearer token to reach our /v1 surface. Safety is
-    // anchored to the loopback bind, not the token.
-    if std::env::var("THCLAWS_API_TOKEN")
-        .map(|v| v != "disable-auth")
-        .unwrap_or(true)
-    {
-        std::env::set_var("THCLAWS_API_TOKEN", "disable-auth");
+    // Warn when bind_host is non-loopback — the listener runs with auth
+    // bypass (LoopbackBypass extension), so binding 0.0.0.0 exposes /v1
+    // to the network without authentication.
+    if let Ok(addr) = bind_host.parse::<std::net::IpAddr>() {
+        if !addr.is_loopback() {
+            eprintln!(
+                "\x1b[31m[api_v1] WARNING: loopback listener binding to {bind_host} (non-loopback) \
+                 — /v1 API will be network-exposed without authentication. \
+                 Only safe behind a host firewall.\x1b[0m"
+            );
+        }
     }
 
     let bind = format!("{bind_host}:{port}");
@@ -235,7 +245,12 @@ pub async fn spawn_loopback() -> std::io::Result<String> {
     let url = format!("http://127.0.0.1:{actual_port}");
     let _ = LOOPBACK_URL.set(url.clone());
 
-    let app = axum::Router::new().merge(router());
+    // Auth bypass via extension — only this loopback router carries
+    // LoopbackBypass. The --serve router does NOT, so its token stays
+    // intact. No global env mutation needed.
+    let app = axum::Router::new()
+        .merge(router())
+        .layer(axum::Extension(LoopbackBypass));
     tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
             eprintln!("\x1b[33m[api_v1 loopback] serve error: {e}\x1b[0m");

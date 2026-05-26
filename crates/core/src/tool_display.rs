@@ -54,9 +54,9 @@ fn redaction_patterns() -> &'static [RedactionPattern] {
     })
 }
 
-/// Redact known secret patterns from `s`. Case-sensitive to avoid
-/// false positives on words like "secretary". Advances past each
-/// replacement to prevent infinite loops.
+/// Redact known secret patterns from `s`. Patterns are intentionally
+/// key-shaped and case-insensitive so common environment and CLI flag
+/// variants are covered without matching ordinary words.
 fn redact_secrets(s: &str) -> String {
     let mut out = s.to_string();
     for pat in redaction_patterns() {

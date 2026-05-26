@@ -160,18 +160,24 @@ pub const LOOPBACK_BIND_ENV: &str = "THCLAWS_LOOPBACK_BIND";
 
 /// Bind the always-on loopback `/v1/*` listener. Resolves the port
 /// from `$THCLAWS_LOOPBACK_PORT` or falls back to
-/// [`LOOPBACK_DEFAULT_PORT`]. Auth is forced to `disable-auth` because
-/// the listener is loopback-only — the safety boundary is the bind
-/// address, not a bearer token an out-of-process MCP server would need
-/// to discover from us anyway.
+/// [`LOOPBACK_DEFAULT_PORT`]. If that port is already in use
+/// (`EADDRINUSE`), falls back to an OS-assigned port (`:0`) so a
+/// second instance on the same host still gets a working bridge.
+/// Out-of-process MCP servers relying on a fixed port must read the
+/// returned URL rather than assuming [`LOOPBACK_DEFAULT_PORT`].
+///
+/// Auth is forced to `disable-auth` because the listener is
+/// loopback-only — the safety boundary is the bind address, not a
+/// bearer token an out-of-process MCP server would need to discover
+/// from us anyway.
 ///
 /// Run once at startup. Logs the bound URL to stderr; returns it so the
 /// caller can stash it for in-process clients. Idempotent — a second
 /// call is a no-op and returns the existing URL.
 ///
-/// Errors are surfaced for the caller to log+ignore: a failed bind
-/// (port collision) should NOT abort startup, because MCP-Apps widgets
-/// that don't need the bridge keep working without it.
+/// Non-`EADDRINUSE` bind errors are surfaced for the caller to
+/// log+ignore: MCP-Apps widgets that don't need the bridge keep
+/// working without it.
 pub async fn spawn_loopback() -> std::io::Result<String> {
     use std::sync::OnceLock;
     static LOOPBACK_URL: OnceLock<String> = OnceLock::new();
@@ -204,13 +210,28 @@ pub async fn spawn_loopback() -> std::io::Result<String> {
         Ok(l) => l,
         Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
             eprintln!(
-                "\x1b[33m[api_v1] loopback port {port} in use — falling back to OS-assigned port\x1b[0m"
+                "\x1b[33m[api_v1] {bind} in use — falling back to OS-assigned port\x1b[0m"
             );
-            tokio::net::TcpListener::bind(format!("{bind_host}:0")).await?
+            let fallback = format!("{bind_host}:0");
+            match tokio::net::TcpListener::bind(&fallback).await {
+                Ok(l) => l,
+                Err(e2) => {
+                    eprintln!(
+                        "\x1b[31m[api_v1] port-0 fallback also failed: {e2} — loopback listener disabled\x1b[0m"
+                    );
+                    return Err(e2);
+                }
+            }
         }
         Err(e) => return Err(e),
     };
-    let actual_port = listener.local_addr()?.port();
+    // Advertise via 127.0.0.1 in the URL even when bound to 0.0.0.0 —
+    // in-process callers always want loopback, and the LOOPBACK_BIND_ENV
+    // override is purely for in-from-the-container reach.
+    let actual_port = listener
+        .local_addr()
+        .expect("bound socket must have a local address")
+        .port();
     let url = format!("http://127.0.0.1:{actual_port}");
     let _ = LOOPBACK_URL.set(url.clone());
 

@@ -8851,7 +8851,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         hud_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         hud_interval.tick().await; // consume immediate first tick
         loop {
-            let anim_delay = if is_connecting || is_thinking_after_tool || !active_tools.is_empty()
+            let anim_delay = if !hud.is_enabled() && (is_connecting || is_thinking_after_tool || !active_tools.is_empty())
             {
                 crate::tool_display::SPINNER_INTERVAL
             } else {

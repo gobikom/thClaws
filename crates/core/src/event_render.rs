@@ -87,6 +87,8 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         })
         .to_string()],
         ViewEvent::TurnDone => vec![serde_json::json!({"type": "chat_done"}).to_string()],
+        // HUD is terminal-only; chat renderer ignores it.
+        ViewEvent::HudTick(_) => vec![],
         ViewEvent::HistoryReplaced(messages) => {
             let arr: Vec<serde_json::Value> = messages
                 .iter()
@@ -429,6 +431,14 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
             Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
         }
         ViewEvent::TurnDone => None,
+        ViewEvent::HudTick(line) => {
+            if line.is_empty() {
+                // Clear the HUD line when turn finishes or is cancelled.
+                Some("\r\x1b[2K".into())
+            } else {
+                Some(format!("\r\x1b[2K\x1b[2m{line}\x1b[0m"))
+            }
+        }
         ViewEvent::HistoryReplaced(messages) => {
             let mut out = String::from("\x1b[3J\x1b[2J\x1b[H");
             for (i, m) in messages.iter().enumerate() {
@@ -690,5 +700,37 @@ mod chat_render_tests {
             !stripped.contains("\r\n\r\n> first prompt"),
             "first user prompt should not have a leading blank line; got: {stripped:?}"
         );
+    }
+
+    #[test]
+    fn hud_tick_non_empty_renders_dim_ansi_line() {
+        let mut state = TerminalRenderState::default();
+        let out = render_terminal_ansi(
+            &mut state,
+            &ViewEvent::HudTick("⏱ 5s · thinking".into()),
+        )
+        .expect("non-empty HudTick should produce output");
+        assert!(
+            out.starts_with("\r\x1b[2K"),
+            "must start with carriage-return + erase-line; got: {out:?}"
+        );
+        assert!(out.contains("5s · thinking"), "must contain the hud content");
+        assert!(out.contains("\x1b[2m"), "must apply dim styling");
+    }
+
+    #[test]
+    fn hud_tick_empty_clears_line_only() {
+        let mut state = TerminalRenderState::default();
+        let out = render_terminal_ansi(&mut state, &ViewEvent::HudTick(String::new()))
+            .expect("empty HudTick should produce clear-escape output");
+        assert_eq!(out, "\r\x1b[2K");
+    }
+
+    #[test]
+    fn hud_tick_ignored_by_chat_renderer() {
+        let dispatches = render_chat_dispatches(&ViewEvent::HudTick("⏱ 3s · Bash 1s".into()));
+        assert!(dispatches.is_empty(), "chat renderer must ignore HudTick");
+        let dispatches_empty = render_chat_dispatches(&ViewEvent::HudTick(String::new()));
+        assert!(dispatches_empty.is_empty());
     }
 }

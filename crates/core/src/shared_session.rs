@@ -270,6 +270,11 @@ pub enum ViewEvent {
     },
     SlashOutput(String),
     TurnDone,
+    /// Lightweight in-place HUD status line. Emitted every
+    /// `THCLAWS_HUD_INTERVAL` seconds during a turn by [`drive_turn_stream`].
+    /// Terminal renderer overwrites the current line with `\r\x1b[2K`; chat
+    /// renderer ignores this event. Empty string means "clear the HUD line".
+    HudTick(String),
     HistoryReplaced(Vec<DisplayMessage>),
     SessionListRefresh(String),
     /// Sidebar provider/model update — carries a pre-built JSON
@@ -3646,6 +3651,13 @@ async fn drive_turn_stream(
     // produces zero tool calls during this turn, the next /loop /goal
     // continue firing gets suppressed once.
     state.last_turn_made_tool_calls = false;
+    let mut hud = crate::session_hud::HudState::new();
+    hud.on_turn_start();
+    let hud_secs = crate::session_hud::HudState::interval_secs();
+    let mut hud_interval =
+        tokio::time::interval(std::time::Duration::from_secs(hud_secs));
+    hud_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    hud_interval.tick().await; // consume immediate first tick
     loop {
         // M6.17 BUG H1: race the next stream event against the cancel
         // signal so a long tool run / stalled provider stream doesn't
@@ -3655,6 +3667,9 @@ async fn drive_turn_stream(
         let ev = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
+                if hud.is_enabled() {
+                    let _ = events_tx.send(ViewEvent::HudTick(String::new()));
+                }
                 let _ = events_tx.send(ViewEvent::ErrorText("(interrupted)".into()));
                 write_lead_log(&state.lead_log, "\x1b[0m\n\x1b[33m[cancelled]\x1b[0m\n");
                 save_history(&state.agent, &mut state.session, &state.session_store);
@@ -3667,6 +3682,11 @@ async fn drive_turn_stream(
                 return;
             }
             ev = stream.next() => ev,
+            _ = hud_interval.tick(), if hud.is_enabled() && hud.is_active() => {
+                let line = hud.render_line();
+                let _ = events_tx.send(ViewEvent::HudTick(line));
+                continue;
+            }
         };
         let Some(ev) = ev else { break };
         match ev {
@@ -3688,6 +3708,7 @@ async fn drive_turn_stream(
             Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
                 state.last_turn_made_tool_calls = true;
                 let label = crate::tool_display::tool_label(&name, &input);
+                hud.on_tool_start(&label);
                 write_lead_log(
                     &state.lead_log,
                     &format!("\x1b[0m\n\x1b[90m[tool: {label}]\x1b[0m "),
@@ -3700,6 +3721,7 @@ async fn drive_turn_stream(
                 ui_resource,
                 ..
             }) => {
+                hud.on_tool_done();
                 let out = output.unwrap_or_else(|e| e);
                 write_lead_log(&state.lead_log, "\x1b[90m✓\x1b[0m\n\x1b[32m");
                 let _ = events_tx.send(ViewEvent::ToolCallResult {
@@ -3709,6 +3731,10 @@ async fn drive_turn_stream(
                 });
             }
             Ok(AgentEvent::Done { usage, .. }) => {
+                hud.on_turn_done();
+                if hud.is_enabled() {
+                    let _ = events_tx.send(ViewEvent::HudTick(String::new()));
+                }
                 write_lead_log(&state.lead_log, "\x1b[0m\n");
                 let _ = lead_mb.write_status("lead", "active", None);
                 // Record token usage for /usage (parity with the CLI
@@ -3767,6 +3793,11 @@ async fn drive_turn_stream(
                 )));
                 let _ = events_tx.send(ViewEvent::TurnDone);
             }
+            Ok(AgentEvent::ToolCallDenied { .. }) => {
+                // Clear HUD ToolRunning phase — the denied call will never
+                // produce a ToolCallResult, so we must return to Thinking here.
+                hud.on_tool_done();
+            }
             Err(e) => {
                 write_lead_log(
                     &state.lead_log,
@@ -3774,10 +3805,19 @@ async fn drive_turn_stream(
                 );
                 let _ = lead_mb.write_status("lead", "active", None);
                 let _ = events_tx.send(ViewEvent::ErrorText(format!("Error: {e}")));
+                hud.on_turn_done();
+                if hud.is_enabled() {
+                    let _ = events_tx.send(ViewEvent::HudTick(String::new()));
+                }
                 let _ = events_tx.send(ViewEvent::TurnDone);
             }
             _ => {}
         }
+    }
+    // H4: clear residual HUD if stream ended without AgentEvent::Done
+    // (provider disconnect, stream truncation).
+    if hud.is_active() && hud.is_enabled() {
+        let _ = events_tx.send(ViewEvent::HudTick(String::new()));
     }
 
     // Stalled-turn detector (M4.4). After every agent turn that ended

@@ -701,4 +701,36 @@ mod chat_render_tests {
             "first user prompt should not have a leading blank line; got: {stripped:?}"
         );
     }
+
+    #[test]
+    fn hud_tick_non_empty_renders_dim_ansi_line() {
+        let mut state = TerminalRenderState::default();
+        let out = render_terminal_ansi(
+            &mut state,
+            &ViewEvent::HudTick("⏱ 5s · thinking".into()),
+        )
+        .expect("non-empty HudTick should produce output");
+        assert!(
+            out.starts_with("\r\x1b[2K"),
+            "must start with carriage-return + erase-line; got: {out:?}"
+        );
+        assert!(out.contains("5s · thinking"), "must contain the hud content");
+        assert!(out.contains("\x1b[2m"), "must apply dim styling");
+    }
+
+    #[test]
+    fn hud_tick_empty_clears_line_only() {
+        let mut state = TerminalRenderState::default();
+        let out = render_terminal_ansi(&mut state, &ViewEvent::HudTick(String::new()))
+            .expect("empty HudTick should produce clear-escape output");
+        assert_eq!(out, "\r\x1b[2K");
+    }
+
+    #[test]
+    fn hud_tick_ignored_by_chat_renderer() {
+        let dispatches = render_chat_dispatches(&ViewEvent::HudTick("⏱ 3s · Bash 1s".into()));
+        assert!(dispatches.is_empty(), "chat renderer must ignore HudTick");
+        let dispatches_empty = render_chat_dispatches(&ViewEvent::HudTick(String::new()));
+        assert!(dispatches_empty.is_empty());
+    }
 }

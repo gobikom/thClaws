@@ -3793,6 +3793,11 @@ async fn drive_turn_stream(
                 )));
                 let _ = events_tx.send(ViewEvent::TurnDone);
             }
+            Ok(AgentEvent::ToolCallDenied { .. }) => {
+                // Clear HUD ToolRunning phase — the denied call will never
+                // produce a ToolCallResult, so we must return to Thinking here.
+                hud.on_tool_done();
+            }
             Err(e) => {
                 write_lead_log(
                     &state.lead_log,

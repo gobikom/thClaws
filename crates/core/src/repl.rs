@@ -8860,7 +8860,12 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             let ev = tokio::select! {
                 ev = stream.next() => ev,
                 _ = tokio::signal::ctrl_c() => {
+                    hud.on_turn_done();
                     print!("{}", crate::tool_display::clear_thinking_line());
+                    if hud.is_enabled() {
+                        print!("\r\x1b[2K");
+                        let _ = std::io::stdout().flush();
+                    }
                     _cancelled = true;
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}[cancelled by Ctrl-C]{COLOR_RESET}");
                     drop(stream);
@@ -9014,6 +9019,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     let _ = std::io::stdout().flush();
                 }
                 Ok(AgentEvent::ToolCallDenied { id, name, .. }) => {
+                    hud.on_tool_done();
                     let td = active_tools.remove(&id);
                     let dur_str = td
                         .as_ref()
@@ -9040,6 +9046,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     match kind {
                         ProgressKind::Thinking => {}
                         ProgressKind::ToolStart { id, label } => {
+                            hud.on_tool_start(&label);
                             if is_connecting || is_thinking_after_tool {
                                 is_connecting = false;
                                 is_thinking_after_tool = false;
@@ -9065,6 +9072,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             label,
                             is_error,
                         } => {
+                            hud.on_tool_done();
                             let td = active_tools.remove(&id);
                             let dur = td.as_ref().map(|t| t.elapsed()).unwrap_or_default();
                             print!(
@@ -9176,11 +9184,22 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    hud.on_turn_done();
+                    if hud.is_enabled() {
+                        print!("\r\x1b[2K");
+                        let _ = std::io::stdout().flush();
+                    }
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}");
                     lead_log!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}\n");
                     break;
                 }
             }
+        }
+        // H4: clear any residual HUD line if the stream ended without AgentEvent::Done
+        // (provider disconnect, stream truncation).
+        if hud.is_active() && hud.is_enabled() {
+            print!("\r\x1b[2K");
+            let _ = std::io::stdout().flush();
         }
     }
 

@@ -79,6 +79,7 @@ pub mod secrets;
 #[cfg(feature = "gui")]
 pub mod server;
 pub mod session;
+pub mod session_hud;
 #[cfg(feature = "gui")]
 pub mod shared_session;
 pub mod shell_bang;

@@ -87,6 +87,8 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
         })
         .to_string()],
         ViewEvent::TurnDone => vec![serde_json::json!({"type": "chat_done"}).to_string()],
+        // HUD is terminal-only; chat renderer ignores it.
+        ViewEvent::HudTick(_) => vec![],
         ViewEvent::HistoryReplaced(messages) => {
             let arr: Vec<serde_json::Value> = messages
                 .iter()
@@ -429,6 +431,14 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
             Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
         }
         ViewEvent::TurnDone => None,
+        ViewEvent::HudTick(line) => {
+            if line.is_empty() {
+                // Clear the HUD line when turn finishes or is cancelled.
+                Some("\r\x1b[2K".into())
+            } else {
+                Some(format!("\r\x1b[2K\x1b[2m{line}\x1b[0m"))
+            }
+        }
         ViewEvent::HistoryReplaced(messages) => {
             let mut out = String::from("\x1b[3J\x1b[2J\x1b[H");
             for (i, m) in messages.iter().enumerate() {

@@ -8845,14 +8845,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         let mut is_thinking_after_tool = false;
         let mut hud = crate::session_hud::HudState::new();
         hud.on_turn_start();
-        let hud_secs = crate::session_hud::HudState::interval_secs();
-        let mut hud_interval =
-            tokio::time::interval(std::time::Duration::from_secs(hud_secs));
-        hud_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        hud_interval.tick().await; // consume immediate first tick
+        hud.set_session_cost(session_cost_usd);
         loop {
-            let anim_delay = if !hud.is_enabled() && (is_connecting || is_thinking_after_tool || !active_tools.is_empty())
-            {
+            let anim_delay = if hud.is_enabled() && hud.is_active() {
+                crate::tool_display::SPINNER_INTERVAL
+            } else if is_connecting || is_thinking_after_tool || !active_tools.is_empty() {
                 crate::tool_display::SPINNER_INTERVAL
             } else {
                 std::time::Duration::from_secs(300)
@@ -8861,11 +8858,8 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 ev = stream.next() => ev,
                 _ = tokio::signal::ctrl_c() => {
                     hud.on_turn_done();
-                    print!("{}", crate::tool_display::clear_thinking_line());
-                    if hud.is_enabled() {
-                        print!("\r\x1b[2K");
-                        let _ = std::io::stdout().flush();
-                    }
+                    print!("\r\x1b[2K");
+                    let _ = std::io::stdout().flush();
                     _cancelled = true;
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}[cancelled by Ctrl-C]{COLOR_RESET}");
                     drop(stream);
@@ -8873,7 +8867,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 _ = tokio::time::sleep(anim_delay) => {
                     spinner_tick += 1;
-                    if is_connecting {
+                    if hud.is_enabled() && hud.is_active() {
+                        hud.tick();
+                        let line = hud.render_line();
+                        if !line.is_empty() {
+                            print!("\r\x1b[2K{line}");
+                            let _ = std::io::stdout().flush();
+                        }
+                    } else if is_connecting {
                         let elapsed = turn_start.elapsed();
                         print!("{}", crate::tool_display::format_thinking_spinner(elapsed, spinner_tick));
                         let _ = std::io::stdout().flush();
@@ -8888,14 +8889,6 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     } else if is_thinking_after_tool {
                         let elapsed = turn_start.elapsed();
                         print!("{}", crate::tool_display::format_thinking_spinner(elapsed, spinner_tick));
-                        let _ = std::io::stdout().flush();
-                    }
-                    continue;
-                }
-                _ = hud_interval.tick(), if hud.is_enabled() && hud.is_active() => {
-                    let line = hud.render_line();
-                    if !line.is_empty() {
-                        print!("\r\x1b[2K\x1b[2m{line}\x1b[0m");
                         let _ = std::io::stdout().flush();
                     }
                     continue;
@@ -9108,10 +9101,9 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         print!("{}", crate::tool_display::clear_thinking_line());
                         is_thinking_after_tool = false;
                         is_connecting = false;
-                    } else if hud.is_enabled() {
-                        // Clear any HUD line that may be on the current row.
-                        print!("\r\x1b[2K");
                     }
+                    // Always clear the in-place status line (HUD or spinner).
+                    print!("\r\x1b[2K");
                     print!("{COLOR_RESET}");
                     if let Some(reason) = stop_reason {
                         if reason == "max_iterations" {
@@ -9145,6 +9137,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     if let Some(c) = catalogue.compute_cost_usd(&config.model, &token_usage) {
                         session_cost_usd += c;
                     }
+                    hud.set_session_cost(session_cost_usd);
                     // Push the running total to the Cardputer display.
                     // Send fails silently when no device is paired —
                     // we don't want a missing buddy to disrupt the REPL.

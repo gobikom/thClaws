@@ -3653,9 +3653,9 @@ async fn drive_turn_stream(
     state.last_turn_made_tool_calls = false;
     let mut hud = crate::session_hud::HudState::new();
     hud.on_turn_start();
-    let hud_secs = crate::session_hud::HudState::interval_secs();
+    hud.set_session_cost(state.session_cost_usd);
     let mut hud_interval =
-        tokio::time::interval(std::time::Duration::from_secs(hud_secs));
+        tokio::time::interval(std::time::Duration::from_secs(2));
     hud_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     hud_interval.tick().await; // consume immediate first tick
     loop {
@@ -3683,6 +3683,7 @@ async fn drive_turn_stream(
             }
             ev = stream.next() => ev,
             _ = hud_interval.tick(), if hud.is_enabled() && hud.is_active() => {
+                hud.tick();
                 let line = hud.render_line();
                 let _ = events_tx.send(ViewEvent::HudTick(line));
                 continue;
@@ -3768,6 +3769,7 @@ async fn drive_turn_stream(
                 if let Some(c) = catalogue.compute_cost_usd(&state.config.model, &token_usage) {
                     state.session_cost_usd += c;
                 }
+                hud.set_session_cost(state.session_cost_usd);
                 #[cfg(feature = "cost_bridge")]
                 if let Some(ref bridge) = state.cost_bridge {
                     let _ = bridge.tx_cost.send(state.session_cost_usd);

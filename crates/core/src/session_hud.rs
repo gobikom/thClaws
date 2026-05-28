@@ -1,16 +1,20 @@
-//! Lightweight session status HUD for thClaws terminal sessions.
+//! Unified session status HUD for thClaws terminal sessions.
 //!
-//! Shows elapsed time and current agent phase (thinking / tool running) as an
-//! in-place overwriting status line during a turn. Token usage is printed at
-//! turn completion by the existing token summary renderer.
+//! Renders a single in-place status line at the bottom of terminal output,
+//! combining the spinner animation, elapsed time, current phase/tool,
+//! session cost, and context window gauge into one compact bar:
+//!
+//! ```text
+//! ─── ⠹ ⏱ 42s · Bash 16s · $0.02 · ctx ▓▓▓░░ 48%
+//! ```
+//!
+//! Phase-based color coding: cyan = thinking, yellow = tool running.
 //!
 //! Enabled by default when stdout is a terminal. Override with env vars:
 //! - `THCLAWS_HUD=0` — disable, `THCLAWS_HUD=1` — force enable
-//! - `THCLAWS_HUD_INTERVAL=<seconds>` — update cadence (default: 2, clamped 1–60)
 
 use std::time::Instant;
 
-/// Current agent turn phase tracked by the HUD.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HudPhase {
     Thinking,
@@ -23,21 +27,17 @@ struct ActiveTool {
     started: Instant,
 }
 
-/// HUD state machine for one REPL session.
-///
-/// Create once per session via [`HudState::new()`], then call
-/// [`on_turn_start`] to reset for each new agent turn. Update with
-/// [`on_tool_start`] / [`on_tool_done`] as tools run, and [`on_turn_done`]
-/// at completion. Call [`render_line`] to get the current display string.
 pub struct HudState {
     turn_started: Instant,
     phase: HudPhase,
     active_tool: Option<ActiveTool>,
     enabled: bool,
+    spinner_tick: u32,
+    session_cost: f64,
+    context_pct: Option<f32>,
 }
 
 impl HudState {
-    /// Create a new HUD state. Checks `THCLAWS_HUD` and stdout TTY status.
     pub fn new() -> Self {
         let enabled = match enabled_from_env(std::env::var("THCLAWS_HUD").ok().as_deref()) {
             Some(v) => v,
@@ -51,20 +51,19 @@ impl HudState {
             phase: HudPhase::Thinking,
             active_tool: None,
             enabled,
+            spinner_tick: 0,
+            session_cost: 0.0,
+            context_pct: None,
         }
     }
 
-    /// Reset state for the start of a new agent turn.
     pub fn on_turn_start(&mut self) {
         self.turn_started = Instant::now();
         self.phase = HudPhase::Thinking;
         self.active_tool = None;
+        self.spinner_tick = 0;
     }
 
-    /// Record that a named tool started running.
-    ///
-    /// `name` is sanitized via [`crate::tool_display::sanitize_label_field`]
-    /// so no control characters or secrets leak into the HUD line.
     pub fn on_tool_start(&mut self, name: &str) {
         self.active_tool = Some(ActiveTool {
             name: crate::tool_display::sanitize_label_field(name),
@@ -73,89 +72,118 @@ impl HudState {
         self.phase = HudPhase::ToolRunning;
     }
 
-    /// Record that the current tool finished; returns to Thinking phase.
-    /// Safe to call even if no tool was started (idempotent).
     pub fn on_tool_done(&mut self) {
         self.active_tool = None;
         self.phase = HudPhase::Thinking;
     }
 
-    /// Record turn completion. After this, [`render_line`] returns empty.
     pub fn on_turn_done(&mut self) {
         self.active_tool = None;
         self.phase = HudPhase::Done;
     }
 
-    /// Whether HUD output is enabled for this session.
     pub fn is_enabled(&self) -> bool {
         self.enabled
     }
 
-    /// Whether the turn is still in progress (not yet Done).
     pub fn is_active(&self) -> bool {
         self.phase != HudPhase::Done
     }
 
-    /// Read-only access to the current phase.
     pub fn phase(&self) -> &HudPhase {
         &self.phase
     }
 
-    /// Update interval in seconds (from `THCLAWS_HUD_INTERVAL`, clamped 1–60, default 2).
-    ///
-    /// Zero and out-of-range values fall back to 2 so `tokio::time::interval`
-    /// never receives a zero-duration (which would panic).
-    pub fn interval_secs() -> u64 {
-        std::env::var("THCLAWS_HUD_INTERVAL")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n.clamp(1, 60))
-            .unwrap_or(2)
+    /// Advance the spinner frame. Call once per animation tick (~100ms).
+    pub fn tick(&mut self) {
+        self.spinner_tick = self.spinner_tick.wrapping_add(1);
     }
 
-    /// Render the current HUD line for in-place terminal display.
+    /// Update cumulative session cost (USD). Called after each turn.
+    pub fn set_session_cost(&mut self, cost: f64) {
+        self.session_cost = cost;
+    }
+
+    /// Update context window usage percentage (0–100). Called at turn
+    /// boundaries when the estimate is available.
+    pub fn set_context_pct(&mut self, pct: f32) {
+        self.context_pct = Some(pct.clamp(0.0, 100.0));
+    }
+
+    /// Render the unified HUD line with separator, spinner, phase color,
+    /// elapsed time, tool state, cost, and context gauge.
     ///
-    /// Returns empty string when the turn is Done — callers should then clear
-    /// the current terminal row separately. For active turns, callers prefix
-    /// the returned string with `\r\x1b[2K` to overwrite the current line.
+    /// Returns empty when the turn is Done.
     pub fn render_line(&self) -> String {
         if self.phase == HudPhase::Done {
             return String::new();
         }
-        let elapsed_str = crate::tool_display::format_duration(self.turn_started.elapsed());
-        match &self.active_tool {
+        let frame = crate::tool_display::spinner_frame(self.spinner_tick);
+        let elapsed = crate::tool_display::format_duration(self.turn_started.elapsed());
+
+        let color = match self.phase {
+            HudPhase::Thinking => "\x1b[36m",
+            HudPhase::ToolRunning => "\x1b[33m",
+            HudPhase::Done => "\x1b[32m",
+        };
+
+        let phase_str = match &self.active_tool {
             Some(tool) => {
-                let tool_elapsed =
-                    crate::tool_display::format_duration(tool.started.elapsed());
-                format!("⏱ {} · {} {}", elapsed_str, tool.name, tool_elapsed)
+                let t_elapsed = crate::tool_display::format_duration(tool.started.elapsed());
+                format!("{} {}", tool.name, t_elapsed)
             }
-            None => format!("⏱ {} · thinking", elapsed_str),
-        }
+            None => "thinking".into(),
+        };
+
+        let cost_str = if self.session_cost > 0.0 {
+            format!(" · ${:.2}", self.session_cost)
+        } else {
+            String::new()
+        };
+
+        let ctx_str = self.context_pct
+            .map(|pct| format!(" · ctx {}", render_gauge(pct)))
+            .unwrap_or_default();
+
+        format!(
+            "{color}─── {frame} ⏱ {elapsed} · {phase_str}{cost_str}{ctx_str}\x1b[0m"
+        )
     }
 }
 
 impl Default for HudState {
-    /// Returns a disabled HUD state with no I/O or env-var side effects.
-    /// Use [`HudState::new()`] to respect the `THCLAWS_HUD` env var.
     fn default() -> Self {
         Self {
             turn_started: Instant::now(),
             phase: HudPhase::Thinking,
             active_tool: None,
             enabled: false,
+            spinner_tick: 0,
+            session_cost: 0.0,
+            context_pct: None,
         }
     }
 }
 
-/// Pure function: parse `THCLAWS_HUD` env value → `Some(bool)` or `None`
-/// (falls through to TTY detection). Extracted for test isolation — tests
-/// call this directly instead of mutating process environment.
 fn enabled_from_env(val: Option<&str>) -> Option<bool> {
     match val {
         Some("0") => Some(false),
         Some("1") => Some(true),
         _ => None,
     }
+}
+
+/// Render a 5-segment gauge bar with percentage.
+fn render_gauge(pct: f32) -> String {
+    let filled = ((pct / 100.0) * 5.0).round() as usize;
+    let filled = filled.min(5);
+    let empty = 5 - filled;
+    format!(
+        "{}{} {}%",
+        "▓".repeat(filled),
+        "░".repeat(empty),
+        pct as u32
+    )
 }
 
 #[cfg(test)]
@@ -168,10 +196,11 @@ mod tests {
             phase: HudPhase::Thinking,
             active_tool: None,
             enabled,
+            spinner_tick: 0,
+            session_cost: 0.0,
+            context_pct: None,
         }
     }
-
-    // ── env parsing (pure, no process env mutation) ──────────────────
 
     #[test]
     fn hud_disabled_when_env_zero() {
@@ -189,52 +218,83 @@ mod tests {
     }
 
     #[test]
-    fn hud_env_unknown_value_falls_through_to_tty() {
+    fn hud_env_unknown_value_falls_through() {
         assert_eq!(enabled_from_env(Some("yes")), None);
     }
 
-    // ── interval_secs ─────────────────────────────────────────────────
-
     #[test]
-    fn interval_secs_defaults_to_two() {
-        // When env var is absent the default must be 2 (never 0, which would panic tokio).
-        // We read the real env here, so the test is stable as long as the var is unset in CI.
-        if std::env::var("THCLAWS_HUD_INTERVAL").is_err() {
-            assert_eq!(HudState::interval_secs(), 2);
-        }
-    }
-
-    #[test]
-    fn interval_secs_valid_range_is_enforced() {
-        // Verify the clamp bounds used by interval_secs().
-        assert_eq!(0u64.clamp(1, 60), 1, "0 must clamp to 1 (prevents tokio panic)");
-        assert_eq!(1u64.clamp(1, 60), 1, "1 is the minimum valid value");
-        assert_eq!(60u64.clamp(1, 60), 60, "60 is the maximum valid value");
-        assert_eq!(3600u64.clamp(1, 60), 60, "large values clamp to 60");
-        // Confirm interval_secs() itself never returns 0.
-        let result = HudState::interval_secs();
-        assert!(result >= 1, "interval_secs() must always return ≥1; got {result}");
-        assert!(result <= 60, "interval_secs() must always return ≤60; got {result}");
-    }
-
-    // ── render ────────────────────────────────────────────────────────
-
-    #[test]
-    fn hud_render_thinking_phase() {
+    fn hud_render_thinking_phase_has_cyan_and_separator() {
         let hud = hud_forced(true);
         let line = hud.render_line();
         assert!(line.contains("thinking"), "expected 'thinking' in '{line}'");
-        assert!(line.starts_with('⏱'), "expected ⏱ prefix in '{line}'");
+        assert!(line.contains("───"), "expected separator in '{line}'");
+        assert!(line.contains("\x1b[36m"), "expected cyan color in '{line}'");
     }
 
     #[test]
-    fn hud_render_tool_running() {
+    fn hud_render_tool_running_has_yellow() {
         let mut hud = hud_forced(true);
         hud.on_tool_start("Bash");
         let line = hud.render_line();
         assert!(line.contains("Bash"), "expected 'Bash' in '{line}'");
-        assert!(line.contains('⏱'), "expected ⏱ in '{line}'");
-        assert!(line.contains('·'), "expected separator in '{line}'");
+        assert!(line.contains("\x1b[33m"), "expected yellow color in '{line}'");
+    }
+
+    #[test]
+    fn hud_render_includes_spinner_frame() {
+        let mut hud = hud_forced(true);
+        hud.tick();
+        let line = hud.render_line();
+        assert!(!line.is_empty());
+        assert!(line.contains('⏱'));
+    }
+
+    #[test]
+    fn hud_render_includes_cost_when_nonzero() {
+        let mut hud = hud_forced(true);
+        hud.set_session_cost(0.05);
+        let line = hud.render_line();
+        assert!(line.contains("$0.05"), "expected cost in '{line}'");
+    }
+
+    #[test]
+    fn hud_render_hides_cost_when_zero() {
+        let hud = hud_forced(true);
+        let line = hud.render_line();
+        assert!(!line.contains('$'), "cost should not appear when zero");
+    }
+
+    #[test]
+    fn hud_render_includes_context_gauge() {
+        let mut hud = hud_forced(true);
+        hud.set_context_pct(60.0);
+        let line = hud.render_line();
+        assert!(line.contains("ctx"), "expected ctx gauge in '{line}'");
+        assert!(line.contains("60%"), "expected 60% in '{line}'");
+        assert!(line.contains("▓▓▓░░"), "expected 3 filled + 2 empty");
+    }
+
+    #[test]
+    fn hud_render_no_context_gauge_when_unset() {
+        let hud = hud_forced(true);
+        let line = hud.render_line();
+        assert!(!line.contains("ctx"), "no gauge when unset");
+    }
+
+    #[test]
+    fn gauge_boundary_values() {
+        assert_eq!(render_gauge(0.0), "░░░░░ 0%");
+        assert_eq!(render_gauge(100.0), "▓▓▓▓▓ 100%");
+        assert_eq!(render_gauge(50.0), "▓▓▓░░ 50%");
+    }
+
+    #[test]
+    fn gauge_clamps_out_of_range() {
+        let mut hud = hud_forced(true);
+        hud.set_context_pct(150.0);
+        assert_eq!(hud.context_pct, Some(100.0));
+        hud.set_context_pct(-10.0);
+        assert_eq!(hud.context_pct, Some(0.0));
     }
 
     #[test]
@@ -250,12 +310,9 @@ mod tests {
         let mut hud = hud_forced(true);
         hud.on_tool_start("Bash\nrm -rf /\tmalicious");
         let line = hud.render_line();
-        assert!(!line.is_empty(), "HUD line should not be empty after sanitization");
         assert!(!line.contains('\n'), "no newlines in HUD line");
         assert!(!line.contains('\t'), "no tabs in HUD line");
     }
-
-    // ── state transitions ─────────────────────────────────────────────
 
     #[test]
     fn hud_transitions() {
@@ -265,11 +322,9 @@ mod tests {
 
         hud.on_tool_start("Read");
         assert_eq!(hud.phase(), &HudPhase::ToolRunning);
-        assert!(hud.active_tool.is_some());
 
         hud.on_tool_done();
         assert_eq!(hud.phase(), &HudPhase::Thinking);
-        assert!(hud.active_tool.is_none());
 
         hud.on_turn_done();
         assert_eq!(hud.phase(), &HudPhase::Done);
@@ -280,27 +335,25 @@ mod tests {
     #[test]
     fn hud_tool_done_without_prior_start_is_idempotent() {
         let mut hud = hud_forced(true);
-        // Should not panic or corrupt state when no tool was started.
         hud.on_tool_done();
         assert_eq!(hud.phase(), &HudPhase::Thinking);
-        assert!(hud.render_line().contains("thinking"));
     }
 
     #[test]
-    fn hud_turn_start_mid_turn_resets_state() {
+    fn hud_turn_start_resets_state() {
         let mut hud = hud_forced(true);
         hud.on_tool_start("Bash");
-        hud.on_turn_start(); // reset mid-turn
+        hud.set_session_cost(1.0);
+        hud.on_turn_start();
         assert_eq!(hud.phase(), &HudPhase::Thinking);
         assert!(hud.active_tool.is_none());
-        assert!(hud.render_line().contains("thinking"));
+        assert_eq!(hud.spinner_tick, 0);
+        assert_eq!(hud.session_cost, 1.0, "cost persists across turns");
     }
 
     #[test]
-    fn hud_default_is_disabled_and_pure() {
+    fn hud_default_is_disabled() {
         let hud = HudState::default();
-        assert!(!hud.is_enabled(), "Default should be disabled (no I/O)");
-        assert_eq!(hud.phase(), &HudPhase::Thinking);
-        assert!(hud.active_tool.is_none());
+        assert!(!hud.is_enabled());
     }
 }

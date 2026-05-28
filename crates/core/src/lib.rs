@@ -78,6 +78,7 @@ pub mod sdk_mcp;
 pub mod secrets;
 #[cfg(feature = "gui")]
 pub mod server;
+pub mod session_hud;
 pub mod session;
 #[cfg(feature = "gui")]
 pub mod shared_session;

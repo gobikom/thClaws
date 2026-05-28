@@ -86,6 +86,7 @@ pub fn render_chat_dispatches(ev: &ViewEvent) -> Vec<String> {
             "text": strip_ansi(text),
         })
         .to_string()],
+        ViewEvent::HudTick(_) => vec![],
         ViewEvent::TurnDone => vec![serde_json::json!({"type": "chat_done"}).to_string()],
         ViewEvent::HistoryReplaced(messages) => {
             let arr: Vec<serde_json::Value> = messages
@@ -428,6 +429,13 @@ pub fn render_terminal_ansi(state: &mut TerminalRenderState, ev: &ViewEvent) -> 
             let body = text.replace('\n', "\r\n");
             Some(format!("\x1b[2m{body}\x1b[0m\r\n"))
         }
+        ViewEvent::HudTick(line) => {
+            if line.is_empty() {
+                Some("\r\x1b[2K".into())
+            } else {
+                Some(format!("\r\x1b[2K{line}"))
+            }
+        }
         ViewEvent::TurnDone => None,
         ViewEvent::HistoryReplaced(messages) => {
             let mut out = String::from("\x1b[3J\x1b[2J\x1b[H");
@@ -690,5 +698,31 @@ mod chat_render_tests {
             !stripped.contains("\r\n\r\n> first prompt"),
             "first user prompt should not have a leading blank line; got: {stripped:?}"
         );
+    }
+
+    #[test]
+    fn hud_tick_non_empty_renders_line() {
+        let mut state = TerminalRenderState::default();
+        let out = render_terminal_ansi(
+            &mut state,
+            &ViewEvent::HudTick("─── ⠹ ⏱ 5s · thinking".into()),
+        )
+        .expect("non-empty HudTick should produce output");
+        assert!(out.starts_with("\r\x1b[2K"));
+        assert!(out.contains("thinking"));
+    }
+
+    #[test]
+    fn hud_tick_empty_clears_line() {
+        let mut state = TerminalRenderState::default();
+        let out = render_terminal_ansi(&mut state, &ViewEvent::HudTick(String::new()))
+            .expect("empty HudTick should produce clear-escape");
+        assert_eq!(out, "\r\x1b[2K");
+    }
+
+    #[test]
+    fn hud_tick_ignored_by_chat_renderer() {
+        let dispatches = render_chat_dispatches(&ViewEvent::HudTick("─── ⠹ ⏱ 3s".into()));
+        assert!(dispatches.is_empty());
     }
 }

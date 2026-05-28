@@ -8843,8 +8843,13 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         let mut spinner_tick: u32 = 0;
         let mut is_connecting = true;
         let mut is_thinking_after_tool = false;
+        let mut hud = crate::session_hud::HudState::new();
+        hud.on_turn_start();
+        hud.set_session_cost(session_cost_usd);
         loop {
-            let anim_delay = if is_connecting || is_thinking_after_tool || !active_tools.is_empty()
+            let anim_delay = if hud.is_enabled() && hud.is_active() {
+                crate::tool_display::SPINNER_INTERVAL
+            } else if is_connecting || is_thinking_after_tool || !active_tools.is_empty()
             {
                 crate::tool_display::SPINNER_INTERVAL
             } else {
@@ -8853,7 +8858,13 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             let ev = tokio::select! {
                 ev = stream.next() => ev,
                 _ = tokio::signal::ctrl_c() => {
-                    print!("{}", crate::tool_display::clear_thinking_line());
+                    hud.on_turn_done();
+                    if hud.is_enabled() {
+                        print!("\r\x1b[2K");
+                    } else {
+                        print!("{}", crate::tool_display::clear_thinking_line());
+                    }
+                    let _ = std::io::stdout().flush();
                     _cancelled = true;
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}[cancelled by Ctrl-C]{COLOR_RESET}");
                     drop(stream);
@@ -8861,7 +8872,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 _ = tokio::time::sleep(anim_delay) => {
                     spinner_tick += 1;
-                    if is_connecting {
+                    if hud.is_enabled() && hud.is_active() {
+                        hud.tick();
+                        let line = hud.render_line();
+                        if !line.is_empty() {
+                            print!("\r\x1b[2K{line}");
+                            let _ = std::io::stdout().flush();
+                        }
+                    } else if is_connecting {
                         let elapsed = turn_start.elapsed();
                         print!("{}", crate::tool_display::format_thinking_spinner(elapsed, spinner_tick));
                         let _ = std::io::stdout().flush();
@@ -8892,7 +8910,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             );
             if (is_connecting || is_thinking_after_tool) && is_content_event {
                 if !matches!(&ev, Ok(AgentEvent::ToolCallStart { .. })) {
-                    print!("{}", crate::tool_display::clear_thinking_line());
+                    if hud.is_enabled() {
+                        print!("\r\x1b[2K");
+                    } else {
+                        print!("{}", crate::tool_display::clear_thinking_line());
+                    }
                     print!("{COLOR_RESET}");
                     let _ = std::io::stdout().flush();
                 }
@@ -8927,18 +8949,21 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }) => {
                     last_was_thinking = false;
                     let label = crate::tool_display::tool_label(&name, &input);
+                    hud.on_tool_start(&label);
                     active_tools.insert(
                         id,
                         crate::tool_display::ActiveToolDisplay::new(label.clone()),
                     );
-                    print!(
-                        "{}",
-                        crate::tool_display::format_tool_spinner(
-                            &label,
-                            std::time::Duration::ZERO,
-                            0
-                        )
-                    );
+                    if !hud.is_enabled() {
+                        print!(
+                            "{}",
+                            crate::tool_display::format_tool_spinner(
+                                &label,
+                                std::time::Duration::ZERO,
+                                0
+                            )
+                        );
+                    }
                     lead_log!("{COLOR_RESET}\n{COLOR_DIM}[tool: {label}]{COLOR_RESET}");
                     let _ = std::io::stdout().flush();
                 }
@@ -8985,24 +9010,32 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             lead_log!("{block}");
                         }
                     }
+                    hud.on_tool_done();
                     if active_tools.is_empty() {
                         is_thinking_after_tool = true;
                         spinner_tick = 0;
-                        print!(
-                            "{}",
-                            crate::tool_display::format_thinking_spinner(turn_start.elapsed(), 0)
-                        );
+                        if !hud.is_enabled() {
+                            print!(
+                                "{}",
+                                crate::tool_display::format_thinking_spinner(turn_start.elapsed(), 0)
+                            );
+                        }
                     }
                     print!("{COLOR_GREEN}");
                     let _ = std::io::stdout().flush();
                 }
                 Ok(AgentEvent::ToolCallDenied { id, name, .. }) => {
+                    hud.on_tool_done();
                     let td = active_tools.remove(&id);
                     let dur_str = td
                         .as_ref()
                         .map(|t| format!(" {}", crate::tool_display::format_duration(t.elapsed())))
                         .unwrap_or_default();
-                    print!("{}", crate::tool_display::clear_thinking_line());
+                    if hud.is_enabled() {
+                        print!("\r\x1b[2K");
+                    } else {
+                        print!("{}", crate::tool_display::clear_thinking_line());
+                    }
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}[denied: {name}{dur_str}]{COLOR_RESET}");
                     lead_log!(
                         "{COLOR_RESET}\n{COLOR_YELLOW}[denied: {name}{dur_str}]{COLOR_RESET}\n{COLOR_GREEN}"
@@ -9010,10 +9043,12 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     if active_tools.is_empty() {
                         is_thinking_after_tool = true;
                         spinner_tick = 0;
-                        print!(
-                            "{}",
-                            crate::tool_display::format_thinking_spinner(turn_start.elapsed(), 0)
-                        );
+                        if !hud.is_enabled() {
+                            print!(
+                                "{}",
+                                crate::tool_display::format_thinking_spinner(turn_start.elapsed(), 0)
+                            );
+                        }
                     }
                     print!("{COLOR_GREEN}");
                     let _ = std::io::stdout().flush();
@@ -9028,18 +9063,21 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 is_thinking_after_tool = false;
                                 spinner_tick = 0;
                             }
+                            hud.on_tool_start(&label);
                             active_tools.insert(
                                 id,
                                 crate::tool_display::ActiveToolDisplay::new(label.clone()),
                             );
-                            print!(
-                                "{}",
-                                crate::tool_display::format_tool_spinner(
-                                    &label,
-                                    std::time::Duration::ZERO,
-                                    0
-                                )
-                            );
+                            if !hud.is_enabled() {
+                                print!(
+                                    "{}",
+                                    crate::tool_display::format_tool_spinner(
+                                        &label,
+                                        std::time::Duration::ZERO,
+                                        0
+                                    )
+                                );
+                            }
                             lead_log!("{COLOR_RESET}\n{COLOR_DIM}[tool: {label}]{COLOR_RESET}");
                             let _ = std::io::stdout().flush();
                         }
@@ -9048,6 +9086,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             label,
                             is_error,
                         } => {
+                            hud.on_tool_done();
                             let td = active_tools.remove(&id);
                             let dur = td.as_ref().map(|t| t.elapsed()).unwrap_or_default();
                             print!(
@@ -9063,14 +9102,16 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             if active_tools.is_empty() {
                                 is_thinking_after_tool = true;
                                 spinner_tick = 0;
-                                print!(
-                                    "{}",
-                                    crate::tool_display::format_thinking_spinner(
-                                        turn_start.elapsed(),
-                                        0
-                                    )
-                                );
-                                let _ = std::io::stdout().flush();
+                                if !hud.is_enabled() {
+                                    print!(
+                                        "{}",
+                                        crate::tool_display::format_thinking_spinner(
+                                            turn_start.elapsed(),
+                                            0
+                                        )
+                                    );
+                                    let _ = std::io::stdout().flush();
+                                }
                             }
                             print!("{COLOR_GREEN}");
                             let _ = std::io::stdout().flush();
@@ -9078,12 +9119,15 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 Ok(AgentEvent::Done { stop_reason, usage }) => {
+                    hud.on_turn_done();
                     if is_thinking_after_tool || is_connecting {
-                        print!("{}", crate::tool_display::clear_thinking_line());
+                        if !hud.is_enabled() {
+                            print!("{}", crate::tool_display::clear_thinking_line());
+                        }
                         is_thinking_after_tool = false;
                         is_connecting = false;
                     }
-                    print!("{COLOR_RESET}");
+                    print!("\r\x1b[2K{COLOR_RESET}");
                     if let Some(reason) = stop_reason {
                         if reason == "max_iterations" {
                             println!("\n{COLOR_YELLOW}[hit max_iterations]{COLOR_RESET}");
@@ -9116,6 +9160,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     if let Some(c) = catalogue.compute_cost_usd(&config.model, &token_usage) {
                         session_cost_usd += c;
                     }
+                    hud.set_session_cost(session_cost_usd);
                     // Push the running total to the Cardputer display.
                     // Send fails silently when no device is paired —
                     // we don't want a missing buddy to disrupt the REPL.
@@ -9155,11 +9200,18 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    hud.on_turn_done();
+                    print!("\r\x1b[2K");
+                    let _ = std::io::stdout().flush();
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}");
                     lead_log!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}\n");
                     break;
                 }
             }
+        }
+        if hud.is_active() && hud.is_enabled() {
+            print!("\r\x1b[2K");
+            let _ = std::io::stdout().flush();
         }
     }
 

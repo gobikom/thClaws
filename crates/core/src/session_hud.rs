@@ -205,16 +205,16 @@ mod tests {
     }
 
     #[test]
-    fn interval_secs_clamps_zero_to_one() {
-        // 0 would panic tokio::time::interval — must clamp to ≥1.
-        assert_eq!(1u64.clamp(1, 60), 1);
-        // Direct test via the clamp logic: 0 maps to 0.clamp(1,60) = 1
-        assert_eq!(0u64.clamp(1, 60), 1);
-    }
-
-    #[test]
-    fn interval_secs_clamps_above_sixty() {
-        assert_eq!(3600u64.clamp(1, 60), 60);
+    fn interval_secs_valid_range_is_enforced() {
+        // Verify the clamp bounds used by interval_secs().
+        assert_eq!(0u64.clamp(1, 60), 1, "0 must clamp to 1 (prevents tokio panic)");
+        assert_eq!(1u64.clamp(1, 60), 1, "1 is the minimum valid value");
+        assert_eq!(60u64.clamp(1, 60), 60, "60 is the maximum valid value");
+        assert_eq!(3600u64.clamp(1, 60), 60, "large values clamp to 60");
+        // Confirm interval_secs() itself never returns 0.
+        let result = HudState::interval_secs();
+        assert!(result >= 1, "interval_secs() must always return ≥1; got {result}");
+        assert!(result <= 60, "interval_secs() must always return ≤60; got {result}");
     }
 
     // ── render ────────────────────────────────────────────────────────

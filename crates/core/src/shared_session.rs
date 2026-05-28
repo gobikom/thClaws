@@ -3805,10 +3805,19 @@ async fn drive_turn_stream(
                 );
                 let _ = lead_mb.write_status("lead", "active", None);
                 let _ = events_tx.send(ViewEvent::ErrorText(format!("Error: {e}")));
+                hud.on_turn_done();
+                if hud.is_enabled() {
+                    let _ = events_tx.send(ViewEvent::HudTick(String::new()));
+                }
                 let _ = events_tx.send(ViewEvent::TurnDone);
             }
             _ => {}
         }
+    }
+    // H4: clear residual HUD if stream ended without AgentEvent::Done
+    // (provider disconnect, stream truncation).
+    if hud.is_active() && hud.is_enabled() {
+        let _ = events_tx.send(ViewEvent::HudTick(String::new()));
     }
 
     // Stalled-turn detector (M4.4). After every agent turn that ended

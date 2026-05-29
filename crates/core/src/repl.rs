@@ -4793,6 +4793,8 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     // model catalogue after every AgentEvent::Done and shown alongside
     // the per-turn token counts. `/cost reset` zeroes it.
     let mut session_cost_usd: f64 = 0.0;
+    let mut hud = crate::session_hud::HudState::new();
+    let mut canvas = crate::session_hud::Canvas::new();
 
     // Cardputer cost-display bridge — best-effort BLE central that
     // streams `session_cost_usd` to a `thClaws-Cost-*` peripheral and
@@ -8843,17 +8845,22 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         let mut spinner_tick: u32 = 0;
         let mut is_connecting = true;
         let mut is_thinking_after_tool = false;
+        hud.on_turn_start();
+        hud.set_session_cost(session_cost_usd);
         loop {
             let anim_delay = if is_connecting || is_thinking_after_tool || !active_tools.is_empty()
             {
                 crate::tool_display::SPINNER_INTERVAL
+            } else if hud.is_active() {
+                std::time::Duration::from_secs(1)
             } else {
                 std::time::Duration::from_secs(300)
             };
             let ev = tokio::select! {
                 ev = stream.next() => ev,
                 _ = tokio::signal::ctrl_c() => {
-                    print!("{}", crate::tool_display::clear_thinking_line());
+                    hud.on_turn_done();
+                    canvas.clear();
                     _cancelled = true;
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}[cancelled by Ctrl-C]{COLOR_RESET}");
                     drop(stream);
@@ -8861,22 +8868,39 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 _ = tokio::time::sleep(anim_delay) => {
                     spinner_tick += 1;
-                    if is_connecting {
+                    let spinner_line = if is_connecting {
                         let elapsed = turn_start.elapsed();
-                        print!("{}", crate::tool_display::format_thinking_spinner(elapsed, spinner_tick));
-                        let _ = std::io::stdout().flush();
+                        Some(crate::tool_display::format_thinking_spinner(elapsed, spinner_tick))
                     } else if !active_tools.is_empty() {
                         if let Some(id) = active_tools.iter().min_by_key(|(_, td)| td.started_at).map(|(k, _)| k.clone()) {
-                            if let Some(td) = active_tools.get_mut(&id) {
-                                print!("{}", crate::tool_display::format_tool_spinner(&td.label, td.elapsed(), spinner_tick));
-                                let _ = std::io::stdout().flush();
+                            active_tools.get_mut(&id).map(|td| {
                                 td.last_heartbeat_at = std::time::Instant::now();
-                            }
+                                crate::tool_display::format_tool_spinner(&td.label, td.elapsed(), spinner_tick)
+                            })
+                        } else {
+                            None
                         }
                     } else if is_thinking_after_tool {
                         let elapsed = turn_start.elapsed();
-                        print!("{}", crate::tool_display::format_thinking_spinner(elapsed, spinner_tick));
-                        let _ = std::io::stdout().flush();
+                        Some(crate::tool_display::format_thinking_spinner(elapsed, spinner_tick))
+                    } else {
+                        None
+                    };
+                    // Render canvas: spinner (optional) + HUD (if active)
+                    let mut lines: Vec<&str> = Vec::new();
+                    let spinner_clean;
+                    if let Some(ref s) = spinner_line {
+                        spinner_clean = crate::session_hud::strip_line_clear(s);
+                        lines.push(spinner_clean);
+                    }
+                    let hud_line;
+                    if hud.is_active() {
+                        hud_line = hud.render_line();
+                        lines.push(&hud_line);
+                        hud.update_tmux_title();
+                    }
+                    if !lines.is_empty() {
+                        canvas.draw(&lines);
                     }
                     continue;
                 }
@@ -8892,7 +8916,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             );
             if (is_connecting || is_thinking_after_tool) && is_content_event {
                 if !matches!(&ev, Ok(AgentEvent::ToolCallStart { .. })) {
-                    print!("{}", crate::tool_display::clear_thinking_line());
+                    canvas.clear();
                     print!("{COLOR_RESET}");
                     let _ = std::io::stdout().flush();
                 }
@@ -8927,24 +8951,30 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }) => {
                     last_was_thinking = false;
                     let label = crate::tool_display::tool_label(&name, &input);
+                    hud.on_tool_start(&label);
                     active_tools.insert(
                         id,
                         crate::tool_display::ActiveToolDisplay::new(label.clone()),
                     );
-                    print!(
-                        "{}",
-                        crate::tool_display::format_tool_spinner(
-                            &label,
-                            std::time::Duration::ZERO,
-                            0
-                        )
-                    );
+                    {
+                        let s = crate::tool_display::format_tool_spinner(
+                            &label, std::time::Duration::ZERO, 0);
+                        let spinner_clean = crate::session_hud::strip_line_clear(&s);
+                        if hud.is_active() {
+                            let hud_line = hud.render_line();
+                            canvas.draw(&[spinner_clean, &hud_line]);
+                        } else {
+                            canvas.draw(&[spinner_clean]);
+                        }
+                    }
                     lead_log!("{COLOR_RESET}\n{COLOR_DIM}[tool: {label}]{COLOR_RESET}");
                     let _ = std::io::stdout().flush();
                 }
                 Ok(AgentEvent::ToolCallResult {
                     id, name, output, ..
                 }) => {
+                    hud.on_tool_done();
+                    canvas.clear();
                     let td = active_tools.remove(&id);
                     if td.is_none() {
                         eprintln!("{COLOR_DIM}[tool-display] result for '{name}' (id={id}) has no matching start{COLOR_RESET}");
@@ -8988,21 +9018,26 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     if active_tools.is_empty() {
                         is_thinking_after_tool = true;
                         spinner_tick = 0;
-                        print!(
-                            "{}",
-                            crate::tool_display::format_thinking_spinner(turn_start.elapsed(), 0)
-                        );
+                        let s = crate::tool_display::format_thinking_spinner(turn_start.elapsed(), 0);
+                        let sc = crate::session_hud::strip_line_clear(&s);
+                        if hud.is_active() {
+                            let hl = hud.render_line();
+                            canvas.draw(&[sc, &hl]);
+                        } else {
+                            canvas.draw(&[sc]);
+                        }
                     }
                     print!("{COLOR_GREEN}");
                     let _ = std::io::stdout().flush();
                 }
                 Ok(AgentEvent::ToolCallDenied { id, name, .. }) => {
+                    hud.on_tool_done();
+                    canvas.clear();
                     let td = active_tools.remove(&id);
                     let dur_str = td
                         .as_ref()
                         .map(|t| format!(" {}", crate::tool_display::format_duration(t.elapsed())))
                         .unwrap_or_default();
-                    print!("{}", crate::tool_display::clear_thinking_line());
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}[denied: {name}{dur_str}]{COLOR_RESET}");
                     lead_log!(
                         "{COLOR_RESET}\n{COLOR_YELLOW}[denied: {name}{dur_str}]{COLOR_RESET}\n{COLOR_GREEN}"
@@ -9010,10 +9045,14 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     if active_tools.is_empty() {
                         is_thinking_after_tool = true;
                         spinner_tick = 0;
-                        print!(
-                            "{}",
-                            crate::tool_display::format_thinking_spinner(turn_start.elapsed(), 0)
-                        );
+                        let s = crate::tool_display::format_thinking_spinner(turn_start.elapsed(), 0);
+                        let sc = crate::session_hud::strip_line_clear(&s);
+                        if hud.is_active() {
+                            let hl = hud.render_line();
+                            canvas.draw(&[sc, &hl]);
+                        } else {
+                            canvas.draw(&[sc]);
+                        }
                     }
                     print!("{COLOR_GREEN}");
                     let _ = std::io::stdout().flush();
@@ -9023,6 +9062,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     match kind {
                         ProgressKind::Thinking => {}
                         ProgressKind::ToolStart { id, label } => {
+                            hud.on_tool_start(&label);
                             if is_connecting || is_thinking_after_tool {
                                 is_connecting = false;
                                 is_thinking_after_tool = false;
@@ -9032,14 +9072,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 id,
                                 crate::tool_display::ActiveToolDisplay::new(label.clone()),
                             );
-                            print!(
-                                "{}",
-                                crate::tool_display::format_tool_spinner(
-                                    &label,
-                                    std::time::Duration::ZERO,
-                                    0
-                                )
-                            );
+                            {
+                                let s = crate::tool_display::format_tool_spinner(
+                                    &label, std::time::Duration::ZERO, 0);
+                                let sc = crate::session_hud::strip_line_clear(&s);
+                                if hud.is_active() {
+                                    let hl = hud.render_line();
+                                    canvas.draw(&[sc, &hl]);
+                                } else {
+                                    canvas.draw(&[sc]);
+                                }
+                            }
                             lead_log!("{COLOR_RESET}\n{COLOR_DIM}[tool: {label}]{COLOR_RESET}");
                             let _ = std::io::stdout().flush();
                         }
@@ -9048,6 +9091,8 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             label,
                             is_error,
                         } => {
+                            hud.on_tool_done();
+                            canvas.clear();
                             let td = active_tools.remove(&id);
                             let dur = td.as_ref().map(|t| t.elapsed()).unwrap_or_default();
                             print!(
@@ -9063,14 +9108,15 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             if active_tools.is_empty() {
                                 is_thinking_after_tool = true;
                                 spinner_tick = 0;
-                                print!(
-                                    "{}",
-                                    crate::tool_display::format_thinking_spinner(
-                                        turn_start.elapsed(),
-                                        0
-                                    )
-                                );
-                                let _ = std::io::stdout().flush();
+                                let s = crate::tool_display::format_thinking_spinner(
+                                    turn_start.elapsed(), 0);
+                                let sc = crate::session_hud::strip_line_clear(&s);
+                                if hud.is_active() {
+                                    let hl = hud.render_line();
+                                    canvas.draw(&[sc, &hl]);
+                                } else {
+                                    canvas.draw(&[sc]);
+                                }
                             }
                             print!("{COLOR_GREEN}");
                             let _ = std::io::stdout().flush();
@@ -9078,8 +9124,9 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 Ok(AgentEvent::Done { stop_reason, usage }) => {
+                    hud.on_turn_done();
+                    canvas.clear();
                     if is_thinking_after_tool || is_connecting {
-                        print!("{}", crate::tool_display::clear_thinking_line());
                         is_thinking_after_tool = false;
                         is_connecting = false;
                     }
@@ -9116,6 +9163,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     if let Some(c) = catalogue.compute_cost_usd(&config.model, &token_usage) {
                         session_cost_usd += c;
                     }
+                    hud.set_session_cost(session_cost_usd);
                     // Push the running total to the Cardputer display.
                     // Send fails silently when no device is paired —
                     // we don't want a missing buddy to disrupt the REPL.
@@ -9155,11 +9203,17 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    hud.on_turn_done();
+                    canvas.clear();
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}");
                     lead_log!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}\n");
                     break;
                 }
             }
+        }
+        if hud.is_active() || canvas.is_drawn() {
+            hud.on_turn_done();
+            canvas.clear();
         }
     }
 

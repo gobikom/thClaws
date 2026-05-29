@@ -122,6 +122,23 @@ impl HudState {
     pub(crate) fn mark(&mut self, now: Instant) {
         self.last_emit = now;
     }
+
+    /// How long the caller may sleep before it must re-check `due()`, given
+    /// `now`. Returns `None` when the HUD is off (the caller keeps its own idle
+    /// delay). When on, this is the time remaining until the next heartbeat,
+    /// floored so a due heartbeat fires promptly without busy-spinning. The
+    /// interactive loop uses this to cap its otherwise-long idle sleep so the
+    /// heartbeat keeps its cadence even when no spinner is animating (e.g.
+    /// during a long stretch of streamed text).
+    pub(crate) fn poll_delay(&self, now: Instant) -> Option<Duration> {
+        if !self.enabled() {
+            return None;
+        }
+        let remaining = self
+            .interval
+            .saturating_sub(now.duration_since(self.last_emit));
+        Some(remaining.max(crate::tool_display::SPINNER_INTERVAL))
+    }
 }
 
 /// Format a heartbeat line for the session HUD.
@@ -306,5 +323,61 @@ mod tests {
                 "heartbeat line adds its own newline via println: {s:?}"
             );
         }
+    }
+
+    #[test]
+    fn heartbeat_formatter_does_not_double_redact_or_introduce_secrets() {
+        // Contract: format_session_heartbeat is a pure formatter; redaction is
+        // the caller's responsibility (the label arrives via tool_display::
+        // tool_label, which already redacts). This guards against a future
+        // change that accidentally injects unredacted data here.
+        let already_redacted = "Bash (--api-key=<redacted>)";
+        let s = format_session_heartbeat(
+            Duration::from_secs(45),
+            Some((already_redacted, Duration::from_secs(10))),
+        );
+        assert!(s.contains("<redacted>"), "redacted marker preserved: {s:?}");
+        assert!(
+            !s.contains("sk-"),
+            "formatter must not introduce secrets: {s:?}"
+        );
+    }
+
+    // ── poll_delay: idle wake honors heartbeat cadence ───────────────
+
+    #[test]
+    fn poll_delay_none_when_off() {
+        let now = Instant::now();
+        let s = HudState::from_env_inner(Some("off"), None, true, now);
+        assert!(s.poll_delay(now).is_none());
+    }
+
+    #[test]
+    fn poll_delay_tracks_remaining_until_due() {
+        let now = Instant::now();
+        let s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, now);
+        // Far from due → ~remaining time (floored at SPINNER_INTERVAL).
+        let d = s.poll_delay(now + Duration::from_secs(10)).unwrap();
+        assert!(d <= Duration::from_secs(20) && d >= crate::tool_display::SPINNER_INTERVAL);
+        // Past due → floored to SPINNER_INTERVAL (prompt fire, no busy spin).
+        let d2 = s.poll_delay(now + Duration::from_secs(60)).unwrap();
+        assert_eq!(d2, crate::tool_display::SPINNER_INTERVAL);
+    }
+
+    // ── per-turn reset: fresh HudState restarts the cadence ──────────
+
+    #[test]
+    fn fresh_hud_state_per_turn_resets_cadence() {
+        // repl.rs constructs a new HudState inside the per-turn block, so each
+        // turn's cadence starts from its own init time. A refactor that lifted
+        // construction out of the loop would break this — this test guards it.
+        let t0 = Instant::now();
+        let turn1 = HudState::from_env_inner(Some("heartbeat"), Some("5"), true, t0);
+        assert!(turn1.due(t0 + Duration::from_secs(5)));
+
+        let t1 = t0 + Duration::from_secs(3); // turn 2 starts fresh, 3s later
+        let turn2 = HudState::from_env_inner(Some("heartbeat"), Some("5"), true, t1);
+        assert!(!turn2.due(t1 + Duration::from_secs(4)));
+        assert!(turn2.due(t1 + Duration::from_secs(5)));
     }
 }

@@ -62,8 +62,17 @@ fn turn_script() -> Vec<u8> {
 fn render_through_pty(bytes: &[u8]) -> Vec<u8> {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 
+    // Unique per call: pid alone collides across `#[test]` fns in the same
+    // binary (they share a pid and may run in parallel), so add an atomic
+    // counter suffix.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("thclaws_hud_pty_{}.bin", std::process::id()));
+    let path = dir.join(format!(
+        "thclaws_hud_pty_{}_{}.bin",
+        std::process::id(),
+        CTR.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&path, bytes).expect("write temp script");
 
     let pair = native_pty_system()
@@ -94,12 +103,10 @@ fn render_through_pty(bytes: &[u8]) -> Vec<u8> {
 fn heartbeat_renders_above_single_spinner_row_without_collision() {
     let raw = render_through_pty(&turn_script());
 
-    // (4) The spinner's in-place mechanism must still be present in the stream:
-    // a carriage return (return to column 0) plus the erase-line CSI `\x1b[2K`.
-    assert!(
-        raw.contains(&b'\r'),
-        "expected a carriage return (spinner in-place rewrite) in the raw PTY stream"
-    );
+    // (4) The spinner's in-place mechanism must still be present in the stream.
+    // We assert on the erase-line CSI `\x1b[2K` only: a bare `\r` check would be
+    // vacuous because the PTY line discipline (ONLCR) maps every `\n` to `\r\n`,
+    // so `\r` is present regardless of whether the spinner emitted it.
     assert!(
         raw.windows(4).any(|w| w == b"\x1b[2K"),
         "expected the erase-line sequence (\\x1b[2K) in the raw PTY stream"
@@ -146,5 +153,34 @@ fn heartbeat_renders_above_single_spinner_row_without_collision() {
             .iter()
             .any(|l| l.contains("⠼") && l.contains("Bash (migrate)")),
         "the surviving spinner row should show the latest frame.\n--- grid ---\n{contents}"
+    );
+}
+
+/// AC4: a turn that ends before the heartbeat interval emits the completion
+/// summary only — no heartbeat line. Mirrors `HudState::due()` returning false
+/// for a sub-interval turn (so `repl.rs` never enters the emit branch).
+#[test]
+fn short_turn_emits_no_heartbeat_line() {
+    let label = "Bash (fast)";
+    let mut s = String::new();
+    // Spinner frames only — no heartbeat_emit() — then the completion summary.
+    s.push_str(&spinner(FRAMES[0], label, "1s"));
+    s.push_str(&spinner(FRAMES[1], label, "2s"));
+    s.push_str("\n\x1b[2m[tokens: 100in/200out · 2s · $0.0010 session]\x1b[0m\n");
+
+    let raw = render_through_pty(s.as_bytes());
+    let mut parser = vt100::Parser::new(24, 100, 0);
+    parser.process(&raw);
+    let contents = parser.screen().contents();
+
+    assert!(
+        !contents.lines().any(|l| l.contains("[⏱")),
+        "short turn must emit no heartbeat line.\n--- grid ---\n{contents}"
+    );
+    assert!(
+        contents
+            .lines()
+            .any(|l| l.contains("[tokens: 100in/200out")),
+        "completion summary should still be present.\n--- grid ---\n{contents}"
     );
 }

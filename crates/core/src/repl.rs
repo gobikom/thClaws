@@ -8855,7 +8855,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
             {
                 crate::tool_display::SPINNER_INTERVAL
             } else {
-                std::time::Duration::from_secs(300)
+                // No spinner animating. Idle a long time normally, but when the
+                // HUD is on, cap the sleep to the next heartbeat so its cadence
+                // holds even during long stretches of streamed text (#335 v6).
+                hud.poll_delay(std::time::Instant::now())
+                    .unwrap_or_else(|| std::time::Duration::from_secs(300))
             };
             let ev = tokio::select! {
                 ev = stream.next() => ev,

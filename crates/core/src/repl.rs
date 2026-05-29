@@ -4793,6 +4793,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
     // model catalogue after every AgentEvent::Done and shown alongside
     // the per-turn token counts. `/cost reset` zeroes it.
     let mut session_cost_usd: f64 = 0.0;
+    let mut hud = crate::session_hud::HudState::new();
 
     // Cardputer cost-display bridge — best-effort BLE central that
     // streams `session_cost_usd` to a `thClaws-Cost-*` peripheral and
@@ -8843,16 +8844,21 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         let mut spinner_tick: u32 = 0;
         let mut is_connecting = true;
         let mut is_thinking_after_tool = false;
+        hud.on_turn_start();
+        hud.set_session_cost(session_cost_usd);
         loop {
             let anim_delay = if is_connecting || is_thinking_after_tool || !active_tools.is_empty()
             {
                 crate::tool_display::SPINNER_INTERVAL
+            } else if hud.is_active() {
+                std::time::Duration::from_secs(1)
             } else {
                 std::time::Duration::from_secs(300)
             };
             let ev = tokio::select! {
                 ev = stream.next() => ev,
                 _ = tokio::signal::ctrl_c() => {
+                    hud.on_turn_done();
                     print!("{}", crate::tool_display::clear_thinking_line());
                     _cancelled = true;
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}[cancelled by Ctrl-C]{COLOR_RESET}");
@@ -8878,6 +8884,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         print!("{}", crate::tool_display::format_thinking_spinner(elapsed, spinner_tick));
                         let _ = std::io::stdout().flush();
                     }
+                    hud.render_tick();
                     continue;
                 }
             };
@@ -8927,6 +8934,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }) => {
                     last_was_thinking = false;
                     let label = crate::tool_display::tool_label(&name, &input);
+                    hud.on_tool_start(&label);
                     active_tools.insert(
                         id,
                         crate::tool_display::ActiveToolDisplay::new(label.clone()),
@@ -8945,6 +8953,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 Ok(AgentEvent::ToolCallResult {
                     id, name, output, ..
                 }) => {
+                    hud.on_tool_done();
                     let td = active_tools.remove(&id);
                     if td.is_none() {
                         eprintln!("{COLOR_DIM}[tool-display] result for '{name}' (id={id}) has no matching start{COLOR_RESET}");
@@ -8997,6 +9006,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     let _ = std::io::stdout().flush();
                 }
                 Ok(AgentEvent::ToolCallDenied { id, name, .. }) => {
+                    hud.on_tool_done();
                     let td = active_tools.remove(&id);
                     let dur_str = td
                         .as_ref()
@@ -9028,6 +9038,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                                 is_thinking_after_tool = false;
                                 spinner_tick = 0;
                             }
+                            hud.on_tool_start(&label);
                             active_tools.insert(
                                 id,
                                 crate::tool_display::ActiveToolDisplay::new(label.clone()),
@@ -9048,6 +9059,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                             label,
                             is_error,
                         } => {
+                            hud.on_tool_done();
                             let td = active_tools.remove(&id);
                             let dur = td.as_ref().map(|t| t.elapsed()).unwrap_or_default();
                             print!(
@@ -9078,6 +9090,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 Ok(AgentEvent::Done { stop_reason, usage }) => {
+                    hud.on_turn_done();
                     if is_thinking_after_tool || is_connecting {
                         print!("{}", crate::tool_display::clear_thinking_line());
                         is_thinking_after_tool = false;
@@ -9116,6 +9129,7 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     if let Some(c) = catalogue.compute_cost_usd(&config.model, &token_usage) {
                         session_cost_usd += c;
                     }
+                    hud.set_session_cost(session_cost_usd);
                     // Push the running total to the Cardputer display.
                     // Send fails silently when no device is paired —
                     // we don't want a missing buddy to disrupt the REPL.
@@ -9155,11 +9169,15 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                     }
                 }
                 Err(e) => {
+                    hud.on_turn_done();
                     println!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}");
                     lead_log!("{COLOR_RESET}\n{COLOR_YELLOW}error: {e}{COLOR_RESET}\n");
                     break;
                 }
             }
+        }
+        if hud.is_active() {
+            hud.on_turn_done();
         }
     }
 

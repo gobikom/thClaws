@@ -6,6 +6,7 @@ use regex::Regex;
 use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 // ── constants ──────────────────────────────────────────────────────
 
@@ -221,6 +222,96 @@ pub(crate) fn format_duration(d: Duration) -> String {
     }
 }
 
+// ── terminal width ─────────────────────────────────────────────────
+
+/// Default column count when the terminal width can't be determined.
+const FALLBACK_COLS: usize = 80;
+
+/// Largest column count we'll pad a spinner label to (cosmetic alignment of
+/// the trailing duration on wide terminals).
+const SPINNER_LABEL_PAD: usize = 50;
+
+/// Current terminal width in columns, queried on **stdout** (fd 1). Callers
+/// MUST write spinner output to stdout (not stderr), or the width will be wrong
+/// when stdout is a pipe. Falls back to `FALLBACK_COLS` when the size can't be
+/// determined (not a TTY, non-unix, or ioctl failure). Queried per frame so
+/// SIGWINCH resizes are picked up without extra wiring.
+pub(crate) fn term_cols() -> usize {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: `ws` is zeroed and lives for the duration of the ioctl, which
+        // only writes into it. A failed ioctl leaves it zeroed → fallback below.
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        let fd = std::io::stdout().as_raw_fd();
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
+    }
+    FALLBACK_COLS
+}
+
+/// Truncate `s` to at most `max_cols` terminal columns, appending '…' (1 col)
+/// when truncation happens. Measured in display columns, not codepoints, so
+/// wide characters (CJK) and zero-width combining marks are counted correctly.
+fn truncate_to_cols(s: &str, max_cols: usize) -> String {
+    if s.width() <= max_cols {
+        return s.to_string();
+    }
+    if max_cols == 0 {
+        return String::new();
+    }
+    let budget = max_cols - 1; // reserve 1 col for the ellipsis
+    let mut used = 0usize;
+    let mut out = String::new();
+    for c in s.chars() {
+        let w = UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+/// Build the spinner's label field so the WHOLE line fits in `cols` and never
+/// wraps (a wrapped spinner line + `\r` overwrite is what makes the spinner
+/// stack/freeze in narrow panes — see agent-devops#369). Measured in terminal
+/// columns (not codepoints) so wide characters don't slip past the cap.
+///
+/// Line layout (visible cols): `2 (indent) + 1 (frame/icon) + 1 (space) +
+/// label + 1 (space) + dur_width` = `5 + dur_width` plus the label. We budget
+/// `cols - 6 - dur_width` for the label — one column less than the layout
+/// needs, reserving a wrap-safety margin so the line uses at most `cols - 1`
+/// columns. Returns `""` when there is no room (caller drops the separators).
+fn fit_label_field(label: &str, dur_width: usize, cols: usize) -> String {
+    let avail = cols.saturating_sub(6 + dur_width);
+    if avail == 0 {
+        return String::new();
+    }
+    let w = label.width();
+    if w <= avail {
+        let pad = avail.min(SPINNER_LABEL_PAD);
+        format!("{label}{}", " ".repeat(pad.saturating_sub(w)))
+    } else {
+        truncate_to_cols(label, avail)
+    }
+}
+
+/// Assemble the inner spinner body `  {marker} {label} {dur}`, width-capped to
+/// `cols`. When there's no room for a label the field and its separator are
+/// dropped so the line stays `  {marker} {dur}` rather than wrapping.
+fn spinner_body(marker: char, label: &str, dur: &str, cols: usize) -> String {
+    let field = fit_label_field(label, dur.width(), cols);
+    if field.is_empty() {
+        format!("  {marker} {dur}")
+    } else {
+        format!("  {marker} {field} {dur}")
+    }
+}
+
 // ── formatted output strings ───────────────────────────────────────
 
 /// Heartbeat text for a long-running tool.
@@ -231,17 +322,21 @@ pub(crate) fn format_tool_heartbeat(label: &str, elapsed: Duration) -> String {
 }
 
 /// Inline spinner line for an active tool — overwrites current line via `\r`.
+/// Width-capped to the terminal so it never wraps (agent-devops#369).
 pub(crate) fn format_tool_spinner(label: &str, elapsed: Duration, tick: u32) -> String {
     let frame = spinner_frame(tick);
     let dur = format_duration(elapsed);
-    format!("\r\x1b[2K\x1b[2m  {frame} {label:<50} {dur}\x1b[0m")
+    let body = spinner_body(frame, label, &dur, term_cols());
+    format!("\r\x1b[2K\x1b[2m{body}\x1b[0m")
 }
 
 /// Final completion line — clears spinner and writes ✓/✗ with newline.
+/// Width-capped to the terminal so it never wraps (agent-devops#369).
 pub(crate) fn format_tool_done(label: &str, elapsed: Duration, is_error: bool) -> String {
     let icon = if is_error { '✗' } else { '✓' };
     let dur = format_duration(elapsed);
-    format!("\r\x1b[2K\x1b[2m  {icon} {label:<50} {dur}\x1b[0m\n")
+    let body = spinner_body(icon, label, &dur, term_cols());
+    format!("\r\x1b[2K\x1b[2m{body}\x1b[0m\n")
 }
 
 /// Inline thinking spinner — overwrites current line with a brightness
@@ -258,7 +353,18 @@ pub(crate) fn format_thinking_spinner(elapsed: Duration, tick: u32) -> String {
         "Still working"
     };
     let text = format!("{phrase} ({dur})");
-    let chars: Vec<char> = text.chars().collect();
+    // Cap to the terminal width so the line never wraps (agent-devops#369).
+    // Prefix consumes "  " + frame + " " = 4 columns; leave 1 column margin.
+    // Measured in display columns so wide chars can't slip past the cap.
+    let max_text = term_cols().saturating_sub(5);
+    let mut text_w = 0usize;
+    let chars: Vec<char> = text
+        .chars()
+        .take_while(|c| {
+            text_w += UnicodeWidthChar::width(*c).unwrap_or(0);
+            text_w <= max_text
+        })
+        .collect();
     let len = chars.len();
     let gap = 6;
     let wave_pos = (tick as usize) % (len + gap);
@@ -622,5 +728,69 @@ mod tests {
     fn label_websearch_query() {
         let label = tool_label("WebSearch", &json!({"query": "rust tokio select"}));
         assert_eq!(label, "WebSearch (rust tokio select)");
+    }
+
+    // ── spinner width fitting (agent-devops#369) ─────────────────────
+
+    /// The core invariant for #369: the spinner body (plain text, no ANSI) must
+    /// never exceed the pane width at ANY width, so the line can never wrap (and
+    /// therefore never stack). `spinner_body` output has no escape codes, so its
+    /// display width is the rendered column count.
+    #[test]
+    fn spinner_body_never_exceeds_width_ascii() {
+        for cols in [7usize, 8, 10, 20, 40, 52, 56, 80, 120, 200] {
+            let body = spinner_body('⠹', "Bash (some longer command here)", "12s", cols);
+            assert!(
+                body.width() <= cols,
+                "cols={cols}: body width {} would wrap ({body:?})",
+                body.width()
+            );
+        }
+    }
+
+    #[test]
+    fn spinner_body_never_exceeds_width_wide_chars() {
+        // CJK ideographs are 2 columns each — must still fit (the bug the
+        // codepoint-count version missed).
+        for cols in [10usize, 20, 40, 56, 80, 120] {
+            let body = spinner_body('⠹', "Bash (打开 /home/用户/文件.txt)", "3s", cols);
+            assert!(
+                body.width() <= cols,
+                "cols={cols}: wide-char body width {} would wrap ({body:?})",
+                body.width()
+            );
+        }
+    }
+
+    #[test]
+    fn spinner_body_pads_to_50_on_wide_terminal() {
+        // Wide terminal keeps the cosmetic alignment (label padded toward 50).
+        let body = spinner_body('⠹', "Bash (x)", "2s", 120);
+        assert!(body.contains("Bash (x)"));
+        assert!(body.width() <= 120 && body.width() >= 50);
+    }
+
+    #[test]
+    fn spinner_body_drops_label_when_no_room() {
+        // Too narrow for any label → "  ⠹ 2s" (no stray double space), still fits.
+        let body = spinner_body('⠹', "Bash (x)", "2s", 7);
+        assert!(body.width() <= 7, "{body:?}");
+        assert!(!body.contains("Bash"));
+    }
+
+    #[test]
+    fn fit_label_truncates_long_label_in_narrow_pane() {
+        let long = format!("Bash ({})", "x".repeat(80));
+        let f = fit_label_field(&long, 2, 40);
+        assert!(f.contains('…'), "long label should be truncated: {f:?}");
+        assert!(f.width() <= 40usize.saturating_sub(6 + 2));
+    }
+
+    #[test]
+    fn truncate_to_cols_counts_display_width() {
+        // 5 CJK chars = 10 cols; cap at 6 cols → keep 2 chars (4 cols) + '…'.
+        let t = truncate_to_cols("打开文件内容", 6);
+        assert!(t.width() <= 6, "{t:?} width {}", t.width());
+        assert!(t.ends_with('…'));
     }
 }

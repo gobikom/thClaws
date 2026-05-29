@@ -30,9 +30,13 @@ impl Canvas {
         }
         let mut out = String::new();
         if self.prev_lines > 0 {
-            // Move cursor up to top of previous canvas
-            for _ in 0..self.prev_lines {
-                out.push_str("\x1b[A");
+            // Cursor is on the last line of canvas. Move up
+            // (prev_lines - 1) to reach the first line, then
+            // carriage return + erase down to clear the block.
+            if self.prev_lines > 1 {
+                for _ in 0..self.prev_lines - 1 {
+                    out.push_str("\x1b[A");
+                }
             }
             out.push('\r');
             out.push_str("\x1b[J"); // erase from cursor down
@@ -52,8 +56,10 @@ impl Canvas {
     pub fn clear(&mut self) {
         if self.prev_lines > 0 {
             let mut out = String::new();
-            for _ in 0..self.prev_lines {
-                out.push_str("\x1b[A");
+            if self.prev_lines > 1 {
+                for _ in 0..self.prev_lines - 1 {
+                    out.push_str("\x1b[A");
+                }
             }
             out.push('\r');
             out.push_str("\x1b[J");

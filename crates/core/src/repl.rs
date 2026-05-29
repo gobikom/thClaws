@@ -8843,6 +8843,13 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         let mut spinner_tick: u32 = 0;
         let mut is_connecting = true;
         let mut is_thinking_after_tool = false;
+        // #335 v6: periodic permanent heartbeat line (scrollback liveness),
+        // independent of the in-place spinner. Default on for a TTY, off when
+        // piped / --print, configurable via THCLAWS_HUD / THCLAWS_HUD_INTERVAL.
+        let mut hud = {
+            use std::io::IsTerminal as _;
+            crate::session_hud::HudState::from_env(std::io::stdout().is_terminal())
+        };
         loop {
             let anim_delay = if is_connecting || is_thinking_after_tool || !active_tools.is_empty()
             {
@@ -8861,6 +8868,28 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                 }
                 _ = tokio::time::sleep(anim_delay) => {
                     spinner_tick += 1;
+                    // #335 v6: emit a permanent heartbeat line when due. Clear
+                    // the spinner's in-place row, print a NORMAL line (no \r),
+                    // then fall through to redraw the spinner on the fresh row.
+                    // The heartbeat never shares the spinner's row, so it cannot
+                    // collide with it — the structural fix for the v1–v5 reverts.
+                    let hud_now = std::time::Instant::now();
+                    if hud.due(hud_now) {
+                        let active = active_tools
+                            .values()
+                            .min_by_key(|td| td.started_at)
+                            .map(|td| (td.label.as_str(), td.elapsed()));
+                        print!("{}", crate::tool_display::clear_thinking_line());
+                        println!(
+                            "{}",
+                            crate::session_hud::format_session_heartbeat(
+                                turn_start.elapsed(),
+                                active
+                            )
+                        );
+                        let _ = std::io::stdout().flush();
+                        hud.mark(hud_now);
+                    }
                     if is_connecting {
                         let elapsed = turn_start.elapsed();
                         print!("{}", crate::tool_display::format_thinking_spinner(elapsed, spinner_tick));

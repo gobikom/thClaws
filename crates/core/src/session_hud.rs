@@ -24,11 +24,16 @@ const DEFAULT_INTERVAL_SECS: u64 = 30;
 /// `THCLAWS_HUD_INTERVAL=0` busy-spamming scrollback.
 const MIN_INTERVAL_SECS: u64 = 5;
 
-/// Whether the session HUD heartbeat is enabled.
+/// Which session-HUD surface is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HudMode {
+    /// No HUD — the live in-pane spinner is the only progress indicator.
     Off,
+    /// Periodic permanent scrollback line (`[⏱ …]`). Opt-in; redundant with the
+    /// live spinner, kept as a non-tmux breadcrumb option.
     Heartbeat,
+    /// Live HUD on the tmux pane border (agent-devops#368). Default inside tmux.
+    Pane,
 }
 
 /// Heartbeat cadence state for one interactive turn.
@@ -42,19 +47,22 @@ pub(crate) struct HudState {
 impl HudState {
     /// Build from the environment.
     ///
-    /// `THCLAWS_HUD`: `off` → disabled; `heartbeat` → enabled; unset → enabled
-    /// only when attached to a TTY (`is_tty`), so piped / `--print` output stays
-    /// scriptable by default.
+    /// `THCLAWS_HUD`: `off` → no HUD; `heartbeat` → periodic scrollback line;
+    /// `pane` → live tmux pane-border HUD. Unset → `pane` when running inside
+    /// tmux (`is_tmux`), else `off` (the live in-pane spinner already covers
+    /// non-tmux liveness, so the static heartbeat is no longer a default — see
+    /// agent-devops#368). `is_tty` keeps piped / `--print` output scriptable.
     ///
     /// `THCLAWS_HUD_INTERVAL`: heartbeat period in seconds, clamped to at least
     /// `MIN_INTERVAL_SECS`. Unset → `DEFAULT_INTERVAL_SECS`. A non-numeric value
     /// is not silently ignored — it logs a one-line warning and falls back to
     /// the default (per the "no silent failures" rule).
-    pub(crate) fn from_env(is_tty: bool) -> Self {
+    pub(crate) fn from_env(is_tty: bool, is_tmux: bool) -> Self {
         Self::from_env_inner(
             std::env::var("THCLAWS_HUD").ok().as_deref(),
             std::env::var("THCLAWS_HUD_INTERVAL").ok().as_deref(),
             is_tty,
+            is_tmux,
             Instant::now(),
         )
     }
@@ -65,22 +73,28 @@ impl HudState {
         hud: Option<&str>,
         interval: Option<&str>,
         is_tty: bool,
+        is_tmux: bool,
         now: Instant,
     ) -> Self {
-        let default_mode = if is_tty {
-            HudMode::Heartbeat
+        // Default: the live pane-border HUD in tmux, otherwise nothing (the
+        // in-pane spinner is the live indicator outside tmux). Never default-on
+        // for non-TTY so piped / --print stays clean.
+        let default_mode = if !is_tty {
+            HudMode::Off
+        } else if is_tmux {
+            HudMode::Pane
         } else {
             HudMode::Off
         };
         let mode = match hud.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
             Some("off") => HudMode::Off,
             Some("heartbeat") => HudMode::Heartbeat,
+            Some("pane") => HudMode::Pane,
             Some("") | None => default_mode,
             Some(other) => {
                 eprintln!(
-                    "[thclaws] THCLAWS_HUD='{other}' not recognized (use 'off' or 'heartbeat'); \
-                     defaulting to {}",
-                    if is_tty { "heartbeat" } else { "off" }
+                    "[thclaws] THCLAWS_HUD='{other}' not recognized \
+                     (use 'off', 'heartbeat', or 'pane'); using default"
                 );
                 default_mode
             }
@@ -107,9 +121,14 @@ impl HudState {
         }
     }
 
-    /// Whether the HUD heartbeat is enabled at all.
+    /// Whether the periodic scrollback heartbeat line is enabled.
     pub(crate) fn enabled(&self) -> bool {
         matches!(self.mode, HudMode::Heartbeat)
+    }
+
+    /// Whether the live tmux pane-border HUD is enabled.
+    pub(crate) fn is_pane(&self) -> bool {
+        matches!(self.mode, HudMode::Pane)
     }
 
     /// Whether a heartbeat is due as of `now`. `now` is injected so callers
@@ -173,78 +192,102 @@ pub(crate) fn format_session_heartbeat(
 mod tests {
     use super::*;
 
-    // ── from_env_inner: mode matrix ──────────────────────────────────
+    // ── from_env_inner: mode matrix (is_tty, is_tmux) ────────────────
 
     #[test]
-    fn mode_off_explicit_disables_even_on_tty() {
-        let s = HudState::from_env_inner(Some("off"), None, true, Instant::now());
-        assert!(!s.enabled());
+    fn mode_off_explicit_disables_even_in_tmux() {
+        let s = HudState::from_env_inner(Some("off"), None, true, true, Instant::now());
+        assert!(!s.enabled() && !s.is_pane());
     }
 
     #[test]
-    fn mode_heartbeat_explicit_enables_even_without_tty() {
-        let s = HudState::from_env_inner(Some("heartbeat"), None, false, Instant::now());
-        assert!(s.enabled());
+    fn mode_heartbeat_explicit_enables_line() {
+        let s = HudState::from_env_inner(Some("heartbeat"), None, false, false, Instant::now());
+        assert!(s.enabled() && !s.is_pane());
     }
 
     #[test]
-    fn mode_unset_defaults_on_with_tty() {
-        let s = HudState::from_env_inner(None, None, true, Instant::now());
-        assert!(s.enabled());
+    fn mode_pane_explicit() {
+        let s = HudState::from_env_inner(Some("pane"), None, true, false, Instant::now());
+        assert!(s.is_pane() && !s.enabled());
+    }
+
+    #[test]
+    fn mode_unset_defaults_pane_in_tmux() {
+        let s = HudState::from_env_inner(None, None, true, true, Instant::now());
+        assert!(s.is_pane());
+    }
+
+    #[test]
+    fn mode_unset_defaults_off_on_tty_without_tmux() {
+        // Tier1: the static heartbeat is no longer a default — the live spinner
+        // already covers non-tmux liveness.
+        let s = HudState::from_env_inner(None, None, true, false, Instant::now());
+        assert!(!s.enabled() && !s.is_pane());
     }
 
     #[test]
     fn mode_unset_defaults_off_without_tty() {
-        // Proves `--print` / piped output never heartbeats by default (AC7).
-        let s = HudState::from_env_inner(None, None, false, Instant::now());
-        assert!(!s.enabled());
+        // piped / --print never shows a HUD by default, even in tmux.
+        let s = HudState::from_env_inner(None, None, false, true, Instant::now());
+        assert!(!s.enabled() && !s.is_pane());
     }
 
     #[test]
     fn mode_is_case_insensitive_and_trimmed() {
-        assert!(!HudState::from_env_inner(Some("  OFF "), None, true, Instant::now()).enabled());
-        assert!(HudState::from_env_inner(Some("HeartBeat"), None, false, Instant::now()).enabled());
+        assert!(
+            HudState::from_env_inner(Some("  PANE "), None, true, false, Instant::now()).is_pane()
+        );
+        assert!(
+            HudState::from_env_inner(Some("HeartBeat"), None, false, false, Instant::now())
+                .enabled()
+        );
     }
 
     #[test]
-    fn mode_unrecognized_falls_back_to_tty_default() {
-        // Non-empty garbage → default for the surface (warns, doesn't crash).
-        assert!(HudState::from_env_inner(Some("loud"), None, true, Instant::now()).enabled());
-        assert!(!HudState::from_env_inner(Some("loud"), None, false, Instant::now()).enabled());
+    fn mode_unrecognized_falls_back_to_default() {
+        // Garbage → the surface default (warns, doesn't crash).
+        assert!(HudState::from_env_inner(Some("loud"), None, true, true, Instant::now()).is_pane());
+        assert!(
+            !HudState::from_env_inner(Some("loud"), None, true, false, Instant::now()).enabled()
+        );
     }
 
     #[test]
     fn mode_empty_string_treated_as_unset() {
-        assert!(HudState::from_env_inner(Some(""), None, true, Instant::now()).enabled());
-        assert!(!HudState::from_env_inner(Some(""), None, false, Instant::now()).enabled());
+        assert!(HudState::from_env_inner(Some(""), None, true, true, Instant::now()).is_pane());
+        assert!(!HudState::from_env_inner(Some(""), None, true, false, Instant::now()).enabled());
     }
 
     // ── from_env_inner: interval parsing ─────────────────────────────
 
     #[test]
     fn interval_default_when_unset() {
-        let s = HudState::from_env_inner(Some("heartbeat"), None, true, Instant::now());
+        let s = HudState::from_env_inner(Some("heartbeat"), None, true, false, Instant::now());
         assert_eq!(s.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
     }
 
     #[test]
     fn interval_parsed_when_valid() {
-        let s = HudState::from_env_inner(Some("heartbeat"), Some("12"), true, Instant::now());
+        let s =
+            HudState::from_env_inner(Some("heartbeat"), Some("12"), true, false, Instant::now());
         assert_eq!(s.interval, Duration::from_secs(12));
     }
 
     #[test]
     fn interval_clamped_to_minimum() {
         // Hostile/typo 0 (or anything below MIN) must not busy-spam scrollback.
-        let s = HudState::from_env_inner(Some("heartbeat"), Some("0"), true, Instant::now());
+        let s = HudState::from_env_inner(Some("heartbeat"), Some("0"), true, false, Instant::now());
         assert_eq!(s.interval, Duration::from_secs(MIN_INTERVAL_SECS));
-        let s2 = HudState::from_env_inner(Some("heartbeat"), Some("1"), true, Instant::now());
+        let s2 =
+            HudState::from_env_inner(Some("heartbeat"), Some("1"), true, false, Instant::now());
         assert_eq!(s2.interval, Duration::from_secs(MIN_INTERVAL_SECS));
     }
 
     #[test]
     fn interval_invalid_falls_back_to_default_not_silent() {
-        let s = HudState::from_env_inner(Some("heartbeat"), Some("soon"), true, Instant::now());
+        let s =
+            HudState::from_env_inner(Some("heartbeat"), Some("soon"), true, false, Instant::now());
         assert_eq!(s.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
     }
 
@@ -253,7 +296,7 @@ mod tests {
     #[test]
     fn not_due_before_interval() {
         let now = Instant::now();
-        let s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, now);
+        let s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, false, now);
         assert!(!s.due(now));
         assert!(!s.due(now + Duration::from_secs(29)));
     }
@@ -261,7 +304,7 @@ mod tests {
     #[test]
     fn due_at_and_after_interval() {
         let now = Instant::now();
-        let s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, now);
+        let s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, false, now);
         assert!(s.due(now + Duration::from_secs(30)));
         assert!(s.due(now + Duration::from_secs(31)));
     }
@@ -269,14 +312,23 @@ mod tests {
     #[test]
     fn never_due_when_off() {
         let now = Instant::now();
-        let s = HudState::from_env_inner(Some("off"), Some("5"), true, now);
+        let s = HudState::from_env_inner(Some("off"), Some("5"), true, false, now);
         assert!(!s.due(now + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn pane_mode_emits_no_heartbeat_line() {
+        // Pane mode must not also emit scrollback heartbeat lines.
+        let now = Instant::now();
+        let s = HudState::from_env_inner(Some("pane"), Some("5"), true, true, now);
+        assert!(!s.due(now + Duration::from_secs(3600)));
+        assert!(s.poll_delay(now).is_none());
     }
 
     #[test]
     fn mark_resets_cadence() {
         let now = Instant::now();
-        let mut s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, now);
+        let mut s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, false, now);
         let t1 = now + Duration::from_secs(30);
         assert!(s.due(t1));
         s.mark(t1);
@@ -348,14 +400,14 @@ mod tests {
     #[test]
     fn poll_delay_none_when_off() {
         let now = Instant::now();
-        let s = HudState::from_env_inner(Some("off"), None, true, now);
+        let s = HudState::from_env_inner(Some("off"), None, true, false, now);
         assert!(s.poll_delay(now).is_none());
     }
 
     #[test]
     fn poll_delay_tracks_remaining_until_due() {
         let now = Instant::now();
-        let s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, now);
+        let s = HudState::from_env_inner(Some("heartbeat"), Some("30"), true, false, now);
         // Far from due → ~remaining time (floored at SPINNER_INTERVAL).
         let d = s.poll_delay(now + Duration::from_secs(10)).unwrap();
         assert!(d <= Duration::from_secs(20) && d >= crate::tool_display::SPINNER_INTERVAL);
@@ -372,11 +424,11 @@ mod tests {
         // turn's cadence starts from its own init time. A refactor that lifted
         // construction out of the loop would break this — this test guards it.
         let t0 = Instant::now();
-        let turn1 = HudState::from_env_inner(Some("heartbeat"), Some("5"), true, t0);
+        let turn1 = HudState::from_env_inner(Some("heartbeat"), Some("5"), true, false, t0);
         assert!(turn1.due(t0 + Duration::from_secs(5)));
 
         let t1 = t0 + Duration::from_secs(3); // turn 2 starts fresh, 3s later
-        let turn2 = HudState::from_env_inner(Some("heartbeat"), Some("5"), true, t1);
+        let turn2 = HudState::from_env_inner(Some("heartbeat"), Some("5"), true, false, t1);
         assert!(!turn2.due(t1 + Duration::from_secs(4)));
         assert!(turn2.due(t1 + Duration::from_secs(5)));
     }

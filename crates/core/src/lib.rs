@@ -94,6 +94,7 @@ pub mod subagent;
 pub mod team;
 pub mod telegram;
 pub mod theme;
+pub mod tmux_hud;
 pub mod tokens;
 pub mod tool_display;
 pub mod tools;

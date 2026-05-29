@@ -5046,6 +5046,23 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         // takes the next line).
         let mut line: String;
         tokio::pin!(readline_task);
+        // #368: persistent live HUD on the tmux pane border. Set up once for the
+        // session (when THCLAWS_HUD resolves to pane mode — default inside tmux);
+        // the guard restores the user's border options on any exit via Drop.
+        let pane_hud = {
+            use std::io::IsTerminal as _;
+            let mode = crate::session_hud::HudState::from_env(
+                std::io::stdout().is_terminal(),
+                std::env::var_os("TMUX").is_some(),
+            );
+            if mode.is_pane() {
+                let h = crate::tmux_hud::TmuxHud::setup();
+                h.update(&format!("{} · idle", config.model));
+                Some(h)
+            } else {
+                None
+            }
+        };
         loop {
             tokio::select! {
                 result = &mut readline_task => {
@@ -8844,22 +8861,32 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
         let mut is_connecting = true;
         let mut is_thinking_after_tool = false;
         // #335 v6: periodic permanent heartbeat line (scrollback liveness),
-        // independent of the in-place spinner. Default on for a TTY, off when
-        // piped / --print, configurable via THCLAWS_HUD / THCLAWS_HUD_INTERVAL.
+        // independent of the in-place spinner. Opt-in via THCLAWS_HUD=heartbeat.
         let mut hud = {
             use std::io::IsTerminal as _;
-            crate::session_hud::HudState::from_env(std::io::stdout().is_terminal())
+            crate::session_hud::HudState::from_env(
+                std::io::stdout().is_terminal(),
+                std::env::var_os("TMUX").is_some(),
+            )
         };
+        // #368: live tmux pane-border HUD update cadence (every ~1s).
+        let mut last_pane_update = std::time::Instant::now();
         loop {
             let anim_delay = if is_connecting || is_thinking_after_tool || !active_tools.is_empty()
             {
                 crate::tool_display::SPINNER_INTERVAL
             } else {
-                // No spinner animating. Idle a long time normally, but when the
-                // HUD is on, cap the sleep to the next heartbeat so its cadence
-                // holds even during long stretches of streamed text (#335 v6).
-                hud.poll_delay(std::time::Instant::now())
-                    .unwrap_or_else(|| std::time::Duration::from_secs(300))
+                // No spinner animating. Idle a long time normally, but cap the
+                // sleep to the next heartbeat (#335) or 1s when the pane HUD is
+                // live (#368) so the elapsed counter keeps ticking even during
+                // long stretches of streamed text.
+                let mut d = hud
+                    .poll_delay(std::time::Instant::now())
+                    .unwrap_or_else(|| std::time::Duration::from_secs(300));
+                if pane_hud.is_some() {
+                    d = d.min(std::time::Duration::from_secs(1));
+                }
+                d
             };
             let ev = tokio::select! {
                 ev = stream.next() => ev,
@@ -8893,6 +8920,28 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         );
                         let _ = std::io::stdout().flush();
                         hud.mark(hud_now);
+                    }
+                    // #368: refresh the live tmux pane-border HUD ~every 1s.
+                    if let Some(ph) = &pane_hud {
+                        if last_pane_update.elapsed() >= std::time::Duration::from_secs(1) {
+                            let phase = if active_tools.is_empty() {
+                                "thinking".to_string()
+                            } else {
+                                active_tools
+                                    .values()
+                                    .min_by_key(|td| td.started_at)
+                                    .map(|td| td.label.clone())
+                                    .unwrap_or_else(|| "working".to_string())
+                            };
+                            ph.update(&format!(
+                                "⏱ {} · {} · ${:.4} · {}",
+                                crate::tool_display::format_duration(turn_start.elapsed()),
+                                phase,
+                                session_cost_usd,
+                                config.model
+                            ));
+                            last_pane_update = std::time::Instant::now();
+                        }
                     }
                     if is_connecting {
                         let elapsed = turn_start.elapsed();
@@ -9172,6 +9221,11 @@ pub async fn run_repl(mut config: AppConfig) -> Result<()> {
                         cost_str
                     );
                     let _ = std::io::stdout().flush();
+
+                    // #368: turn finished — show idle HUD (model + session cost).
+                    if let Some(ph) = &pane_hud {
+                        ph.update(&format!("{} · ${:.4}", config.model, session_cost_usd));
+                    }
 
                     // Record usage to .thclaws/usage/.
                     let provider_name = config.detect_provider().unwrap_or("unknown");

@@ -306,6 +306,9 @@ impl Session {
     /// the next save.
     pub fn sync(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+        if self.last_saved_count > self.messages.len() {
+            self.last_saved_count = self.messages.len();
+        }
         self.updated_at = now_secs();
     }
 

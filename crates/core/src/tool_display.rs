@@ -20,6 +20,9 @@ fn terminal_width() -> usize {
 }
 
 fn fit_label(label: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
     let len = label.chars().count();
     if len > width {
         truncate(label, width.saturating_sub(1))
@@ -329,7 +332,7 @@ pub(crate) fn clear_thinking_line() -> String {
 pub(crate) fn format_worker_start(worker_id: u32, prompt_preview: &str) -> String {
     let width = terminal_width();
     // visible: "  ⠋ w{id}  {label}" — 7 fixed chars + id digits
-    let id_len = if worker_id == 0 { 1 } else { (worker_id as f64).log10() as usize + 1 };
+    let id_len = worker_id.to_string().len();
     let label_cap = width.saturating_sub(7 + id_len);
     let label = truncate(&sanitize_label_field(prompt_preview), label_cap);
     format!("\r\x1b[2K\x1b[2m  ⠋ w{worker_id}  {label}\x1b[0m")
@@ -348,7 +351,7 @@ pub(crate) fn format_worker_done(
     let dur = format_duration(elapsed);
     let width = terminal_width();
     // visible: "  {icon} w{id}  {label}  {dur}" — 9 fixed chars + id digits + dur
-    let id_len = if worker_id == 0 { 1 } else { (worker_id as f64).log10() as usize + 1 };
+    let id_len = worker_id.to_string().len();
     let label_cap = width.saturating_sub(9 + id_len + dur.len());
     let label = truncate(&sanitize_label_field(prompt_preview), label_cap);
     format!("\r\x1b[2K\x1b[2m  {icon} w{worker_id}  {label}  {dur}\x1b[0m\n")

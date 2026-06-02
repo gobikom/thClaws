@@ -7,16 +7,17 @@ use serde_json::Value;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// Current terminal column count, used to fit spinner labels within
+/// one row (otherwise `\r` overwrite breaks on line-wrap — see #138).
+/// Returns 80 when stdout isn't a tty or the OS query fails. The
+/// `terminal_size` crate wraps `TIOCGWINSZ` on Unix and
+/// `GetConsoleScreenBufferInfo` on Windows so we don't have to
+/// hand-roll cross-platform unsafe.
 fn terminal_width() -> usize {
-    unsafe {
-        let mut ws = std::mem::MaybeUninit::<libc::winsize>::uninit();
-        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, ws.as_mut_ptr()) == 0 {
-            let w = ws.assume_init().ws_col as usize;
-            if w > 0 { w } else { 80 }
-        } else {
-            80
-        }
-    }
+    terminal_size::terminal_size()
+        .map(|(w, _)| w.0 as usize)
+        .filter(|w| *w > 0)
+        .unwrap_or(80)
 }
 
 fn fit_label(label: &str, width: usize) -> String {

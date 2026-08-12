@@ -192,6 +192,7 @@ pub fn add_from_preset_with_store(
         cwd,
         prompt: render_prompt(preset, kms),
         model: None,
+        resume_session: None,
         max_iterations: None,
         timeout_secs: None,
         enabled: true,

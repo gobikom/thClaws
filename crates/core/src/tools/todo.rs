@@ -1,6 +1,6 @@
 //! TodoWrite tool — write/update the project's todo list.
 //!
-//! Stores todos in `.thclaws/todos.md` (markdown format).
+//! Stores todos in `.thclaws/state/todos.md` (markdown format).
 //! Input: `{ "todos": [{"id": "1", "content": "Fix bug", "status": "in_progress"|"pending"|"completed"}] }`
 //! The tool overwrites the entire todo list (full state replacement, not append).
 //!
@@ -51,13 +51,13 @@ pub struct TodoWriteTool;
 
 impl TodoWriteTool {
     fn todos_path() -> PathBuf {
-        PathBuf::from(".thclaws").join("todos.md")
+        PathBuf::from(".thclaws").join("state").join("todos.md")
     }
 
     /// Write todos to a specific root directory (for testing).
     #[cfg(test)]
     fn write_todos_to(root: &std::path::Path, todos: &[TodoItem]) -> Result<String> {
-        let path = root.join(".thclaws").join("todos.md");
+        let path = root.join(".thclaws").join("state").join("todos.md");
 
         // Build markdown content.
         let mut md = String::from("# Todos\n\n");
@@ -82,7 +82,7 @@ impl TodoWriteTool {
         let pending = todos.iter().filter(|t| t.status == "pending").count();
 
         Ok(format!(
-            "Wrote {} todo(s) to .thclaws/todos.md ({} pending, {} in progress, {} completed)",
+            "Wrote {} todo(s) to .thclaws/state/todos.md ({} pending, {} in progress, {} completed)",
             todos.len(),
             pending,
             in_progress,
@@ -214,12 +214,12 @@ impl Tool for TodoWriteTool {
 
     fn description(&self) -> &'static str {
         "Casual scratchpad for YOUR OWN task tracking during informal \
-         multi-step work — writes to .thclaws/todos.md as a markdown \
+         multi-step work — writes to .thclaws/state/todos.md as a markdown \
          checklist. Invisible in the chat / sidebar; the user only sees \
          it if they open the file. No approval gate, no driver, no \
          sequential enforcement.\n\n\
          \
-         **At session start, if `.thclaws/todos.md` already exists, read \
+         **At session start, if `.thclaws/state/todos.md` already exists, read \
          it first.** Incomplete items (pending or in_progress) are work \
          from a prior session — surface them and either resume or \
          replace based on the user's intent. Don't silently start fresh \
@@ -301,7 +301,7 @@ impl Tool for TodoWriteTool {
         // empirically before fix.
         Self::check_thclaws_not_symlinked()?;
 
-        // Write to .thclaws/todos.md (relative to cwd).
+        // Write to .thclaws/state/todos.md (relative to cwd).
         let path = Self::todos_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -320,7 +320,7 @@ impl Tool for TodoWriteTool {
         let pending = todos.iter().filter(|t| t.status == "pending").count();
 
         Ok(format!(
-            "Wrote {} todo(s) to .thclaws/todos.md ({} pending, {} in progress, {} completed)",
+            "Wrote {} todo(s) to .thclaws/state/todos.md ({} pending, {} in progress, {} completed)",
             todos.len(),
             pending,
             in_progress,
@@ -329,7 +329,7 @@ impl Tool for TodoWriteTool {
     }
 }
 
-/// Parse `.thclaws/todos.md` back into a `Vec<TodoItem>` so the GUI
+/// Parse `.thclaws/state/todos.md` back into a `Vec<TodoItem>` so the GUI
 /// worker can hydrate the sidebar at session boot. Mirror of the
 /// `to_markdown()` writer — recognizes `[x]` / `[-]` / `[ ]` and
 /// `(id: <id>)` at end of line. Ignores blank lines, headings, and
@@ -337,7 +337,7 @@ impl Tool for TodoWriteTool {
 /// parse trouble (the sidebar simply shows nothing — better than
 /// crashing the worker).
 pub fn read_todos_from_disk(root: &std::path::Path) -> Vec<TodoItem> {
-    let path = root.join(".thclaws").join("todos.md");
+    let path = root.join(".thclaws").join("state").join("todos.md");
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -406,7 +406,7 @@ mod tests {
         assert!(result.contains("1 in progress"));
         assert!(result.contains("1 completed"));
 
-        let contents = std::fs::read_to_string(dir.path().join(".thclaws/todos.md")).unwrap();
+        let contents = std::fs::read_to_string(dir.path().join(".thclaws/state/todos.md")).unwrap();
         assert!(contents.contains("# Todos"));
         assert!(contents.contains("[x] Fix bug (id: 1)"));
         assert!(contents.contains("[-] Add tests (id: 2)"));
@@ -420,7 +420,7 @@ mod tests {
         let result = TodoWriteTool::write_todos_to(dir.path(), &[]).unwrap();
         assert!(result.contains("0 todo(s)"));
 
-        let contents = std::fs::read_to_string(dir.path().join(".thclaws/todos.md")).unwrap();
+        let contents = std::fs::read_to_string(dir.path().join(".thclaws/state/todos.md")).unwrap();
         assert!(contents.contains("_No todos._"));
     }
 
@@ -444,7 +444,7 @@ mod tests {
         }];
         TodoWriteTool::write_todos_to(dir.path(), &todos2).unwrap();
 
-        let contents = std::fs::read_to_string(dir.path().join(".thclaws/todos.md")).unwrap();
+        let contents = std::fs::read_to_string(dir.path().join(".thclaws/state/todos.md")).unwrap();
         assert!(!contents.contains("Old task"));
         assert!(contents.contains("[x] New task (id: 2)"));
     }
@@ -486,14 +486,14 @@ mod tests {
 
     #[test]
     fn description_tells_model_to_resume_from_existing_todos_md() {
-        // When .thclaws/todos.md already exists at session start, the
+        // When .thclaws/state/todos.md already exists at session start, the
         // model should read it and surface incomplete work — not
         // silently start fresh on top of a stale list. The tool
         // description carries this rule because the system prompt
         // alone may not survive truncation in long sessions.
         let d = TodoWriteTool.description();
         assert!(
-            d.contains(".thclaws/todos.md"),
+            d.contains(".thclaws/state/todos.md"),
             "must name the todos file path: {d}",
         );
         assert!(
@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn read_todos_from_disk_returns_empty_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
-        // No .thclaws/todos.md written.
+        // No .thclaws/state/todos.md written.
         assert!(read_todos_from_disk(dir.path()).is_empty());
     }
 
@@ -808,7 +808,8 @@ mod tests {
         assert!(msg.contains("1 in progress"));
         assert!(msg.contains("1 completed"));
         // File written under the scratch dir.
-        let written = std::fs::read_to_string(scratch.path().join(".thclaws/todos.md")).unwrap();
+        let written =
+            std::fs::read_to_string(scratch.path().join(".thclaws/state/todos.md")).unwrap();
         assert!(written.contains("- [ ] normal task (id: 1)"));
         assert!(written.contains("- [-] another (id: 2)"));
         assert!(written.contains("- [x] third (id: 3)"));

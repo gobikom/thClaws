@@ -57,7 +57,7 @@ For providers that report a TOTAL prompt count (OpenAI's `prompt_tokens`, Gemini
 | **OpenAI** | implicit (server-side ≥1024 tokens) | ✓ since M6.22 — `prompt_tokens_details.cached_tokens` → `cache_read_input_tokens` | n/a (auto) | 50% read |
 | **OpenAIResponses** | implicit (server-side, includes cross-call via `previous_response_id`) | ✓ since M6.22 — `input_tokens_details.cached_tokens` | n/a (auto) | 50% read |
 | **OpenRouter** (via OpenAI provider) | depends on upstream | ✓ since M6.22 if upstream emits standard fields | n/a | depends on routed-to provider |
-| **AgenticPress / DashScope / ZAi / LMStudio / OpenAICompat / ThaiLLM** (via OpenAI provider) | depends on upstream | ✓ since M6.22 if upstream emits `prompt_tokens_details.cached_tokens` | n/a | varies |
+| **DashScope / ZAi / LMStudio / OpenAICompat / ThaiLLM / Moonshot / xAI / Groq** (via OpenAI provider) | depends on upstream | ✓ since M6.22 if upstream emits `prompt_tokens_details.cached_tokens` | n/a | varies |
 | **DeepSeek** (via OpenAI provider) | implicit (`prompt_cache_hit_tokens`/`prompt_cache_miss_tokens`) | ✓ since M6.22 — defensive dual-check in `parse_openai_usage` | n/a (auto) | 10% read |
 | **Gemini** | implicit + explicit `cachedContents` resource | ✓ since M6.22 — `cachedContentTokenCount` for implicit; explicit not wired | ✗ explicit cache not wired (G6 deferred) | 25% (implicit) |
 | **Ollama** | none (local, no caching concept) | n/a — hardcoded None | n/a | n/a |
@@ -231,7 +231,7 @@ fn parse_openai_usage(v: &Value) -> Option<Usage> {
 }
 ```
 
-OpenAI's auto-cache works server-side (you ARE getting the cost discount), but `usage.prompt_tokens_details.cached_tokens` never lands in `Usage`. The CLI/GUI never displays cache hits for OpenAI / OpenRouter / OpenAICompat / DashScope / ZAi / LMStudio / AgenticPress / ThaiLLM (everyone routing through `OpenAIProvider`).
+OpenAI's auto-cache works server-side (you ARE getting the cost discount), but `usage.prompt_tokens_details.cached_tokens` never lands in `Usage`. The CLI/GUI never displays cache hits for OpenAI / OpenRouter / OpenAICompat / DashScope / ZAi / LMStudio / ThaiLLM (everyone routing through `OpenAIProvider`).
 
 **Impact:** the per-turn token pill shows `5000 in / 200 out` for an OpenAI turn that actually consumed `500 fresh + 4500 cached`. User can't tell the cache is working. Daily totals also undercount cache reads.
 

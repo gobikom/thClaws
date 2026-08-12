@@ -47,9 +47,40 @@ function originAccent(o: AgentOrigin): string {
 
 type Decision = "allow" | "allow_for_session" | "deny";
 
+function formatValue(value: unknown): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
 function summarizeInput(input: unknown): string {
   if (input === null || input === undefined) return "";
   if (typeof input === "string") return input;
+  // Render a flat object as multi-line "Key: value" pairs (one per
+  // line) instead of raw JSON — easier to scan in the approval box.
+  // Multi-line string values (e.g. an Edit's old/new text) drop to an
+  // indented block; nested objects/arrays fall back to pretty JSON.
+  if (typeof input === "object" && !Array.isArray(input)) {
+    const entries = Object.entries(input as Record<string, unknown>);
+    if (entries.length === 0) return "";
+    return entries
+      .map(([key, value]) => {
+        const rendered = formatValue(value);
+        if (rendered.includes("\n")) {
+          const indented = rendered
+            .split("\n")
+            .map((line) => "  " + line)
+            .join("\n");
+          return `${key}:\n${indented}`;
+        }
+        return `${key}: ${rendered}`;
+      })
+      .join("\n");
+  }
   try {
     return JSON.stringify(input, null, 2);
   } catch {

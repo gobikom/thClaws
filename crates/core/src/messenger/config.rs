@@ -1,23 +1,42 @@
-//! On-disk binding config at `~/.config/thclaws/messenger.json`.
+//! On-disk binding config at `./.thclaws/messenger.json` (dev-plan/33
+//! Tier 2 — project-scoped, mirrors the Telegram + LINE per-project
+//! move).
 //!
 //! Same model as the LINE bridge (`crate::line::config`): the
 //! high-value secrets — the Page Access Token + App Secret — live on
 //! the relay (k3s Secret), never here. The desktop only stores the
 //! binding JWT the relay's `POST /pair` hands back plus the relay URL,
-//! then reconnects the WebSocket on each launch.
+//! then reconnects the WebSocket on each launch — per project.
 //!
 //! Tier 1 (dev-plan/31) shares the LINE relay deployment, so the
 //! default server URL is the same `line.thclaws.ai` host with a
 //! `/messenger/webhook` ingest path. The rename to a neutral gateway
 //! host is dev-plan/31 open-question #1 (deferred to Tier 3).
+//!
+//! Legacy `~/.config/thclaws/messenger.json` is consulted as a
+//! fallback only when env var `THCLAWS_MESSENGER_USER_CONFIG=1` is
+//! set, so pre-Tier 2 installs keep working until the user migrates.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::BridgeConfig;
+
 /// Default relay when `server_url` isn't set. Shared with the LINE
 /// relay in Tier 1; override in dev via `THCLAWS_MESSENGER_SERVER`.
 pub const DEFAULT_SERVER_URL: &str = "https://line.thclaws.ai";
+
+/// Env opt-in for the legacy `~/.config/thclaws/messenger.json`
+/// fallback path. Without this, only `./.thclaws/messenger.json` is
+/// consulted — each project owns its own Messenger binding.
+pub const USER_FALLBACK_ENV: &str = "THCLAWS_MESSENGER_USER_CONFIG";
+
+fn user_fallback_enabled() -> bool {
+    std::env::var(USER_FALLBACK_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum MessengerConfigError {
@@ -54,28 +73,66 @@ pub struct MessengerConfig {
 }
 
 impl MessengerConfig {
-    /// Canonical on-disk path. `None` only when no home directory can
-    /// be resolved (headless/CI environments).
+    /// Project-scoped path: `./.thclaws/messenger.json` — resolved
+    /// against the current working directory at call time. dev-plan/33
+    /// Tier 2 moved this off the user-level path so each project owns
+    /// its own Messenger binding.
     pub fn path() -> Result<PathBuf, MessengerConfigError> {
+        let cwd = std::env::current_dir().map_err(|source| MessengerConfigError::Io {
+            path: PathBuf::from("."),
+            source,
+        })?;
+        Ok(cwd.join(".thclaws").join("messenger.json"))
+    }
+
+    /// Legacy user-level path (`~/.config/thclaws/messenger.json`).
+    /// Only consulted as a fallback when
+    /// `THCLAWS_MESSENGER_USER_CONFIG=1` is set — pre-Tier 2 installs
+    /// had their binding here.
+    pub fn legacy_user_path() -> Result<PathBuf, MessengerConfigError> {
         let home = crate::util::home_dir().ok_or(MessengerConfigError::NoHome)?;
         Ok(home.join(".config").join("thclaws").join("messenger.json"))
     }
 
-    /// Read from disk. `Ok(None)` when the file is absent — the
-    /// "Messenger bridge not configured" default for a fresh install.
+    /// Read from disk. Project path first; legacy user path as
+    /// opt-in fallback. `Ok(None)` when both are absent.
     pub fn load() -> Result<Option<Self>, MessengerConfigError> {
-        let path = Self::path()?;
-        match std::fs::read_to_string(&path) {
+        let project_path = Self::path()?;
+        match std::fs::read_to_string(&project_path) {
+            Ok(body) => {
+                return serde_json::from_str(&body).map(Some).map_err(|source| {
+                    MessengerConfigError::Json {
+                        path: project_path,
+                        source,
+                    }
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(MessengerConfigError::Io {
+                    path: project_path,
+                    source,
+                });
+            }
+        }
+        if !user_fallback_enabled() {
+            return Ok(None);
+        }
+        let user_path = Self::legacy_user_path()?;
+        match std::fs::read_to_string(&user_path) {
             Ok(body) => {
                 serde_json::from_str(&body)
                     .map(Some)
                     .map_err(|source| MessengerConfigError::Json {
-                        path: path.clone(),
+                        path: user_path,
                         source,
                     })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(MessengerConfigError::Io { path, source }),
+            Err(source) => Err(MessengerConfigError::Io {
+                path: user_path,
+                source,
+            }),
         }
     }
 
@@ -116,65 +173,34 @@ impl MessengerConfig {
         }
     }
 
-    /// Resolve the relay URL. Precedence: explicit `server_url` →
-    /// `THCLAWS_MESSENGER_SERVER` env → `DEFAULT_SERVER_URL`.
-    pub fn resolved_server_url(&self) -> String {
-        if let Some(url) = self.server_url.as_deref() {
-            return url.trim_end_matches('/').to_string();
-        }
-        if let Ok(url) = std::env::var("THCLAWS_MESSENGER_SERVER") {
-            if !url.trim().is_empty() {
-                return url.trim_end_matches('/').to_string();
-            }
-        }
-        DEFAULT_SERVER_URL.to_string()
-    }
+    // `resolved_server_url` / `ws_url` / `reply_url` / `push_url` /
+    // `unpair_url` now come from the shared `BridgeConfig` trait
+    // (dev-plan/44 Tier 0). Messenger's `route_prefix` is `/messenger`,
+    // so reply/push namespace under it; see the impl below.
+}
 
-    /// Build the `wss://…/ws?token=<jwt>` URL the WS client opens.
-    pub fn ws_url(&self) -> String {
-        let base = self.resolved_server_url();
-        let scheme = if base.starts_with("http://") {
-            "ws://"
-        } else {
-            "wss://"
-        };
-        let host = base
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        format!(
-            "{scheme}{host}/ws?token={}",
-            urlencoding::encode(&self.binding_token)
-        )
+impl BridgeConfig for MessengerConfig {
+    fn binding_token(&self) -> &str {
+        &self.binding_token
     }
-
-    /// Build the absolute `POST /messenger/reply/<request_id>` URL. The
-    /// relay resolves the recipient PSID from the inbound event keyed
-    /// by `request_id` and calls the Graph API Send API.
-    pub fn reply_url(&self, request_id: &str) -> String {
-        format!(
-            "{}/messenger/reply/{}",
-            self.resolved_server_url(),
-            urlencoding::encode(request_id)
-        )
+    fn server_url_override(&self) -> Option<&str> {
+        self.server_url.as_deref()
     }
-
-    /// Build the absolute `POST /messenger/push` URL — unsolicited
-    /// messages (approval prompts, timeout notices) that have no
-    /// inbound event to reply to. The relay targets the Page's most-
-    /// recent inbound PSID (Tier-1 approximation).
-    pub fn push_url(&self) -> String {
-        format!("{}/messenger/push", self.resolved_server_url())
+    fn server_env_var(&self) -> &'static str {
+        "THCLAWS_MESSENGER_SERVER"
     }
-
-    /// Build the absolute `POST /unpair` URL.
-    pub fn unpair_url(&self) -> String {
-        format!("{}/unpair", self.resolved_server_url())
+    fn default_server(&self) -> &'static str {
+        DEFAULT_SERVER_URL
+    }
+    fn route_prefix(&self) -> &'static str {
+        "/messenger"
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::BridgeConfig;
 
     #[test]
     fn server_url_precedence_config_over_env_over_default() {

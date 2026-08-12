@@ -35,7 +35,7 @@ Linux)
 | **CPU** | 64-bit x86_64 หรือ ARM64 ของช่วง 10 ปีมานี้ | multi-core รุ่นใหม่ ๆ |
 | **RAM** | ว่างอยู่ 2 GB | รวมทั้งเครื่อง 8 GB |
 | **Disk** | ~50 MB | SSD |
-| **Network** | จำเป็นถ้าใช้ cloud provider (Anthropic / OpenAI / Gemini / OpenRouter / Z.ai / DashScope / Agentic Press); ถ้าใช้แต่ Ollama หรือ LMStudio ในเครื่อง ก็ไม่ต้องใช้เน็ต | broadband |
+| **Network** | จำเป็นถ้าใช้ cloud provider (Anthropic / OpenAI / Gemini / OpenRouter / Z.ai / DashScope); ถ้าใช้แต่ Ollama หรือ LMStudio ในเครื่อง ก็ไม่ต้องใช้เน็ต | broadband |
 
 ถ้าใช้ thClaws กับ cloud provider อย่างเดียว — โน๊ตบุ๊คซื้อมาในช่วงไม่กี่
 ปีหลัง ๆ รันได้สบาย ๆ ส่วนกรณีรันโมเดลในเครื่องเอง (local) เพดานสเปก

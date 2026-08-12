@@ -575,14 +575,14 @@ pub fn build_step_continuation_prompt(
     }
 }
 
-/// Read `.thclaws/todos.md` from the working directory and, if it
+/// Read `.thclaws/state/todos.md` from the working directory and, if it
 /// exists and has any incomplete items (`[ ]` pending or `[-]`
 /// in_progress), return a system-reminder string surfacing the list.
 /// Returns `None` if the file is missing, empty, or has only completed
 /// items — no point nagging the model with a fully-checked list.
 ///
 /// This is the programmatic counterpart to the system-prompt directive
-/// that says "check `.thclaws/todos.md` BEFORE asking for context."
+/// that says "check `.thclaws/state/todos.md` BEFORE asking for context."
 /// Real-world testing showed that prompt-only guidance isn't enough on
 /// some models — gpt-4.1 in particular still asks the user instead of
 /// reading the file. Auto-injecting the contents removes the model's
@@ -597,6 +597,7 @@ pub fn build_todos_reminder() -> Option<String> {
     let path = std::env::current_dir()
         .ok()?
         .join(".thclaws")
+        .join("state")
         .join("todos.md");
     let raw = std::fs::read_to_string(&path).ok()?;
     if raw.trim().is_empty() {
@@ -616,9 +617,9 @@ pub fn build_todos_reminder() -> Option<String> {
     // unbounded tokens every turn. 80 lines / 6 KB is generous for a
     // typical scratchpad — headers + bullets average ~50 bytes/line.
     let bounded =
-        crate::memory::truncate_for_prompt(raw.trim_end(), 80, 6_000, ".thclaws/todos.md");
+        crate::memory::truncate_for_prompt(raw.trim_end(), 80, 6_000, ".thclaws/state/todos.md");
     Some(format!(
-        "## Existing todos (.thclaws/todos.md)\n\n\
+        "## Existing todos (.thclaws/state/todos.md)\n\n\
          A scratchpad todo list from a prior session is present in this \
          workspace. Surface this to the user before asking what to work \
          on, and offer to resume incomplete items (`[ ]` pending or \
@@ -633,6 +634,119 @@ pub fn build_todos_reminder() -> Option<String> {
          start, write an updated list via TodoWrite that reflects the \
          new direction."
     ))
+}
+
+/// Strip tantivy query-syntax metacharacters so a raw user message can be
+/// used as a search query without `QueryParser` choking on stray `:`/`(`/
+/// `?` etc. Turns the message into a safe bag-of-words.
+#[cfg(feature = "kms_search_index")]
+fn sanitize_kms_query(q: &str) -> String {
+    let cleaned: String = q
+        .chars()
+        .map(|c| match c {
+            '+' | '-' | '&' | '|' | '!' | '(' | ')' | '{' | '}' | '[' | ']' | '^' | '"' | '~'
+            | '*' | '?' | ':' | '\\' | '/' => ' ',
+            other => other,
+        })
+        .collect();
+    // Cap length — the Thai segmenter handles long input but there's no
+    // point feeding a whole paragraph; the first ~200 chars carry the topic.
+    cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(200)
+        .collect()
+}
+
+/// Deterministic pre-retrieval (RAG, lightweight): before the model answers,
+/// search the active KMS for the user's message and splice a short **pointer
+/// list** of the matching canonical topic pages (name + one-line topic) into
+/// the system prompt. This removes the dependence on the model *choosing* to
+/// call `KmsSearch` — weak/economy models (and even strong ones, for "casual"
+/// phrasings) routinely skip the mandatory-consult instruction and answer from
+/// training data. Naming the relevant pages reliably triggers a `KmsRead`; we
+/// inject pointers, not full bodies, so the per-turn token cost is ~200 bytes
+/// instead of multiple KB (the model pulls only what it needs). Returns `None`
+/// (no injection) when there's no active KMS, the message is too short, or
+/// nothing clears the relevance floor — so greetings / coding turns / off-topic
+/// asks don't pull noise. Provenance (`sess-*`) and audit (`dream-*`) pages are
+/// skipped; only canonical topic pages are surfaced.
+#[cfg(feature = "kms_search_index")]
+pub fn build_kms_context_reminder(query: &str) -> Option<String> {
+    // Below the BM25 score floor we treat a hit as coincidental, not a real
+    // topic match (e.g. a one-word overlap). Tuned against observed scores:
+    // a direct topic match lands ~10-20, the audit page ~1-2.
+    const SCORE_FLOOR: f32 = 4.0;
+    const MAX_PAGES: usize = 3;
+
+    let q = sanitize_kms_query(query);
+    if q.chars().count() < 4 {
+        return None;
+    }
+    let active = crate::config::AppConfig::load().ok()?.kms_active;
+    if active.is_empty() {
+        return None;
+    }
+
+    // (score, kms_name, page, label) for canonical topic pages above the floor.
+    let mut hits: Vec<(f32, String, String, String)> = Vec::new();
+    for name in &active {
+        let Some(kref) = crate::kms::resolve(name) else {
+            continue;
+        };
+        let Ok(idx) = crate::kms_search_index::get_or_open(&kref.root) else {
+            continue;
+        };
+        let Ok(found) = idx.search(&q, &[], None, 5) else {
+            continue;
+        };
+        for h in found {
+            if h.score < SCORE_FLOOR {
+                continue;
+            }
+            // Skip provenance/audit pages — only canonical topic pages are
+            // the answer surface (digests are thin stubs, dream-* is audit).
+            if h.page.starts_with("sess-") || h.page.starts_with("dream-") {
+                continue;
+            }
+            // Prefer the page's one-line `topic:` as the pointer label, then
+            // its title, then the page stem.
+            let label = h
+                .topic
+                .clone()
+                .or_else(|| h.title.clone())
+                .unwrap_or_else(|| h.page.clone());
+            hits.push((h.score, name.clone(), h.page, label));
+        }
+    }
+    if hits.is_empty() {
+        return None;
+    }
+    hits.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    hits.truncate(MAX_PAGES);
+
+    let mut list = String::new();
+    for (_score, name, page, label) in &hits {
+        list.push_str(&format!("- `KMS: {name}/{page}` — {label}\n"));
+    }
+    Some(format!(
+        "## Relevant KMS pages (auto-matched to this message)\n\n\
+         The user's knowledge base has the following page(s) matching the current \
+         message. **Before answering, `KmsRead` the most relevant one(s) and answer \
+         from them** — the user populated the KMS specifically so answers come from \
+         here, not from training data or a fresh web search. Cite the page you used \
+         (`KMS: <name>/<page>`). If none of them actually cover the question, ignore \
+         this block and answer normally.\n\n{list}"
+    ))
+}
+
+/// No-op when the BM25 search index feature is off — auto-retrieval needs
+/// ranked scores to gate on, which only the indexed path provides.
+#[cfg(not(feature = "kms_search_index"))]
+pub fn build_kms_context_reminder(_query: &str) -> Option<String> {
+    None
 }
 
 /// Collect (position, title, output) tuples for completed steps that
@@ -685,6 +799,11 @@ pub struct Agent {
     pub max_retries: usize,
     pub thinking_budget: Option<u32>,
     pub permission_mode: PermissionMode,
+    /// Tool names that always trip the approval gate, even under
+    /// `PermissionMode::Auto` (config `askTools`). Interactive-only — with
+    /// an `AutoApprover` sink there's no human to prompt, so a listed tool
+    /// still sails through. Empty = mode alone decides (original behavior).
+    pub ask_tools: Vec<String>,
     approver: Arc<dyn ApprovalSink>,
     history: Arc<Mutex<Vec<Message>>>,
     /// Cooperative cancel signal shared with the worker / driver. M6.17
@@ -766,6 +885,7 @@ impl Agent {
             max_retries: 3,
             thinking_budget: None,
             permission_mode: PermissionMode::Auto,
+            ask_tools: Vec::new(),
             approver: Arc::new(AutoApprover),
             history: Arc::new(Mutex::new(Vec::new())),
             cancel: None,
@@ -887,6 +1007,13 @@ impl Agent {
         self
     }
 
+    /// Force the approval gate on for these tool names regardless of the
+    /// permission mode (config `askTools`). See the field docs.
+    pub fn with_ask_tools(mut self, tools: Vec<String>) -> Self {
+        self.ask_tools = tools;
+        self
+    }
+
     pub fn with_approver(mut self, approver: Arc<dyn ApprovalSink>) -> Self {
         self.approver = approver;
         self
@@ -907,6 +1034,16 @@ impl Agent {
         self.system = text.into();
     }
 
+    /// Read-only view of the captured system prompt. Used by
+    /// regression tests that verify `set_system` / `append_system`
+    /// land what they claim — particularly the
+    /// `refresh_repl_system_prompt` addendum-preservation path,
+    /// where wiping the team-role addenda would be a silent failure
+    /// otherwise.
+    pub fn system_text(&self) -> &str {
+        &self.system
+    }
+
     pub fn history_snapshot(&self) -> Vec<Message> {
         self.history.lock().expect("history lock").clone()
     }
@@ -920,8 +1057,19 @@ impl Agent {
         &self.provider
     }
 
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     pub fn clear_history(&self) {
         self.history.lock().expect("history lock").clear();
+    }
+
+    /// The tools this agent actually exposes to the model this turn
+    /// (gate/env filtered, sorted). Backs the `/tools` command so users get
+    /// registry ground truth instead of a model's prose enumeration.
+    pub fn tool_defs(&self) -> Vec<crate::types::ToolDef> {
+        self.tools.tool_defs()
     }
 
     /// Replace the agent's history wholesale — used when loading a saved session.
@@ -962,12 +1110,26 @@ impl Agent {
         // state every turn (plan mode active? plan submitted but not
         // approved? existing todos.md from a prior session?). Cheap —
         // just a string concat per turn.
+        // Query for deterministic KMS pre-retrieval: the user's text for
+        // this turn. Computed before `user_content` is moved into history.
+        let kms_query: String = user_content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
         let system = {
             let base = self.system.clone();
             let mode = crate::permissions::current_mode();
             let active_plan = crate::tools::plan_state::get();
             let plan_reminder = build_plan_reminder(mode, active_plan.as_ref());
             let todos_reminder = build_todos_reminder();
+            // Deterministic pre-retrieval: pull relevant KMS pages for this
+            // message so the model answers from stored knowledge without
+            // having to decide to call KmsSearch first.
+            let kms_reminder = build_kms_context_reminder(&kms_query);
             // Chain reminders. Plan reminder dominates when active —
             // it has the strongest per-turn discipline and would be
             // redundant with todos guidance. Otherwise surface todos
@@ -976,6 +1138,14 @@ impl Agent {
                 (Some(p), Some(t)) => Some(format!("{p}\n\n{t}")),
                 (Some(p), None) => Some(p),
                 (None, Some(t)) => Some(t),
+                (None, None) => None,
+            };
+            // Retrieved KMS context is independent of plan/todos — always
+            // append it when present.
+            let chained = match (chained, kms_reminder) {
+                (Some(c), Some(k)) => Some(format!("{c}\n\n{k}")),
+                (Some(c), None) => Some(c),
+                (None, Some(k)) => Some(k),
                 (None, None) => None,
             };
             match chained {
@@ -994,6 +1164,10 @@ impl Agent {
         // `permissions::current_mode()` so EnterPlanMode / ExitPlanMode /
         // `/plan` flips take effect mid-turn rather than next-message.
         let permission_mode_default = self.permission_mode;
+        // `askTools`: names that force the approval gate on regardless of
+        // mode (read once per turn — a static config list, unlike the live
+        // `current_mode()` above).
+        let ask_tools = self.ask_tools.clone();
         let approver = self.approver.clone();
         let history = self.history.clone();
         let cancel = self.cancel.clone();
@@ -1012,6 +1186,15 @@ impl Agent {
 
             let mut current_max_tokens = base_max_tokens;
             let mut cumulative_usage = Usage::default();
+
+            // Degenerate-tool-loop breaker: a model that repeats the SAME
+            // failing tool call (same tool, same input, same error) burns the
+            // whole iteration budget learning nothing — grok-4.5 re-sent an
+            // argless WorkflowRun 22× straight. Track a signature of each
+            // all-errors tool iteration; three identical ones in a row ends
+            // the turn with a clear message instead of grinding to the cap.
+            let mut degen_sig: Option<String> = None;
+            let mut degen_count: u32 = 0;
 
             // 0 means unlimited.
             let effective_max = if max_iterations == 0 { usize::MAX } else { max_iterations };
@@ -1058,7 +1241,7 @@ impl Agent {
                             );
                         }
                     }
-                    let compacted = compact(&h, messages_budget);
+                    let mut compacted = compact(&h, messages_budget);
                     if will_compact {
                         if let Some(hk) = &hooks {
                             let post_tokens =
@@ -1071,6 +1254,28 @@ impl Agent {
                             );
                         }
                     }
+                    // Issue #144: defensive last-mile sanitization.
+                    // Compaction's no-op path (history fits budget) skips
+                    // the orphan-tool-result protection in compact(),
+                    // and `/model` swap preserves history across
+                    // providers — so the destination wire format can
+                    // see partial-state blocks (tool_use without
+                    // matching tool_result, or vice versa). Every
+                    // provider rejects those (DashScope code 2013,
+                    // Anthropic "tool_use ids without matching
+                    // tool_result", OpenAI "tool_call_ids did not
+                    // have response messages"). Strip just before
+                    // the request leaves the engine.
+                    crate::compaction::sanitize_tool_pairs(&mut compacted);
+                    // Bound the base64 image payload to the gateway body cap.
+                    // compact() trims by *tokens*, which doesn't track base64
+                    // byte size — N freshly-read images (e.g. "read all 7
+                    // namecards") can sit within the token budget yet blow the
+                    // 5 MB body cap on the one request that must carry them.
+                    // Shrinks images (then evicts oldest as a last resort) on
+                    // this outgoing copy only; stored history is untouched and
+                    // gets redacted post-send.
+                    fit_outgoing_image_payload(&mut compacted);
                     compacted
                 };
                 let tool_defs = tools.tool_defs();
@@ -1107,7 +1312,18 @@ impl Agent {
                     Some(cap) => current_max_tokens.min(cap),
                     None => current_max_tokens,
                 };
-                let req = StreamRequest {
+                // dev-plan/55: swap Thai PII for `[ID_1]`-style placeholders
+                // on the way out, and restore it on the way back below.
+                // History stays plaintext — the masking lives at the wire, so
+                // every turn re-masks and coreference keeps the placeholders
+                // stable. Skipped for local models: nothing leaves the host,
+                // and masking would only cost the model context.
+                let masker = crate::sensitive::active().filter(|_| {
+                    !crate::providers::ProviderKind::detect(&active_model)
+                        .map(|k| k.is_local())
+                        .unwrap_or(false)
+                });
+                let mut req = StreamRequest {
                     model: active_model,
                     system: if system.is_empty() { None } else { Some(system.clone()) },
                     messages,
@@ -1116,6 +1332,9 @@ impl Agent {
                     thinking_budget,
                     stream_chunk_timeout_override: chunk_timeout_override,
                 };
+                if let Some(m) = &masker {
+                    m.mask_request(&mut req);
+                }
 
                 // Retry with exponential backoff on transient errors.
                 // Config errors (missing API key, bad model name, etc.)
@@ -1172,6 +1391,10 @@ impl Agent {
                 let mut turn_text = String::new();
                 let mut turn_thinking = String::new();
                 let mut turn_tool_uses: Vec<ContentBlock> = Vec::new();
+                // Un-masking carry buffer: a placeholder can straddle two
+                // text deltas, so the tail of a chunk that might still become
+                // one is held until the next chunk (flushed after the loop).
+                let mut mask_pending = String::new();
                 // L4 (M6.17): id → parse error message for any tool use
                 // whose JSON input failed to parse mid-stream. The per-
                 // tool dispatch loop emits a synthetic error tool_result
@@ -1182,8 +1405,23 @@ impl Agent {
                 while let Some(ev) = assembled.next().await {
                     match ev? {
                         AssembledEvent::Text(s) => {
-                            turn_text.push_str(&s);
-                            yield AgentEvent::Text(s);
+                            match &masker {
+                                // Persist the plain reading, show the marked
+                                // one: history and tools must never carry the
+                                // display wrapper, but the reader should see
+                                // which values were put back locally.
+                                Some(m) => {
+                                    let r = m.feed(&mut mask_pending, &s);
+                                    if !r.is_empty() {
+                                        turn_text.push_str(&r.plain);
+                                        yield AgentEvent::Text(r.display);
+                                    }
+                                }
+                                None => {
+                                    turn_text.push_str(&s);
+                                    yield AgentEvent::Text(s);
+                                }
+                            }
                         }
                         AssembledEvent::Thinking(s) => {
                             // Capture for persistence so it can be echoed
@@ -1219,7 +1457,16 @@ impl Agent {
                             // below can emit a matching error result.
                             turn_parse_errors.push((id, error));
                         }
-                        AssembledEvent::ToolUse(block) => {
+                        AssembledEvent::ToolUse(mut block) => {
+                            // Restore real values in the arguments BEFORE the
+                            // tool runs — otherwise a Write lands `[PHONE_1]`
+                            // in the user's file. Done on the parsed Value, so
+                            // a value carrying a quote can't break the JSON.
+                            if let Some(m) = &masker {
+                                if let ContentBlock::ToolUse { input, .. } = &mut block {
+                                    m.unmask_json(input);
+                                }
+                            }
                             // L1 (M6.17): announce the tool call as soon as
                             // it's parsed, BEFORE the per-tool execution
                             // loop's approval / plan-mode / dispatch gates.
@@ -1253,6 +1500,16 @@ impl Agent {
                                 cumulative_usage.accumulate(u);
                             }
                         }
+                    }
+                }
+
+                // Whatever the un-masker was still holding for a possible
+                // placeholder is plain text now that the stream is over.
+                if let Some(m) = &masker {
+                    let tail = m.flush(&mut mask_pending);
+                    if !tail.is_empty() {
+                        turn_text.push_str(&tail.plain);
+                        yield AgentEvent::Text(tail.display);
                     }
                 }
 
@@ -1347,7 +1604,120 @@ impl Agent {
 
                 // Execute each tool (after approval, if required) and collect results.
                 let mut result_blocks: Vec<ContentBlock> = Vec::new();
+                // ── Concurrent fast-path (dev-plan/46) ──────────────────
+                // When a turn emits ≥2 tool calls that are ALL parallelizable
+                // (read-only / Task subagents — no approval, no mutation), run
+                // them in one concurrent batch instead of awaiting each in
+                // turn: wall-clock collapses from sum-of-N to max-of-N. This
+                // is behaviourally identical to the sequential loop below for
+                // these tools (they clear every guard anyway). Any other mix
+                // (mutating tools, approvals, parse errors) leaves the flag
+                // false and falls through to the sequential loop unchanged.
+                let mut handled_concurrently = false;
+                {
+                    let exec: Vec<(String, String, Value)> = turn_tool_uses
+                        .iter()
+                        .filter_map(|tu| match tu {
+                            ContentBlock::ToolUse { id, name, input, .. } => {
+                                Some((id.clone(), name.clone(), input.clone()))
+                            }
+                            _ => None,
+                        })
+                        .filter(|(id, _, _)| !turn_parse_errors.iter().any(|(eid, _)| eid == id))
+                        .collect();
+                    let all_parallelizable = exec.len() >= 2
+                        && exec.iter().all(|(_, name, _)| {
+                            tools.get(name).map(|t| t.parallelizable()).unwrap_or(false)
+                        });
+                    if all_parallelizable {
+                        let futs = exec.into_iter().map(|(id, name, input)| {
+                            let tool = tools.get(&name).expect("parallelizable ⇒ tool exists");
+                            let hooks = hooks.clone();
+                            async move {
+                                let hook_denied: Option<String> = if let Some(h) = &hooks {
+                                    let input_str = serde_json::to_string(&input)
+                                        .unwrap_or_else(|_| "<unserializable>".to_string());
+                                    match crate::hooks::fire_pre_tool_use_gate(h, &name, &input_str)
+                                        .await
+                                    {
+                                        crate::hooks::PreToolDecision::Deny(r) => Some(r),
+                                        crate::hooks::PreToolDecision::Allow => None,
+                                    }
+                                } else {
+                                    None
+                                };
+                                let tool_result = match hook_denied {
+                                    Some(reason) => Err(crate::error::Error::Tool(format!(
+                                        "blocked by policy: {reason}"
+                                    ))),
+                                    None => tool.call_multimodal(input).await,
+                                };
+                                let ui_resource = if tool_result.is_ok() {
+                                    tool.fetch_ui_resource().await
+                                } else {
+                                    None
+                                };
+                                (id, name, tool_result, ui_resource)
+                            }
+                        });
+                        // join_all preserves input order → result_blocks +
+                        // events stay in the model's tool_use order.
+                        let results = futures::future::join_all(futs).await;
+                        for (id, name, tool_result, ui_resource) in results {
+                            let (content, is_error) = match &tool_result {
+                                Ok(c) => {
+                                    let truncated = match c {
+                                        crate::types::ToolResultContent::Text(s) => {
+                                            crate::types::ToolResultContent::Text(
+                                                maybe_truncate_to_disk(s),
+                                            )
+                                        }
+                                        crate::types::ToolResultContent::Blocks(_) => c.clone(),
+                                    };
+                                    (truncated, false)
+                                }
+                                Err(e) => (
+                                    crate::types::ToolResultContent::Text(format!("error: {e}")),
+                                    true,
+                                ),
+                            };
+                            let content = if content.is_empty() {
+                                crate::types::ToolResultContent::Text("(no output)".to_string())
+                            } else {
+                                content
+                            };
+                            if let Some(h) = &hooks {
+                                let preview = match &content {
+                                    crate::types::ToolResultContent::Text(s) => s.clone(),
+                                    crate::types::ToolResultContent::Blocks(_) => {
+                                        "<multimodal>".to_string()
+                                    }
+                                };
+                                crate::hooks::fire_post_tool_use(h, &name, &preview, is_error);
+                            }
+                            result_blocks.push(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: content.clone(),
+                                is_error,
+                            });
+                            yield AgentEvent::ToolCallResult {
+                                id,
+                                name,
+                                output: match tool_result {
+                                    Ok(c) => Ok(c.to_text()),
+                                    Err(e) => Err(format!("{e}")),
+                                },
+                                ui_resource,
+                            };
+                        }
+                        handled_concurrently = true;
+                    }
+                }
+
                 for tu in &turn_tool_uses {
+                    if handled_concurrently {
+                        break;
+                    }
                     let ContentBlock::ToolUse { id, name, input, .. } = tu else { continue };
 
                     // L4 (M6.17): if this tool's JSON input failed to
@@ -1521,8 +1891,13 @@ impl Agent {
                     // Approval gate. `asks_for_approval()` covers
                     // both `Ask` (local prompt) and `LineGated`
                     // (plan-07 Phase 1.2 — prompt routed to LINE).
-                    let needs_approval =
-                        permission_mode.asks_for_approval() && tool.requires_approval(input);
+                    // `askTools` forces the gate on for a named tool even
+                    // under `Auto`, bypassing both the mode check and the
+                    // tool's own `requires_approval` — an interactive-only
+                    // escape hatch (an AutoApprover sink still auto-yeses).
+                    let force_ask = ask_tools.iter().any(|t| t.as_str() == name);
+                    let needs_approval = force_ask
+                        || (permission_mode.asks_for_approval() && tool.requires_approval(input));
                     if needs_approval {
                         let req = ApprovalRequest {
                             tool_name: name.clone(),
@@ -1563,21 +1938,33 @@ impl Agent {
                     }
 
                     // M6.35 HOOK1: pre_tool_use fires after the approval
-                    // gate but before the tool runs. Fire-and-forget so
-                    // the hook doesn't block dispatch — pre/post strict
-                    // ordering is documented as best-effort, not a
-                    // guarantee, in the user manual.
-                    if let Some(h) = &hooks {
+                    // gate but before the tool runs, as a synchronous GATE —
+                    // a hook that exits 2 denies the call (the tool never
+                    // runs; the model sees the hook's reason). Any other
+                    // outcome allows it (fail-open), so a plain audit hook
+                    // (exit 0) behaves exactly as the old fire-and-forget.
+                    let hook_denied: Option<String> = if let Some(h) = &hooks {
                         let input_str = serde_json::to_string(input)
                             .unwrap_or_else(|_| "<unserializable>".to_string());
-                        crate::hooks::fire_pre_tool_use(h, &name, &input_str);
-                    }
+                        match crate::hooks::fire_pre_tool_use_gate(h, &name, &input_str).await {
+                            crate::hooks::PreToolDecision::Deny(reason) => Some(reason),
+                            crate::hooks::PreToolDecision::Allow => None,
+                        }
+                    } else {
+                        None
+                    };
 
                     // ToolCallStart was yielded at parse time (see the
                     // assembled-event loop above) so the UI shows the
                     // tool queued before the approval modal pops. The
-                    // dispatch site here just runs the call.
-                    let tool_result = tool.call_multimodal(input.clone()).await;
+                    // dispatch site here just runs the call (unless the
+                    // pre_tool_use gate denied it).
+                    let tool_result = match hook_denied {
+                        Some(reason) => {
+                            Err(crate::error::Error::Tool(format!("blocked by policy: {reason}")))
+                        }
+                        None => tool.call_multimodal(input.clone()).await,
+                    };
 
                     let (content, is_error) = match &tool_result {
                         Ok(c) => {
@@ -1651,6 +2038,50 @@ impl Agent {
                     };
                 }
 
+                // Degenerate-loop signature for THIS iteration: only when
+                // every tool call errored. Name + input + error text (capped)
+                // per call, joined — identical across iterations ⇒ the model
+                // is re-rolling the exact same failing call.
+                let degen_this: Option<String> = if !result_blocks.is_empty()
+                    && result_blocks.iter().all(|b| {
+                        matches!(b, ContentBlock::ToolResult { is_error: true, .. })
+                    }) {
+                    let mut sig = String::new();
+                    for tu in &turn_tool_uses {
+                        let ContentBlock::ToolUse { id, name, input, .. } = tu else { continue };
+                        let err = result_blocks.iter().find_map(|b| match b {
+                            ContentBlock::ToolResult { tool_use_id, content, .. }
+                                if tool_use_id == id =>
+                            {
+                                Some(content.to_text())
+                            }
+                            _ => None,
+                        });
+                        let err = err.unwrap_or_default();
+                        let err_head: String = err.chars().take(200).collect();
+                        sig.push_str(name);
+                        sig.push('\u{1}');
+                        sig.push_str(&input.to_string());
+                        sig.push('\u{1}');
+                        sig.push_str(&err_head);
+                        sig.push('\u{2}');
+                    }
+                    Some(sig)
+                } else {
+                    None
+                };
+                match (&degen_this, &degen_sig) {
+                    (Some(now), Some(prev)) if now == prev => degen_count += 1,
+                    (Some(now), _) => {
+                        degen_sig = Some(now.clone());
+                        degen_count = 1;
+                    }
+                    (None, _) => {
+                        degen_sig = None;
+                        degen_count = 0;
+                    }
+                }
+
                 if !result_blocks.is_empty() {
                     // Drain any user-typed messages that arrived while
                     // we were mid-tool (issue #106). Fold each as an
@@ -1685,6 +2116,38 @@ impl Agent {
                         yield AgentEvent::UserMessageInjected { text };
                     }
                 }
+
+                // Three identical all-errors tool iterations in a row: the
+                // model is stuck re-rolling the same failing call. End the
+                // turn with a plain explanation instead of burning the rest
+                // of the iteration budget (grok-4.5 went 22 rounds here).
+                if degen_count >= 3 {
+                    let first_tool = turn_tool_uses
+                        .iter()
+                        .find_map(|tu| match tu {
+                            ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "tool".to_string());
+                    yield AgentEvent::Text(format!(
+                        "\n[stopped: `{first_tool}` failed with the IDENTICAL call + error \
+                         {degen_count} times in a row — the model keeps re-sending the same \
+                         failing parameters. Try rephrasing the request, or switch to a model \
+                         with stronger tool-calling (this pattern is typical of models that \
+                         can't emit nested tool arguments).]"
+                    ));
+                    if let Ok(mut g) = model_override.lock() {
+                        *g = None;
+                    }
+                    if let Ok(mut g) = next_turn_chunk_timeout.lock() {
+                        *g = None;
+                    }
+                    yield AgentEvent::Done {
+                        stop_reason: Some("degenerate_tool_loop".to_string()),
+                        usage: cumulative_usage,
+                    };
+                    return;
+                }
             }
 
             // Hit the iteration cap without a natural stop. Same
@@ -1714,6 +2177,172 @@ impl Agent {
 /// is the dominant cause of premature compaction when an agent reads
 /// even one large screenshot. Idempotent — already-redacted entries
 /// are no-ops.
+/// Gateway/body cap is 5 MB. Keep the base64 image payload of an outgoing
+/// request under this so the full assembled body (system prompt + tool defs +
+/// text + JSON framing + images) stays within the cap. Conservative — leaves
+/// headroom for the non-image parts (a large CLAUDE.md/skills/memory cascade
+/// can be hundreds of KB).
+const OUTGOING_IMAGE_BUDGET_BYTES: usize = 3_500_000;
+
+/// Long edge to shrink images toward when the payload is over budget. Tighter
+/// than the per-read 1568 target because one turn can carry many images that
+/// share the budget (e.g. "read all 7 namecards" → 7 image blocks in one
+/// request). 1280px keeps small text legible for OCR while fitting several
+/// images comfortably.
+const FIT_LONG_EDGE: u32 = 1280;
+
+/// Sum of base64 image bytes across all messages — tool-result images (Read)
+/// plus pasted-attachment image blocks.
+fn outgoing_image_b64_bytes(messages: &[Message]) -> usize {
+    use crate::types::{ContentBlock, ImageSource, ToolResultBlock, ToolResultContent};
+    let mut n = 0usize;
+    for m in messages {
+        for b in &m.content {
+            match b {
+                ContentBlock::Image {
+                    source: ImageSource::Base64 { data, .. },
+                } => n += data.len(),
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Blocks(bs),
+                    ..
+                } => {
+                    for tb in bs {
+                        if let ToolResultBlock::Image {
+                            source: ImageSource::Base64 { data, .. },
+                        } = tb
+                        {
+                            n += data.len();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    n
+}
+
+/// Re-encode a base64 image smaller: resize to ≤ `FIT_LONG_EDGE` long edge and
+/// JPEG-compress (q80). Returns `None` on decode/encode failure so the caller
+/// keeps the original. JPEG drops alpha — irrelevant for vision.
+fn shrink_b64_image(data: &str) -> Option<String> {
+    use base64::Engine;
+    let raw = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    let img = image::load_from_memory(&raw).ok()?;
+    let img = if img.width().max(img.height()) > FIT_LONG_EDGE {
+        img.resize(
+            FIT_LONG_EDGE,
+            FIT_LONG_EDGE,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        img
+    };
+    let rgb = image::DynamicImage::ImageRgb8(img.to_rgb8());
+    let mut out = Vec::new();
+    rgb.write_to(
+        &mut std::io::Cursor::new(&mut out),
+        image::ImageOutputFormat::Jpeg(80),
+    )
+    .ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(&out))
+}
+
+/// Replace every base64 image in one message with a text placeholder.
+fn drop_images_in_message(msg: &mut Message) {
+    use crate::types::{ContentBlock, ImageSource, ToolResultBlock, ToolResultContent};
+    for b in msg.content.iter_mut() {
+        match b {
+            ContentBlock::Image {
+                source: ImageSource::Base64 { media_type, .. },
+            } => {
+                let mt = media_type.clone();
+                *b = ContentBlock::Text {
+                    text: format!("[{mt} dropped to fit the request size cap]"),
+                };
+            }
+            ContentBlock::ToolResult {
+                content: ToolResultContent::Blocks(bs),
+                ..
+            } => {
+                let new: Vec<ToolResultBlock> = bs
+                    .drain(..)
+                    .map(|tb| match tb {
+                        ToolResultBlock::Image {
+                            source: ImageSource::Base64 { media_type, .. },
+                        } => ToolResultBlock::Text {
+                            text: format!("[{media_type} dropped to fit the request size cap]"),
+                        },
+                        other => other,
+                    })
+                    .collect();
+                *bs = new;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Bound the base64 image payload of an outgoing request. Two passes: (1)
+/// shrink every image toward `FIT_LONG_EDGE` / JPEG; (2) if still over budget
+/// (pathologically many images), evict the oldest image blocks — keeping the
+/// most recent ones the model is actively working with.
+fn fit_image_payload_to(messages: &mut Vec<Message>, budget: usize) {
+    use crate::types::{ContentBlock, ImageSource, ToolResultBlock, ToolResultContent};
+    if outgoing_image_b64_bytes(messages) <= budget {
+        return;
+    }
+
+    // Pass 1: shrink every image in place.
+    for m in messages.iter_mut() {
+        for b in m.content.iter_mut() {
+            match b {
+                ContentBlock::Image {
+                    source: ImageSource::Base64 { media_type, data },
+                } => {
+                    if let Some(small) = shrink_b64_image(data) {
+                        *data = small;
+                        *media_type = "image/jpeg".to_string();
+                    }
+                }
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Blocks(bs),
+                    ..
+                } => {
+                    for tb in bs.iter_mut() {
+                        if let ToolResultBlock::Image {
+                            source: ImageSource::Base64 { media_type, data },
+                        } = tb
+                        {
+                            if let Some(small) = shrink_b64_image(data) {
+                                *data = small;
+                                *media_type = "image/jpeg".to_string();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // Pass 2: still over budget — evict oldest images until it fits.
+    for i in 0..messages.len() {
+        if outgoing_image_b64_bytes(messages) <= budget {
+            break;
+        }
+        drop_images_in_message(&mut messages[i]);
+    }
+}
+
+/// Bound the outgoing image payload to the gateway body cap. See
+/// [`fit_image_payload_to`].
+fn fit_outgoing_image_payload(messages: &mut Vec<Message>) {
+    fit_image_payload_to(messages, OUTGOING_IMAGE_BUDGET_BYTES);
+}
+
 fn redact_consumed_images_from_history(history: &mut Vec<Message>) {
     use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
     for msg in history.iter_mut() {
@@ -1871,6 +2500,24 @@ mod tests {
     use std::collections::VecDeque;
     use tempfile::tempdir;
 
+    #[cfg(feature = "kms_search_index")]
+    #[test]
+    fn sanitize_kms_query_strips_metachars_and_caps() {
+        // tantivy query metacharacters must not survive into the query.
+        let q = sanitize_kms_query("what is foo:bar? (test) +x -y *z");
+        assert!(!q.contains(':'));
+        assert!(!q.contains('?'));
+        assert!(!q.contains('('));
+        assert!(!q.contains('+'));
+        assert!(!q.contains('*'));
+        // whitespace collapsed to single spaces, content preserved
+        assert!(q.contains("foo bar"));
+        assert!(q.contains("test"));
+        // length cap
+        let long = "ก".repeat(500);
+        assert!(sanitize_kms_query(&long).chars().count() <= 200);
+    }
+
     // ── Image redaction ────────────────────────────────────────────────
 
     /// Single Read of an image lands a base64 blob inside a ToolResult's
@@ -1972,6 +2619,127 @@ mod tests {
         let mut history = original.clone();
         redact_consumed_images_from_history(&mut history);
         assert_eq!(history, original);
+    }
+
+    // ── Outgoing image payload budget ──────────────────────────────────
+
+    fn b64_png(w: u32, h: u32) -> String {
+        use base64::Engine;
+        let buf = image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([
+                (x ^ y) as u8,
+                x.wrapping_mul(7) as u8,
+                y.wrapping_mul(13) as u8,
+            ])
+        });
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(buf)
+            .write_to(
+                &mut std::io::Cursor::new(&mut out),
+                image::ImageOutputFormat::Png,
+            )
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(&out)
+    }
+
+    fn img_msg(data: String) -> Message {
+        use crate::types::{ContentBlock, ImageSource, Role, ToolResultBlock, ToolResultContent};
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "id".into(),
+                content: ToolResultContent::Blocks(vec![ToolResultBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data,
+                    },
+                }]),
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn shrink_b64_image_resizes_and_shrinks() {
+        use base64::Engine;
+        let big = b64_png(2000, 1000);
+        let small = shrink_b64_image(&big).expect("shrink ok");
+        assert!(small.len() < big.len(), "expected a smaller payload");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&small)
+            .unwrap();
+        let (w, h) = image::io::Reader::new(std::io::Cursor::new(&raw))
+            .with_guessed_format()
+            .unwrap()
+            .into_dimensions()
+            .unwrap();
+        assert_eq!(
+            (w, h),
+            (1280, 640),
+            "fit to FIT_LONG_EDGE, aspect preserved"
+        );
+    }
+
+    #[test]
+    fn fit_payload_noop_when_under_budget() {
+        let original = vec![img_msg(b64_png(64, 64))];
+        let mut msgs = original.clone();
+        fit_image_payload_to(&mut msgs, OUTGOING_IMAGE_BUDGET_BYTES);
+        assert_eq!(msgs, original, "under budget → untouched");
+    }
+
+    #[test]
+    fn fit_payload_shrinks_to_fit_keeping_image() {
+        use crate::types::{ContentBlock, ToolResultBlock, ToolResultContent};
+        let big = b64_png(2000, 1000);
+        let small = shrink_b64_image(&big).unwrap();
+        assert!(small.len() < big.len());
+        // Budget strictly between the shrunk and original size: pass 1 (shrink)
+        // must run and succeed; pass 2 (evict) must NOT fire.
+        let budget = small.len() + (big.len() - small.len()) / 2;
+        let mut msgs = vec![img_msg(big)];
+        fit_image_payload_to(&mut msgs, budget);
+        assert!(
+            outgoing_image_b64_bytes(&msgs) <= budget,
+            "should fit budget"
+        );
+        let ContentBlock::ToolResult {
+            content: ToolResultContent::Blocks(bs),
+            ..
+        } = &msgs[0].content[0]
+        else {
+            panic!("expected tool-result blocks");
+        };
+        assert!(
+            matches!(bs[0], ToolResultBlock::Image { .. }),
+            "image kept (not evicted)"
+        );
+    }
+
+    #[test]
+    fn fit_payload_evicts_when_shrink_insufficient() {
+        use crate::types::{ContentBlock, ToolResultBlock, ToolResultContent};
+        // Budget 0 → even after shrinking nothing fits → all images evicted.
+        let mut msgs = vec![
+            img_msg(b64_png(800, 600)),
+            img_msg(b64_png(800, 600)),
+            img_msg(b64_png(800, 600)),
+        ];
+        fit_image_payload_to(&mut msgs, 0);
+        assert_eq!(outgoing_image_b64_bytes(&msgs), 0, "no image bytes remain");
+        for m in &msgs {
+            let ContentBlock::ToolResult {
+                content: ToolResultContent::Blocks(bs),
+                ..
+            } = &m.content[0]
+            else {
+                panic!("expected tool-result blocks");
+            };
+            assert!(
+                matches!(bs[0], ToolResultBlock::Text { .. }),
+                "evicted to a text placeholder"
+            );
+        }
     }
 
     // ── Builder semantics ──────────────────────────────────────────────
@@ -2549,12 +3317,13 @@ mod tests {
     /// agent::tests so cwd contention is bounded; if this becomes a
     /// hot spot, we'd add a Mutex like plan_state's test_lock.
     fn with_cwd<R>(dir: &std::path::Path, f: impl FnOnce() -> R) -> R {
-        // Synchronise cwd-touching tests in this module so they don't
-        // race when cargo runs them in parallel — `set_current_dir`
-        // is process-global and the previous tests in the file don't
-        // touch cwd, so a Mutex inside agent::tests is enough.
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // Serialise via the crate-wide env lock (kms::test_env_lock) so
+        // we don't race against kms/plugins/context/config tests that
+        // mutate the same process-global cwd/HOME. A local Mutex here
+        // wouldn't coordinate with those modules and the prompt-builder
+        // tests would intermittently read whichever cwd happened to be
+        // active when their two refresh calls fired.
+        let _g = crate::kms::test_env_lock();
         let prior = std::env::current_dir().expect("cwd readable");
         std::env::set_current_dir(dir).expect("cwd to test dir");
         let out = f();
@@ -2566,14 +3335,14 @@ mod tests {
     fn todos_reminder_returns_none_when_file_missing() {
         let tmp = tempdir().unwrap();
         let r = with_cwd(tmp.path(), build_todos_reminder);
-        assert!(r.is_none(), "no .thclaws/todos.md → no reminder");
+        assert!(r.is_none(), "no .thclaws/state/todos.md → no reminder");
     }
 
     #[test]
     fn todos_reminder_returns_none_when_file_empty() {
         let tmp = tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".thclaws")).unwrap();
-        std::fs::write(tmp.path().join(".thclaws/todos.md"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join(".thclaws/state")).unwrap();
+        std::fs::write(tmp.path().join(".thclaws/state/todos.md"), "").unwrap();
         let r = with_cwd(tmp.path(), build_todos_reminder);
         assert!(r.is_none(), "empty file → no reminder");
     }
@@ -2583,9 +3352,9 @@ mod tests {
         // A list where everything is checked off shouldn't nag the
         // model — there's nothing to resume.
         let tmp = tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".thclaws")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".thclaws/state")).unwrap();
         std::fs::write(
-            tmp.path().join(".thclaws/todos.md"),
+            tmp.path().join(".thclaws/state/todos.md"),
             "# Todos\n\n- [x] Done thing (id: 1)\n- [x] Other done thing (id: 2)\n",
         )
         .unwrap();
@@ -2596,15 +3365,18 @@ mod tests {
     #[test]
     fn todos_reminder_surfaces_pending_items() {
         let tmp = tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".thclaws")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".thclaws/state")).unwrap();
         std::fs::write(
-            tmp.path().join(".thclaws/todos.md"),
+            tmp.path().join(".thclaws/state/todos.md"),
             "# Todos\n\n- [ ] Add tests (id: 1)\n- [-] Fix bug (id: 2)\n- [x] Old task (id: 3)\n",
         )
         .unwrap();
         let r = with_cwd(tmp.path(), build_todos_reminder).expect("reminder fires");
         // Header naming the file path so the model sees what the source is.
-        assert!(r.contains(".thclaws/todos.md"), "missing file path: {r}");
+        assert!(
+            r.contains(".thclaws/state/todos.md"),
+            "missing file path: {r}"
+        );
         // Anti-ask framing — the rule that gpt-4.1 violated in the
         // M6.6 manual test.
         assert!(
@@ -2638,9 +3410,9 @@ mod tests {
         // Edge case: a single `[-]` (in_progress) item with everything
         // else `[x]` should still fire — the user paused mid-task.
         let tmp = tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join(".thclaws")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".thclaws/state")).unwrap();
         std::fs::write(
-            tmp.path().join(".thclaws/todos.md"),
+            tmp.path().join(".thclaws/state/todos.md"),
             "# Todos\n\n- [x] Done (id: 1)\n- [-] Halfway (id: 2)\n",
         )
         .unwrap();
@@ -2735,6 +3507,104 @@ mod tests {
                 usage: None,
             },
         ]
+    }
+
+    /// Two tool_use blocks in a single assistant message.
+    fn two_tool_script(n1: &str, id1: &str, n2: &str, id2: &str) -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::MessageStart {
+                model: "test".into(),
+            },
+            ProviderEvent::ToolUseStart {
+                id: id1.into(),
+                name: n1.into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::ToolUseStart {
+                id: id2.into(),
+                name: n2.into(),
+                thought_signature: None,
+            },
+            ProviderEvent::ToolUseDelta {
+                partial_json: "{}".into(),
+            },
+            ProviderEvent::ContentBlockStop,
+            ProviderEvent::MessageStop {
+                stop_reason: Some("tool_use".into()),
+                usage: None,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn parallelizable_tools_run_concurrently() {
+        use crate::tools::Tool;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct SleepyTool;
+        #[async_trait::async_trait]
+        impl Tool for SleepyTool {
+            fn name(&self) -> &'static str {
+                "Sleep"
+            }
+            fn description(&self) -> &'static str {
+                "sleeps"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object"})
+            }
+            fn parallelizable(&self) -> bool {
+                true
+            }
+            async fn call(&self, _input: Value) -> Result<String> {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok("slept".into())
+            }
+        }
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(SleepyTool));
+        let provider = ScriptedProvider::new(vec![
+            two_tool_script("Sleep", "t1", "Sleep", "t2"),
+            text_script(&["done"]),
+        ]);
+        let agent = Agent::new(provider, reg, "test", "");
+
+        let start = Instant::now();
+        let outcome = collect_agent_turn(agent.run_turn("go".into()))
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(outcome.text, "done");
+        assert_eq!(
+            outcome.tool_calls,
+            vec!["Sleep".to_string(), "Sleep".to_string()]
+        );
+        // Two 200ms sleeps: concurrent ≈200ms, sequential ≈400ms. The bound
+        // sits well below the sequential floor and above concurrent+overhead.
+        assert!(
+            elapsed < Duration::from_millis(330),
+            "took {elapsed:?} — looks sequential, not concurrent"
+        );
+
+        // Results land in tool_use order regardless of completion order.
+        let history = agent.history_snapshot();
+        let trmsg = &history[2];
+        let ids: Vec<String> = trmsg
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["t1".to_string(), "t2".to_string()]);
     }
 
     #[tokio::test]
@@ -2968,6 +3838,37 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok");
     }
 
+    #[tokio::test]
+    async fn ask_tools_forces_approval_under_auto() {
+        use crate::permissions::{DenyApprover, PermissionMode};
+        use tempfile::tempdir;
+
+        // Auto mode would normally never consult the approver — but a tool
+        // named in `askTools` must still hit the gate. DenyApprover vetoes,
+        // so the Write must NOT land and the call is recorded as a denial.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("gated.txt");
+        let args = serde_json::json!({
+            "path": path.to_string_lossy(),
+            "content": "should-not-write",
+        })
+        .to_string();
+        let provider = ScriptedProvider::new(vec![
+            tool_script("toolu_1", "Write", &args),
+            text_script(&["done"]),
+        ]);
+        let agent = Agent::new(provider, ToolRegistry::with_builtins(), "test", "")
+            .with_permission_mode(PermissionMode::Auto)
+            .with_ask_tools(vec!["Write".to_string()])
+            .with_approver(Arc::new(DenyApprover));
+
+        let outcome = collect_agent_turn(agent.run_turn("write".into()))
+            .await
+            .unwrap();
+        assert!(!path.exists(), "askTools should have gated the Write");
+        assert_eq!(outcome.tool_denials, vec!["Write".to_string()]);
+    }
+
     // M6.20 BUG M1 regression note: the TodoWrite plan-mode block
     // (agent.rs:1133 area) now fires BEFORE the generic mutating-tool
     // block, so the model gets the SubmitPlan-specific message instead
@@ -3186,6 +4087,130 @@ mod tests {
         assert_eq!(
             got[1], None,
             "override should clear after the first turn ends"
+        );
+    }
+
+    /// dev-plan/55 step 3 — the wire boundary, end to end. Unit-testing the
+    /// masker proves the helpers; this proves the choke point is in the right
+    /// place, which is the part that would actually leak. Two halves:
+    /// the provider must never see the phone number, and the user must never
+    /// see the placeholder — including when the model splits one across
+    /// stream chunks, which is the failure mode a naive per-chunk replace
+    /// would ship silently.
+    #[tokio::test]
+    async fn masking_hides_pii_from_the_provider_and_restores_it_locally() {
+        use std::sync::Mutex;
+        let _guard = crate::kms::test_env_lock();
+
+        struct CapturingProvider {
+            seen: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait]
+        impl Provider for CapturingProvider {
+            async fn stream(&self, req: crate::providers::StreamRequest) -> Result<EventStream> {
+                let flat: String = req
+                    .messages
+                    .iter()
+                    .flat_map(|m| m.content.iter())
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.seen.lock().unwrap().push(flat);
+                // Echo the placeholder back, split mid-token across two
+                // deltas the way a real stream would.
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(ProviderEvent::TextDelta("โทรกลับที่ [PHO".into())),
+                    Ok(ProviderEvent::TextDelta("NE_1] ได้เลย".into())),
+                    Ok(ProviderEvent::ContentBlockStop),
+                    Ok(ProviderEvent::MessageStop {
+                        stop_reason: Some("end_turn".into()),
+                        usage: None,
+                    }),
+                ])))
+            }
+        }
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::new(
+            Arc::new(CapturingProvider { seen: seen.clone() }),
+            ToolRegistry::default(),
+            "test-model",
+            "",
+        );
+
+        // Force a fresh masker so placeholder numbering is deterministic
+        // regardless of what other tests left in the process-wide map.
+        crate::sensitive::configure(false, Vec::new());
+        crate::sensitive::configure(true, Vec::new());
+        let out = collect_agent_turn(agent.run_turn("โทรหาผมที่ 081-234-5678 นะครับ".into())).await;
+        crate::sensitive::configure(false, Vec::new());
+
+        let sent = seen.lock().unwrap().join("\n");
+        assert!(
+            !sent.contains("081-234-5678"),
+            "phone number reached the provider: {sent}"
+        );
+        assert!(sent.contains("[PHONE_1]"), "not masked at all: {sent}");
+
+        let text = out.expect("turn should succeed").text;
+        assert!(
+            text.contains("081-234-5678"),
+            "reply not restored locally: {text}"
+        );
+        assert!(
+            !text.contains("PHONE_1"),
+            "placeholder leaked into the reply: {text}"
+        );
+        // The reader has to be able to tell a restored value from something
+        // the model actually knew.
+        assert!(
+            text.contains(crate::sensitive::MARK_OPEN),
+            "restored value not marked for the reader: {text}"
+        );
+
+        // History keeps plaintext, which is what makes turn 2 safe: it
+        // re-masks from the real value instead of shipping a stale copy.
+        let history = agent.history_snapshot();
+        let last = history.last().expect("assistant message");
+        let stored: String = last
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            stored.contains("081-234-5678") && !stored.contains("PHONE_1"),
+            "history should hold plaintext, got {stored:?}"
+        );
+        assert!(
+            !stored.contains(crate::sensitive::MARK_OPEN),
+            "display marker persisted into history: {stored:?}"
+        );
+    }
+
+    /// The masker must stay off unless the user turns it on — a privacy
+    /// feature that silently rewrites prompts by default would be worse
+    /// than not shipping it.
+    #[tokio::test]
+    async fn masking_is_off_unless_configured() {
+        let _guard = crate::kms::test_env_lock();
+        crate::sensitive::configure(false, Vec::new());
+        assert!(crate::sensitive::active().is_none());
+        // Multiuser refuses to arm even when the setting says yes: one
+        // shared worker, one process-wide map, several members.
+        crate::workdir::set_multiuser(true);
+        crate::sensitive::configure(true, Vec::new());
+        let armed_under_multiuser = crate::sensitive::active().is_some();
+        crate::workdir::set_multiuser(false);
+        crate::sensitive::configure(false, Vec::new());
+        assert!(
+            !armed_under_multiuser,
+            "masking must not arm under multiuser"
         );
     }
 }

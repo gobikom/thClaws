@@ -61,9 +61,33 @@ let wsSend: ((msg: IPCMessage) => void) | null = null;
 let reconnectDelayMs = 250;
 const RECONNECT_MAX_MS = 5000;
 
+// Messages sent while the socket is still CONNECTING, flushed on open.
+// Components that send on mount (ThemeProvider's `theme_get`, sidebar
+// fetches, …) race the initial WS handshake; without this buffer those
+// requests were silently dropped, so e.g. the persisted theme never
+// loaded on a page refresh. Only the initial-connect window buffers —
+// sends while disconnected still drop (reconnect re-syncs via the
+// `frontend_ready` snapshot instead).
+let wsConnectQueue: IPCMessage[] = [];
+
+/**
+ * Path prefix the frontend lives under, with a trailing slash.
+ *
+ * Local + self-hosted deploys serve at `/` so this returns `/`. Hosted
+ * agents on thclaws.cloud serve under `/u/<handle>/<slug>/` — every
+ * runtime URL (WebSocket, /upload, etc.) needs to include that prefix
+ * so requests reach the right pod after Caddy strips it. Recomputed
+ * lazily at call time so we pick up the actual page location, not a
+ * cached value from another tab.
+ */
+export function basePath(): string {
+  const p = window.location.pathname;
+  return p.endsWith("/") ? p : p + "/";
+}
+
 function wsUrl(): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/ws`;
+  return `${proto}//${window.location.host}${basePath()}ws`;
 }
 
 function emitStatus(status: "disconnected" | "connecting" | "connected") {
@@ -83,6 +107,9 @@ function connectWs() {
     // `frontend_ready` arm calls `on_send_initial_state` which (today)
     // is a stub but will become the snapshot builder per SERVE9.
     wsSend!({ type: "frontend_ready" });
+    const queued = wsConnectQueue;
+    wsConnectQueue = [];
+    queued.forEach((m) => wsSend!(m));
   };
   ws.onmessage = (ev) => {
     try {
@@ -110,6 +137,8 @@ if (typeof window !== "undefined" && !window.ipc) {
   wsSend = (msg) => {
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(msg));
+    } else if (ws && ws.readyState === WebSocket.CONNECTING) {
+      wsConnectQueue.push(msg);
     } else {
       console.warn("[ipc] ws not open, dropped:", msg);
     }

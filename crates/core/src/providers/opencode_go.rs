@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 pub const DEFAULT_API_URL: &str = "https://opencode.ai/zen/go/v1";
 pub const MODELS_URL: &str = "https://opencode.ai/zen/go/v1/models";
@@ -28,8 +30,13 @@ pub const MODELS_URL: &str = "https://opencode.ai/zen/go/v1/models";
 // qwen4.x release doesn't silently fall through to the OpenAI path
 // and get rejected with a 4xx upstream. Tracked as a TODO so we can
 // rip out the lists once the upstream exposes the hint.
-const ANTHROPIC_MODELS: &[&str] = &["minimax-m2.5", "minimax-m2.7"];
-const ALIBABA_MODELS: &[&str] = &["qwen3.5-plus", "qwen3.6-plus"];
+const ANTHROPIC_MODELS: &[&str] = &["minimax-m2.5", "minimax-m2.7", "minimax-m3"];
+const ALIBABA_MODELS: &[&str] = &[
+    "qwen3.5-plus",
+    "qwen3.6-plus",
+    "qwen3.7-max",
+    "qwen3.7-plus",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WireFormat {
@@ -59,6 +66,14 @@ fn detect_wire_format(model: &str) -> WireFormat {
     }
 }
 
+fn detect_wire_format_with_hints(model: &str, hints: &HashMap<String, WireFormat>) -> WireFormat {
+    let lower = model.to_lowercase();
+    if let Some(&fmt) = hints.get(&lower) {
+        return fmt;
+    }
+    detect_wire_format(model)
+}
+
 fn endpoint_for(format: WireFormat) -> &'static str {
     match format {
         WireFormat::OpenAI => "/chat/completions",
@@ -72,6 +87,7 @@ pub struct OpencodeGoProvider {
     api_key: String,
     base_url: String,
     list_models_url: Option<String>,
+    wire_cache: OnceLock<HashMap<String, WireFormat>>,
 }
 
 impl OpencodeGoProvider {
@@ -81,16 +97,19 @@ impl OpencodeGoProvider {
             api_key: api_key.into(),
             base_url: DEFAULT_API_URL.to_string(),
             list_models_url: None,
+            wire_cache: OnceLock::new(),
         }
     }
 
     pub fn with_base_url(mut self, url: impl Into<String>) -> Self {
         self.base_url = url.into();
+        self.wire_cache = OnceLock::new();
         self
     }
 
     pub fn with_list_models_url(mut self, url: impl Into<String>) -> Self {
         self.list_models_url = Some(url.into());
+        self.wire_cache = OnceLock::new();
         self
     }
 
@@ -850,6 +869,44 @@ impl OpencodeGoProvider {
         }
         format!("{}/models", self.base_url.trim_end_matches('/'))
     }
+
+    async fn load_wire_hints(&self) -> HashMap<String, WireFormat> {
+        let url = self.models_list_url();
+        let Ok(resp) = self
+            .client
+            .get(&url)
+            .header("authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+        else {
+            return HashMap::new();
+        };
+        let Ok(v) = resp.json::<Value>().await else {
+            return HashMap::new();
+        };
+        let mut hints = HashMap::new();
+        if let Some(arr) = v.get("data").and_then(Value::as_array) {
+            for m in arr {
+                let Some(raw_id) = m.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let model_id = raw_id
+                    .strip_prefix("opencode-go/")
+                    .unwrap_or(raw_id)
+                    .to_lowercase();
+                let Some(wire_str) = m.get("wire").and_then(Value::as_str) else {
+                    continue;
+                };
+                let format = match wire_str {
+                    "anthropic" => WireFormat::Anthropic,
+                    "alibaba" => WireFormat::Alibaba,
+                    _ => WireFormat::OpenAI,
+                };
+                hints.insert(model_id, format);
+            }
+        }
+        hints
+    }
 }
 
 #[async_trait]
@@ -905,7 +962,12 @@ impl Provider for OpencodeGoProvider {
             req.model = rest.to_string();
         }
 
-        let wire_format = detect_wire_format(&req.model);
+        let hints = self.wire_cache.get_or_init(|| {
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(self.load_wire_hints())
+            })
+        });
+        let wire_format = detect_wire_format_with_hints(&req.model, hints);
         let endpoint = format!(
             "{}{}",
             self.base_url.trim_end_matches('/'),
@@ -1076,6 +1138,61 @@ mod tests {
     use crate::types::Message;
 
     #[test]
+    fn hints_override_static_lists() {
+        let mut hints = HashMap::new();
+        hints.insert("minimax-m4".to_string(), WireFormat::Anthropic);
+        hints.insert("qwen5-ultra".to_string(), WireFormat::Alibaba);
+        // model ใหม่ที่ไม่อยู่ใน static list — ได้ hint จาก API
+        assert_eq!(
+            detect_wire_format_with_hints("minimax-m4", &hints),
+            WireFormat::Anthropic
+        );
+        assert_eq!(
+            detect_wire_format_with_hints("qwen5-ultra", &hints),
+            WireFormat::Alibaba
+        );
+        // model เก่าที่ไม่อยู่ใน hints — fallback static list
+        assert_eq!(
+            detect_wire_format_with_hints("minimax-m2.7", &HashMap::new()),
+            WireFormat::Anthropic
+        );
+        // unknown → OpenAI
+        assert_eq!(
+            detect_wire_format_with_hints("glm-5.1", &hints),
+            WireFormat::OpenAI
+        );
+    }
+
+    #[tokio::test]
+    async fn load_wire_hints_empty_on_bad_json() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "minimax-m4"}]  // no "wire" field
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = OpencodeGoProvider::new("test-key")
+            .with_list_models_url(format!("{}/v1/models", server.uri()));
+        let hints = provider.load_wire_hints().await;
+        assert!(hints.is_empty());
+        // fallback static list still works when hints are empty
+        assert_eq!(
+            detect_wire_format_with_hints("minimax-m2.7", &hints),
+            WireFormat::Anthropic
+        );
+        assert_eq!(
+            detect_wire_format_with_hints("glm-5.1", &hints),
+            WireFormat::OpenAI
+        );
+    }
+
+    #[test]
     fn test_detect_wire_format_openai() {
         assert_eq!(detect_wire_format("glm-5.1"), WireFormat::OpenAI);
         assert_eq!(detect_wire_format("kimi-k2.6"), WireFormat::OpenAI);
@@ -1087,12 +1204,15 @@ mod tests {
     fn test_detect_wire_format_anthropic() {
         assert_eq!(detect_wire_format("minimax-m2.7"), WireFormat::Anthropic);
         assert_eq!(detect_wire_format("minimax-m2.5"), WireFormat::Anthropic);
+        assert_eq!(detect_wire_format("minimax-m3"), WireFormat::Anthropic);
     }
 
     #[test]
     fn test_detect_wire_format_alibaba() {
         assert_eq!(detect_wire_format("qwen3.6-plus"), WireFormat::Alibaba);
         assert_eq!(detect_wire_format("qwen3.5-plus"), WireFormat::Alibaba);
+        assert_eq!(detect_wire_format("qwen3.7-max"), WireFormat::Alibaba);
+        assert_eq!(detect_wire_format("qwen3.7-plus"), WireFormat::Alibaba);
     }
 
     #[test]

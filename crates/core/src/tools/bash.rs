@@ -17,7 +17,26 @@ use tokio::time::{timeout, Duration};
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 
-pub struct BashTool;
+#[derive(Default)]
+pub struct BashTool {
+    /// When set, a session cancel (Stop / Esc / Cmd+. — all send
+    /// `shell_cancel`) kills the in-flight child process PROMPTLY instead of
+    /// letting it run to its own `timeout_ms`. The default `with_builtins`
+    /// registration carries `None`; `run_worker` re-registers a cancel-aware
+    /// instance over it (register overwrites by tool name) with the session's
+    /// token. Reported by @Mayth01 (issue #182).
+    cancel: Option<crate::cancel::CancelToken>,
+}
+
+impl BashTool {
+    /// Cancel-aware constructor: the returned tool races the given token
+    /// against the child's wait, so a mid-call cancel kills the process.
+    pub fn with_cancel(cancel: crate::cancel::CancelToken) -> Self {
+        Self {
+            cancel: Some(cancel),
+        }
+    }
+}
 
 #[async_trait]
 impl Tool for BashTool {
@@ -90,7 +109,7 @@ impl Tool for BashTool {
         } else if let Some(root) = crate::sandbox::Sandbox::root() {
             root
         } else {
-            std::env::current_dir()?
+            crate::workdir::current_workdir()
         };
 
         // Auto-activate venv for pip/python commands when no venv exists yet.
@@ -122,7 +141,14 @@ impl Tool for BashTool {
                 setup_cmd.chars().take(80).collect::<String>(),
                 if setup_cmd.len() > 80 { "…" } else { "" }
             );
-            setup_output = run_shell_command(&setup_cmd, &resolved_cwd, timeout_ms, false).await?;
+            setup_output = run_shell_command(
+                &setup_cmd,
+                &resolved_cwd,
+                timeout_ms,
+                false,
+                self.cancel.as_ref(),
+            )
+            .await?;
             // If setup failed, return its output (includes exit code).
             if setup_output.contains("[exit code") {
                 return Ok(setup_output);
@@ -187,8 +213,39 @@ impl Tool for BashTool {
         }
 
         let effective_timeout = if is_server { 5000 } else { timeout_ms };
-        let server_output =
-            run_shell_command(&command, &resolved_cwd, effective_timeout, is_server).await?;
+        let mut server_output = run_shell_command(
+            &command,
+            &resolved_cwd,
+            effective_timeout,
+            is_server,
+            self.cancel.as_ref(),
+        )
+        .await?;
+
+        // F30: concurrent team members sharing one git index collide on
+        // `.git/index.lock` ("fatal: Unable to create '.../.git/index.lock':
+        // File exists"). That's a transient race, not a real failure — retry
+        // a few times with a short backoff before surfacing it. Gated on the
+        // specific error signature so ordinary output isn't re-run, and
+        // skipped for server commands (which are expected to keep running).
+        if !is_server {
+            let mut tries: u32 = 0;
+            while tries < 3
+                && server_output.contains("index.lock")
+                && server_output.contains("File exists")
+            {
+                tries += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(250 * tries as u64)).await;
+                server_output = run_shell_command(
+                    &command,
+                    &resolved_cwd,
+                    effective_timeout,
+                    is_server,
+                    self.cancel.as_ref(),
+                )
+                .await?;
+            }
+        }
 
         // Combine setup output with server output.
         if setup_output.is_empty() {
@@ -207,8 +264,43 @@ async fn run_shell_command(
     cwd: &std::path::Path,
     timeout_ms: u64,
     is_server: bool,
+    cancel: Option<&crate::cancel::CancelToken>,
 ) -> Result<String> {
-    let mut cmd = crate::util::shell_command_async(command);
+    let out = run_shell_command_inner(command, cwd, timeout_ms, is_server, true, cancel).await?;
+    // If the OS confiner couldn't enforce, it bailed BEFORE running the
+    // command (exiting with a no-enforce sentinel, NOT the command's output).
+    // Re-run unconfined so the command actually executes — the workspace /
+    // container remains the security boundary in environments where the
+    // kernel confiner is unavailable (e.g. a hosted runner whose container
+    // kernel returns EINVAL from the Landlock syscalls). Without this, every
+    // Bash call (and `!` shell escape) fails with "landlock setup failed,
+    // exit 78" and no output.
+    if crate::confine::output_shows_no_enforce(&out) {
+        // Remember so later commands skip the doomed confined attempt.
+        crate::confine::mark_no_enforce();
+        return run_shell_command_inner(command, cwd, timeout_ms, is_server, false, cancel).await;
+    }
+    Ok(out)
+}
+
+async fn run_shell_command_inner(
+    command: &str,
+    cwd: &std::path::Path,
+    timeout_ms: u64,
+    is_server: bool,
+    confined: bool,
+    cancel: Option<&crate::cancel::CancelToken>,
+) -> Result<String> {
+    // dev-plan/49: route through the OS confiner — returns a sandbox-exec /
+    // bwrap-wrapped `sh -c` when bash.sandbox is on and a confiner is
+    // available, else a plain `sh -c` (unchanged). One chokepoint, so
+    // subagent/workflow Bash is confined identically. `confined=false` is the
+    // unconfined re-run path when the confiner couldn't enforce.
+    let mut cmd = if confined {
+        crate::confine::shell_command_async(command)
+    } else {
+        crate::util::shell_command_async(command)
+    };
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -222,6 +314,7 @@ async fn run_shell_command(
     // is additive; user shells can still override per-command via
     // `VAR=value cmd` syntax.
     apply_noninteractive_env(&mut cmd);
+    scrub_sensitive_env(&mut cmd);
 
     let mut child = cmd
         .spawn()
@@ -247,7 +340,29 @@ async fn run_shell_command(
         buf
     });
 
-    let wait_result = timeout(Duration::from_millis(timeout_ms), child.wait()).await;
+    // Race the session cancel against the child's wait so Stop / Esc / Cmd+.
+    // kills a long-running command (build, test, `sleep 45`) PROMPTLY instead
+    // of letting it run to `timeout_ms`. `cancelled()` returns immediately if
+    // the token is already set, but the worker resets it before each turn (the
+    // same discipline the main agent loop relies on), so this only fires on a
+    // genuine mid-call cancel. `None` (e.g. the `!` shell escape) keeps the
+    // old timeout-only behaviour. Server commands never race — a timeout there
+    // is the expected "left it running in the background" path. (issue #182)
+    let wait_result = match (cancel, is_server) {
+        (Some(tok), false) => {
+            tokio::select! {
+                biased;
+                _ = tok.cancelled() => {
+                    let _ = child.kill().await;
+                    return Err(Error::Tool(format!(
+                        "cancelled while running: {command}"
+                    )));
+                }
+                r = timeout(Duration::from_millis(timeout_ms), child.wait()) => r,
+            }
+        }
+        _ => timeout(Duration::from_millis(timeout_ms), child.wait()).await,
+    };
     match wait_result {
         Err(_) if is_server => {
             // Server command — timeout is expected. Server keeps running.
@@ -304,7 +419,13 @@ async fn run_shell_command(
             let stdout = String::from_utf8_lossy(&stdout_bytes);
             let stderr = String::from_utf8_lossy(&stderr_bytes);
             let exit_code = status.code().unwrap_or(-1);
-            Ok(format_output(&stdout, &stderr, exit_code))
+            let out = format_output(&stdout, &stderr, exit_code);
+            // dev-plan/49: if the OS sandbox likely blocked a write, tell the
+            // model it's the sandbox (not a real perms error) + how to allow it.
+            Ok(match crate::confine::denied_hint(&out) {
+                Some(hint) => format!("{out}\n\n{hint}"),
+                None => out,
+            })
         }
     }
 }
@@ -361,15 +482,30 @@ fn maybe_wrap_with_venv(cmd: &str, cwd: &std::path::Path) -> String {
     }
 }
 
-/// Does this command need a Python venv? Any python/pip command should use
-/// the project venv if one exists, plus specific tool commands.
+/// Does this command need a Python venv? Trigger ONLY on commands that
+/// actually install or run framework servers — pip/pipx/poetry/uv,
+/// long-running server runners (uvicorn/gunicorn/flask), and the
+/// pytest/celery toolchains.
+///
+/// Plain `python3 script.py` does NOT trigger here. The previous
+/// heuristic fired on every `python3 ` prefix, which:
+///   - Wrapped agent-shipped stdlib scripts (e.g. image-generator's
+///     batch.py) in `python3 -m venv && source && python3 script.py`,
+///   - Printed `[creating .venv and activating before pip]` +
+///     `⚠ destructive command detected` warnings the model then
+///     mis-attributed to the script itself,
+///   - Created a `.venv/` directory inside agent workspaces that had
+///     no business owning one.
+/// If a user actually needs venv-bound python, they call `pip` or
+/// activate the venv themselves; both still get auto-handled here.
 fn needs_venv(cmd: &str) -> bool {
     let lower = cmd.to_lowercase();
-    // Any python/pip invocation should use the venv.
-    lower.starts_with("python ")
-        || lower.starts_with("python3 ")
-        || lower.contains("pip install")
+    lower.contains("pip install")
         || lower.contains("pip3 install")
+        || lower.contains("pipx ")
+        || lower.contains("poetry install")
+        || lower.contains("poetry add")
+        || lower.contains("uv pip ")
         || lower.contains("uvicorn ")
         || lower.contains("gunicorn ")
         || lower.contains("hypercorn ")
@@ -519,24 +655,27 @@ fn has_destructive_signal(cmd: &str) -> bool {
 /// command (`;`, newline, `&&`, `||`, `|`, `&`). Coarse but enough to
 /// isolate each verb for prefix-stripping.
 fn split_shell_segments(cmd: &str) -> Vec<String> {
+    // `char_indices()` yields (byte_pos, char) tuples where every
+    // `byte_pos` is on a UTF-8 char boundary, so `cmd[pos..]` is
+    // always a valid slice. The previous byte-arithmetic version
+    // panicked on any multi-byte UTF-8 (em-dash etc.) that LLM-
+    // generated commands inadvertently include — see issue #141.
+    //
+    // Order matters: check the two-char operators `&&` / `||` BEFORE
+    // the single-char `&` / `|` branch, else the single-char arm
+    // steals the first byte of the pair and `cur` ends up with a
+    // stray `&` between two segments.
     let mut segs = Vec::new();
     let mut cur = String::new();
-    let bytes = cmd.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        let c = bytes[i] as char;
-        if c == ';' || c == '\n' {
+    let mut chars = cmd.char_indices().peekable();
+    while let Some((pos, c)) = chars.next() {
+        if cmd[pos..].starts_with("&&") || cmd[pos..].starts_with("||") {
             segs.push(std::mem::take(&mut cur));
-            i += 1;
-        } else if cmd[i..].starts_with("&&") || cmd[i..].starts_with("||") {
+            chars.next(); // consume the second char of the pair
+        } else if c == ';' || c == '\n' || c == '|' || c == '&' {
             segs.push(std::mem::take(&mut cur));
-            i += 2;
-        } else if c == '|' || c == '&' {
-            segs.push(std::mem::take(&mut cur));
-            i += 1;
         } else {
             cur.push(c);
-            i += 1;
         }
     }
     segs.push(cur);
@@ -990,10 +1129,12 @@ fn classify_leaf_as_server(leaf: &str, sub: &str, third: &str) -> bool {
         // Python web frameworks
         "flask" => sub == "run",
         "django-admin" => sub == "runserver",
-        "python" | "python3" => matches!(
-            sub,
-            "app.py" | "main.py" | "server.py" | "run.py" | "wsgi.py" | "asgi.py"
-        ),
+        "python" | "python3" => {
+            matches!(
+                sub,
+                "app.py" | "main.py" | "server.py" | "run.py" | "wsgi.py" | "asgi.py"
+            ) || (sub == "manage.py" && third == "runserver") // Django dev server
+        }
         // After `python -m`, the leaf becomes the module name.
         "http.server" => true,
 
@@ -1008,12 +1149,25 @@ fn classify_leaf_as_server(leaf: &str, sub: &str, third: &str) -> bool {
         "go" => sub == "run",
 
         // Docker
-        "docker" => sub == "compose" && third == "up",
-        "docker-compose" => sub == "up",
+        "docker" => {
+            (sub == "compose" && third == "up")
+                || (sub == "logs" && matches!(third, "-f" | "--follow"))
+        }
+        "docker-compose" => sub == "up" || (sub == "logs" && matches!(third, "-f" | "--follow")),
 
         // Kubernetes
-        "kubectl" => sub == "port-forward",
+        "kubectl" => sub == "port-forward" || (sub == "logs" && matches!(third, "-f" | "--follow")),
         "cloudflared" => sub == "tunnel",
+
+        // Long-blocking utilities that never return on their own — these
+        // would otherwise foreground-hang for the full Bash timeout.
+        "tail" => matches!(sub, "-f" | "-F" | "--follow"),
+        "watch" => true,
+        "nc" | "ncat" | "netcat" => sub == "-l" || sub.starts_with("-l"),
+        "ssh" => {
+            matches!(sub, "-N" | "-L" | "-R" | "-D" | "-W")
+                || matches!(third, "-N" | "-L" | "-R" | "-D" | "-W")
+        }
 
         // `serve <dir>` — the `serve` npm package serves static files.
         // Only treat as server when there's a path argument.
@@ -1103,6 +1257,69 @@ fn looks_like_tty_required(stdout: &str, stderr: &str) -> bool {
 /// Most modern CLIs honour at least one of these to skip prompts and
 /// auto-accept defaults. M6.8 B1 — workaround for the lack of a real
 /// PTY in the Bash sandbox.
+/// Keep platform credentials out of the shell's environment so a
+/// `printenv` / `cat /proc/self/environ` can't exfiltrate them. Platform
+/// internals (the raw gateway env, the multiuser HMAC secret, the cloud
+/// token) are removed up front; provider API keys are removed only in a
+/// multiuser/shared session, where the shell belongs to a guest who must
+/// not read the owner's billable credentials. On a single-user session the
+/// user's own keys stay available — and the *resolved* gateway credential
+/// (env → keychain → cloud-token, same chain the providers use) is
+/// re-injected as `THCLAWS_GATEWAY_{API_KEY,BASE_URL}` so agent scripts can
+/// reach Gemini image/TTS through the metered gateway with zero .env setup.
+fn scrub_sensitive_env(cmd: &mut tokio::process::Command) {
+    const ALWAYS: &[&str] = &[
+        "THCLAWS_CLOUD_HMAC_SECRET",
+        "THCLAWS_GATEWAY_API_KEY",
+        "THCLAWS_CLOUD_TOKEN",
+    ];
+    for k in ALWAYS {
+        cmd.env_remove(k);
+    }
+    if crate::workdir::is_multiuser() {
+        const SCOPED: &[&str] = &[
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "QWENCLOUD_API_KEY",
+            "ZAI_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "MINIMAX_API_KEY",
+            "THAILLM_API_KEY",
+            "XAI_API_KEY",
+            "MOONSHOT_API_KEY",
+            "BRAVE_SEARCH_API_KEY",
+            "BRAVE_API_KEY",
+            "TAVILY_API_KEY",
+            "HAL_API_KEY",
+        ];
+        for k in SCOPED {
+            cmd.env_remove(k);
+        }
+        return;
+    }
+    // Single-user: re-inject the RESOLVED gateway credential after the scrub.
+    // The blanket removal above protects multiuser guests, but on a
+    // single-user session the gateway key bills the user themself — and
+    // agent scripts (speech-generator, training-video-generator,
+    // tutorial-studio) that call Gemini image/TTS have no other keyless
+    // path: the sandbox blocks ~/.config + the keychain, so "I use the
+    // gateway" users hit `no credential` from every subprocess. Resolving
+    // via the same env→keychain→cloud-token chain the providers use means
+    // a gateway-configured desktop just works.
+    if let Some(key) = crate::providers::thclaws_gateway::resolve_access_key() {
+        let base = std::env::var("THCLAWS_GATEWAY_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| crate::providers::thclaws_gateway::GATEWAY_BASE_URL.to_string());
+        cmd.env("THCLAWS_GATEWAY_API_KEY", key);
+        cmd.env("THCLAWS_GATEWAY_BASE_URL", base);
+    }
+}
+
 fn apply_noninteractive_env(cmd: &mut tokio::process::Command) {
     // CI=1 is the most-respected signal. npm, pnpm, yarn, vite, jest,
     // ESLint, Prettier, Cypress, etc. all use it.
@@ -1130,12 +1347,89 @@ fn apply_noninteractive_env(cmd: &mut tokio::process::Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scrub_removes_platform_secrets_keeps_others() {
+        let mut cmd = crate::util::shell_command_async("true");
+        cmd.env("THCLAWS_GATEWAY_API_KEY", "spend-me")
+            .env("THCLAWS_CLOUD_HMAC_SECRET", "forge-me")
+            .env("KEEP_ME", "1");
+        scrub_sensitive_env(&mut cmd);
+        let std = cmd.as_std();
+        let removed = |key: &str| {
+            std.get_envs()
+                .any(|(k, v)| k == std::ffi::OsStr::new(key) && v.is_none())
+        };
+        assert!(
+            removed("THCLAWS_GATEWAY_API_KEY"),
+            "gateway key must be scrubbed"
+        );
+        assert!(
+            removed("THCLAWS_CLOUD_HMAC_SECRET"),
+            "hmac secret must be scrubbed"
+        );
+        assert!(
+            std.get_envs()
+                .any(|(k, v)| k == std::ffi::OsStr::new("KEEP_ME")
+                    && v == Some(std::ffi::OsStr::new("1"))),
+            "non-secret env must be preserved"
+        );
+    }
     use tempfile::tempdir;
+
+    #[test]
+    fn split_shell_segments_handles_multibyte_utf8() {
+        // Regression for issue #141: the old byte-arithmetic version
+        // panicked here because `i += 1` walks into the middle of the
+        // 3-byte em-dash (U+2014, E2 80 94).
+        let cmd = "echo hello — world; ls";
+        let segs = split_shell_segments(cmd);
+        assert_eq!(
+            segs,
+            vec!["echo hello — world".to_string(), " ls".to_string()]
+        );
+
+        // And a few more exotic Unicode points to be sure: a 4-byte
+        // emoji (😀, U+1F600, F0 9F 98 80) right next to an operator.
+        let cmd = "echo 😀 | grep .";
+        let segs = split_shell_segments(cmd);
+        assert_eq!(segs, vec!["echo 😀 ".to_string(), " grep .".to_string()]);
+
+        // Mixed: Thai script (3-byte each) split by `&&`.
+        let cmd = "echo สวัสดี && echo world";
+        let segs = split_shell_segments(cmd);
+        assert_eq!(
+            segs,
+            vec!["echo สวัสดี ".to_string(), " echo world".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_shell_segments_distinguishes_double_and_single_operators() {
+        // && and || vs single & and | — make sure the two-char check
+        // wins so neither operator gets corrupted.
+        assert_eq!(
+            split_shell_segments("a && b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+        assert_eq!(
+            split_shell_segments("a || b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+        assert_eq!(
+            split_shell_segments("a & b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+        assert_eq!(
+            split_shell_segments("a | b"),
+            vec!["a ".to_string(), " b".to_string()]
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn echoes_stdout() {
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({"command": "echo hello-bash"}))
             .await
             .unwrap();
@@ -1394,7 +1688,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn captures_stderr() {
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({"command": "echo oops >&2"}))
             .await
             .unwrap();
@@ -1405,7 +1699,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn nonzero_exit_appended_to_output() {
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({"command": "echo done; exit 3"}))
             .await
             .unwrap();
@@ -1416,7 +1710,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn stdout_and_stderr_both_captured() {
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({"command": "echo out; echo err >&2"}))
             .await
             .unwrap();
@@ -1430,7 +1724,7 @@ mod tests {
     async fn honors_cwd_argument() {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("marker.txt"), "").unwrap();
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({
                 "command": "ls",
                 "cwd": dir.path().to_string_lossy(),
@@ -1443,7 +1737,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_long_running_commands() {
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({
                 "command": "sleep 5",
                 "timeout": 1000,
@@ -1458,10 +1752,41 @@ mod tests {
         }
     }
 
+    // issue #182: a mid-call session cancel must kill the child promptly,
+    // not wait out `timeout_ms`. Repro: a 30s sleep under a 60s timeout,
+    // cancelled after 200ms — should error in well under a second.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_in_flight_bash() {
+        let cancel = crate::cancel::CancelToken::new();
+        let bash = BashTool::with_cancel(cancel.clone());
+        let firing = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            firing.cancel();
+        });
+        let start = std::time::Instant::now();
+        let out = bash
+            .call(json!({ "command": "sleep 30 && echo woke", "timeout": 60000 }))
+            .await;
+        let elapsed = start.elapsed();
+        match out {
+            Err(e) => assert!(
+                format!("{e}").contains("cancelled"),
+                "expected a cancelled error, got: {e}"
+            ),
+            Ok(o) => panic!("expected cancellation, got Ok: {o}"),
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "cancel should kill promptly; took {elapsed:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_secs_legacy_alias_works() {
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({
                 "command": "sleep 5",
                 "timeout_secs": 1,
@@ -1479,13 +1804,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn missing_command_errors() {
-        let err = BashTool.call(json!({})).await.unwrap_err();
+        let err = BashTool::default().call(json!({})).await.unwrap_err();
         assert!(format!("{err}").contains("command"));
     }
 
     #[test]
     fn bash_requires_approval() {
-        let bash = BashTool;
+        let bash = BashTool::default();
         assert!(bash.requires_approval(&json!({"command": "ls"})));
     }
 
@@ -1500,15 +1825,24 @@ mod tests {
     }
 
     #[test]
-    fn needs_venv_detects_pip_and_python_tools() {
+    fn needs_venv_detects_pip_and_server_tools() {
+        // v0.35.4 tightened needs_venv: only pip/poetry/uv installs +
+        // long-running server runners + pytest. Plain `python script.py`
+        // does NOT trigger venv auto-wrap (was producing spurious
+        // `[creating .venv]` warnings around agent-shipped stdlib
+        // scripts; the agent then mis-attributed them to the script).
         assert!(needs_venv("pip install fastapi"));
         assert!(needs_venv("pip3 install uvicorn"));
         assert!(needs_venv("uvicorn main:app --port 8000"));
         assert!(needs_venv("gunicorn app:app"));
         assert!(needs_venv("pytest tests/"));
         assert!(needs_venv("flask run"));
-        assert!(needs_venv("python app.py"));
-        assert!(needs_venv("python3 main.py"));
+        assert!(needs_venv("poetry install"));
+        assert!(needs_venv("uv pip install requests"));
+        // Plain python invocations — explicitly NOT venv-wrapped.
+        assert!(!needs_venv("python app.py"));
+        assert!(!needs_venv("python3 main.py"));
+        assert!(!needs_venv("python3 .thclaws/scripts/batch.py"));
         assert!(!needs_venv("echo hello"));
         assert!(!needs_venv("cargo build"));
         assert!(!needs_venv("npm install express"));
@@ -1702,7 +2036,7 @@ mod tests {
         // If this env var doesn't reach the child, all the other
         // workarounds in M6.8 B1 are also broken, so this acts as
         // the canary for the whole apply_noninteractive_env path.
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({"command": "echo \"CI=$CI\""}))
             .await
             .unwrap();
@@ -1719,7 +2053,7 @@ mod tests {
         // bars, no interactive prompts." Tools like `less` /
         // `git log` / `vim` use it to skip pager / fall back to
         // non-interactive behaviour.
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({"command": "echo \"TERM=$TERM\""}))
             .await
             .unwrap();
@@ -1735,7 +2069,7 @@ mod tests {
         // npm respects this for confirmation prompts. Sample test
         // ensures the env var array stays in sync with the code
         // (a future refactor that drops it should fail this test).
-        let out = BashTool
+        let out = BashTool::default()
             .call(json!({"command": "echo \"NPM_CONFIG_YES=$NPM_CONFIG_YES\""}))
             .await
             .unwrap();
@@ -1849,7 +2183,7 @@ mod tests {
         crate::sandbox::Sandbox::init().unwrap();
 
         // A) cwd outside the workspace root → sandbox denies.
-        let a = BashTool
+        let a = BashTool::default()
             .call(json!({"command": "echo hi", "cwd": outside.path().to_str().unwrap()}))
             .await;
         eprintln!("[A cwd-outside] {a:?}");
@@ -1862,7 +2196,7 @@ mod tests {
 
         // B) command runs with default root; the command STRING is not
         //    path-checked, so an in-workspace echo just works.
-        let b = BashTool
+        let b = BashTool::default()
             .call(json!({"command": "echo IN_WS_OK"}))
             .await
             .expect("default-root command should run");
@@ -1872,7 +2206,7 @@ mod tests {
         // C) absolute exe path in the command, no cwd → NOT a sandbox
         //    denial. It runs and fails as a plain shell error (exit
         //    code / not found) — never "access denied".
-        let c = BashTool
+        let c = BashTool::default()
             .call(json!({"command": "/no/such/python_zzz_119 --version"}))
             .await
             .expect("a failing command returns Ok(output-with-exit-code), not Err");

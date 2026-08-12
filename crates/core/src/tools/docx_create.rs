@@ -148,7 +148,10 @@ fn render_docx(path: &Path, content: &str, body_pt: usize) -> Result<usize> {
     // being rendered as a string of pipes.
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
-    let parser = Parser::new_ext(content, opts);
+    // Repair LLM-miscounted table delimiter rows so GFM tables aren't silently
+    // demoted to paragraphs (see tools::md_tables).
+    let content = super::md_tables::repair_table_delimiters(content);
+    let parser = Parser::new_ext(&content, opts);
 
     // Streaming markdown walker. We accumulate text inside a paragraph
     // until a block-end event flushes it to the doc. Header / list /

@@ -1,0 +1,20 @@
+char  $แอน   = @./anny.png  voice:th-female-warm  desc:"หญิงสาวผมยาว"
+char  $โทนี่  = @./tony.png  voice:th-male-low     desc:"ชายหนุ่มไว้เครา"
+scene $ห้อง   = @./room.png  time:day
+prop  $โต๊ะ   = @./table.png
+
+shot 1 (dialogue) {
+    $แอน นั่งที่ $โต๊ะ ใน $ห้อง, $โทนี่ นั่งตรงข้าม
+    camera: two-shot, static
+    $แอน say "คุณหายไปไหนมาตั้งแต่เช้า"
+    @duration: 6
+}
+
+shot 2 (dialogue) {
+    close-up $โทนี่
+    expression: หงุดหงิด
+    $โทนี่ say "ไปทำงาน" แล้วลุกจากโต๊ะเดินออกจากเฟรม
+    camera: static
+    @continue_from: 1
+    @duration: 6
+}

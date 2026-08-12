@@ -94,7 +94,7 @@ pub async fn spawn_side_channel(
     agent_defs: crate::agent_defs::AgentDefsConfig,
     events_tx: broadcast::Sender<ViewEvent>,
 ) -> Result<SideChannelId> {
-    let agent_def = agent_defs
+    let mut agent_def = agent_defs
         .agents
         .iter()
         .find(|d| d.name == agent_name)
@@ -104,6 +104,11 @@ pub async fn spawn_side_channel(
                 "unknown agent '{agent_name}' — try /agents to list known agents"
             ))
         })?;
+
+    // A user launching an agent from the sidebar is an explicit "go do
+    // this for me" — let it read/write artifacts even when its def is
+    // declared read-only. See [`grant_file_tools_for_sidechannel`].
+    grant_file_tools_for_sidechannel(&mut agent_def);
 
     let id: SideChannelId = format!(
         "side-{}",
@@ -141,6 +146,10 @@ pub async fn spawn_side_channel(
 
     let id_for_task = id.clone();
     let agent_name_for_task = agent_name.clone();
+    // Kept separate from `agent_name_for_task` (moved into the Done
+    // event) so we can still test it after the match to decide whether
+    // to refresh the KMS sidebar.
+    let agent_name_for_refresh = agent_name.clone();
     let events_tx_for_task = events_tx.clone();
     let cancel_for_task = cancel.clone();
 
@@ -168,11 +177,18 @@ pub async fn spawn_side_channel(
                         text: s,
                     });
                 }
-                Ok(AgentEvent::ToolCallStart { name, .. }) => {
+                Ok(AgentEvent::ToolCallStart { name, input, .. }) => {
+                    // Progress feedback: build a descriptive label from the
+                    // tool input (e.g. `WebFetch (https://…)`, `Write
+                    // (articles/…/article.md)`, `FetchImages (…/article.md)`)
+                    // instead of the bare tool name, so `/extract` and other
+                    // side-channel agents show WHAT each step is doing, not just
+                    // that a tool ran.
+                    let label = crate::tool_display::tool_label(&name, &input);
                     let _ = events_tx_for_task.send(ViewEvent::SideChannelToolCall {
                         id: id_for_task.clone(),
-                        tool_name: name.clone(),
-                        label: name,
+                        tool_name: name,
+                        label,
                     });
                 }
                 Ok(AgentEvent::Done { .. }) => break,
@@ -200,6 +216,17 @@ pub async fn spawn_side_channel(
                     result_text: full_text,
                 });
             }
+        }
+
+        // A finished `dream` run has written/updated KMS pages (digests
+        // + topic pages), so push a `kms_update` to refresh the sidebar
+        // without a manual /reload — same pattern research-job
+        // completion uses. Fire on any outcome: a run that errored or
+        // was cancelled may still have written pages before stopping.
+        if agent_name_for_refresh == "dream" {
+            let _ = events_tx_for_task.send(ViewEvent::KmsUpdate(
+                crate::kms::build_update_payload().to_string(),
+            ));
         }
 
         // Always remove from registry on exit, regardless of outcome.
@@ -301,6 +328,31 @@ pub fn list_side_channels() -> Vec<(String, String, f64)> {
             )
         })
         .collect()
+}
+
+/// Widen a sidebar-launched agent's tool allow-list with the file tools
+/// (Read/Write/Edit) so a user-invoked agent can save the artifact it was
+/// asked for — even when its def is declared read-only (e.g. a planner
+/// that normally only returns text). Running an agent from the sidebar is
+/// an explicit user action, so this matches the expectation that "if I
+/// tell it to write a file, it can."
+///
+/// Rules: a def with an EMPTY allow-list already inherits every tool, so
+/// it's left alone. A tool listed in `disallowed_tools` stays denied (the
+/// author's explicit deny wins). The base registry still gates what
+/// actually exists, so adding a name the registry lacks is a harmless
+/// no-op.
+fn grant_file_tools_for_sidechannel(def: &mut crate::agent_defs::AgentDef) {
+    if def.tools.is_empty() {
+        return;
+    }
+    for t in ["Read", "Write", "Edit"] {
+        let denied = def.disallowed_tools.iter().any(|d| d == t);
+        let present = def.tools.iter().any(|x| x == t);
+        if !denied && !present {
+            def.tools.push(t.to_string());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -599,5 +651,42 @@ mod tests {
             r.clear();
         }
         assert!(!cancel_side_channel("does-not-exist"));
+    }
+
+    #[test]
+    fn sidechannel_grants_file_tools_to_restricted_agent() {
+        use crate::agent_defs::AgentDef;
+
+        // Read-only planner (like the marketplace `outliner`): gains the
+        // file tools, without duplicating the Read it already had.
+        let mut def = AgentDef {
+            name: "outliner".into(),
+            tools: vec!["Read".into(), "Grep".into(), "Glob".into()],
+            ..Default::default()
+        };
+        grant_file_tools_for_sidechannel(&mut def);
+        assert!(def.tools.contains(&"Write".to_string()));
+        assert!(def.tools.contains(&"Edit".to_string()));
+        assert_eq!(def.tools.iter().filter(|t| *t == "Read").count(), 1);
+
+        // Empty allow-list already inherits everything → untouched.
+        let mut open = AgentDef {
+            name: "open".into(),
+            tools: vec![],
+            ..Default::default()
+        };
+        grant_file_tools_for_sidechannel(&mut open);
+        assert!(open.tools.is_empty());
+
+        // An explicit deny wins — Write stays out.
+        let mut denied = AgentDef {
+            name: "reviewer".into(),
+            tools: vec!["Read".into()],
+            disallowed_tools: vec!["Write".into(), "Edit".into()],
+            ..Default::default()
+        };
+        grant_file_tools_for_sidechannel(&mut denied);
+        assert!(!denied.tools.contains(&"Write".to_string()));
+        assert!(!denied.tools.contains(&"Edit".to_string()));
     }
 }

@@ -9,10 +9,12 @@ Knowledge Base หรือสร้างทีม AI Agent ทำงานร�
 binary เดียว แค่บอกเป็นภาษาธรรมชาติว่าต้องการอะไร แล้ว agent จะอ่านไฟล์
 รันคำสั่ง ใช้ tool และพูดคุยโต้ตอบกับคุณระหว่างทำงาน
 
-หก surface รวมอยู่ใน binary เดียว ใช้ `Agent` loop, `Session` และ tool
-registry ชุดเดียวกัน — ห้า surface แรกสำหรับ "คน" คนหนึ่ง (รวมถึงคุย
-ผ่าน LINE บนมือถือ), surface ที่หกให้ "ซอฟต์แวร์อื่น" เรียกใช้ thClaws
-ไปทำงาน:
+แปด surface รวมอยู่ใน binary เดียว ใช้ `Agent` loop, `Session` และ tool
+registry ชุดเดียวกัน — เจ็ด surface แรกสำหรับ "คน" คนหนึ่ง (รวมถึงคุย
+ผ่าน LINE, Telegram หรือ Facebook Messenger บนมือถือ), surface ที่แปด
+ให้ "ซอฟต์แวร์อื่น" เรียกใช้ thClaws ไปทำงาน นอกเหนือจาก binary แล้ว
+**[thClaws.cloud](#thclawscloud)** ยังเพิ่ม catalog ให้เลือกใช้และ
+hosted runtime ให้เช่า — ดู bullet ด้านล่างและ [บทที่ 27](ch27-thclaws-cloud.md):
 
 - **Desktop GUI** (`thclaws` โดยไม่ใส่ flag) — หน้าต่าง native ประกอบด้วย
   แท็บ Terminal ที่รัน REPL ตัวเดียวกับโหมด `--cli`, แท็บ Chat แบบ
@@ -31,12 +33,34 @@ registry ชุดเดียวกัน — ห้า surface แรกสำ
   `line.thclaws.ai` ซึ่งเชื่อมระหว่าง LINE platform กับ thClaws ที่รัน
   บนเครื่องคุณ — agent อยู่ในเครื่องคุณ แต่เรียกใช้ได้จากที่ไหนก็ได้
   ผ่านมือถือ (ดู [บทที่ 21](ch21-line-and-browser-chat.md))
+- **Telegram bot** (`thclaws --telegram` หรือ GUI Telegram Connect
+  modal) — สร้างบอทด้วย `@BotFather` วาง token แล้วทุกข้อความที่ DM หา
+  บอทจะรันเป็น turn บนเครื่องคุณ tool call ที่ต้องอนุมัติจะมาเป็นปุ่ม
+  inline-keyboard กดจากมือถือได้ (ดู [บทที่ 23](ch23-telegram.md))
+- **Facebook Page Messenger** (`thclaws --messenger` หรือ GUI Messenger
+  Connect modal) — เชื่อม Facebook Page ครั้งเดียว แล้วทุก DM Messenger
+  ถึง Page จะรันเป็น turn บนเครื่องคุณ การอนุมัติแสดงเป็น quick-reply
+  chip ที่กดจากมือถือได้ (ดู [บทที่ 24](ch24-messenger.md))
 - **AI Agent (API Server)** (`thclaws --serve` + HTTP API) — ให้
   *ซอฟต์แวร์อื่น* (orchestrator, external client, scheduler) เรียกใช้
   thClaws เป็น agent ผ่าน HTTP API เดียวกัน — รายละเอียดอยู่ในบทถัด ๆ ไป
 
 ## สิ่งที่ทำให้ thClaws แตกต่าง
 
+- **thClaws.cloud — เลือกใช้ รัน และโฮสต์ agent** — AI agent ใน thClaws
+  คือ "โฟลเดอร์" ([บทที่ 8](ch08-memory-and-agents-md.md)) และ
+  thClaws.cloud เปลี่ยนโมเดลโฟลเดอร์นี้ให้เป็น *git สำหรับ AI agent*
+  **เลือกใช้** จาก catalog ที่
+  [thclaws.cloud/browse](https://thclaws.cloud/browse) **ติดตั้ง** ลง
+  โฟลเดอร์ในเครื่องด้วยคำสั่งเดียว (`/cloud get <slug>`) **เผยแพร่** ของ
+  ตัวเอง (`/cloud publish`) — คุณเป็นเจ้าของโฟลเดอร์และใช้ provider key
+  ของคุณเอง ผูกเดสก์ท็อปกับ catalog ด้วยการวาง CLI token ครั้งเดียวที่
+  Settings → thClaws.cloud จากนั้นทุก catalog op เป็น slash command ใน
+  session ที่เปิดอยู่ สำหรับทีมมี **hosted runtime** (managed runner
+  ไม่ต้องตั้งค่า — ตอนนี้อยู่ในช่วง closed beta) และ **shared agent**:
+  agent ของบริษัทที่หลายคนใช้ร่วมกัน คิดเงินผ่าน gateway ไปที่เจ้าของ
+  พร้อม knowledge base ของบริษัทแบบอ่านอย่างเดียว
+  ดู [บทที่ 27](ch27-thclaws-cloud.md) <a id="thclawscloud"></a>
 - **Self-improving AI Agent (auto-learn)** — เปิด `autoLearn: true` ใน
   settings แล้ว agent จะเรียนรู้จากตัวเองอัตโนมัติ ทุก session ที่จบลง
   จะถูกบันทึกเป็น KMS page ใน `self_learn` (แยกจาก KMS ที่คุณ curate
@@ -44,30 +68,43 @@ registry ชุดเดียวกัน — ห้า surface แรกสำ
   ในนั้น สร้างจากปริมิทีฟที่มีอยู่แล้ว (`/kms ingest`, `/kms reconcile`)
   — ไม่มี prompt agent ใหม่ แค่เปิด/ปิดด้วย flag เดียว ถ้าอยากเริ่มใหม่
   ลบโฟลเดอร์ `self_learn/` ทิ้งได้เลย ([บทที่ 9 §Self-improving AI Agent](ch09-knowledge-bases-kms.md#self-improving-ai-agent-auto-learn))
-- **3 ระดับของ agent orchestration** —
+- **4 ระดับของ agent orchestration** —
   **`Task` tool** (model ตัดสินใจ block parent's turn),
   **`/agent <name>`** (user สั่งเอง รันขนานกับ main ไม่เข้า history),
   **Agent Team** (หลาย process, mailbox + task queue, แต่ละคนมี
-  worktree ของตัวเอง) ดู [บทที่ 15](ch15-subagents.md) และ
-  [บทที่ 17](ch17-agent-teams.md)
+  worktree ของตัวเอง) และ **Workflow (`/workflow`)** — ตัว
+  orchestrate เป็น *โค้ด* ไม่ใช่ model: LLM เขียนสคริปต์ JavaScript ที่
+  fan-out งานไปยัง subagent หลายตัว แล้ว JS engine แบบ sandbox รัน
+  อย่าง deterministic บนเครื่องคุณ รันซ้ำได้ผลรูปแบบเดิม งานยาว ๆ ทิ้ง
+  checkpoint ไว้ resume ได้ เหมาะกับงาน **bulk ที่เป็นอิสระต่อกัน** (เช่น
+  "แก้ไฟล์เทสต์ทั้ง 800 ไฟล์ให้ใช้ fixture ใหม่") ดู
+  [บทที่ 15](ch15-subagents.md), [บทที่ 17](ch17-agent-teams.md) และ
+  [บทที่ 25](ch25-workflows.md)
 - **Hire-able as a working agent — self-hosted sandbox ของคุณ** —
   ทิศกลับของ orchestration: thClaws เป็น *worker* ให้ orchestrator
-  ตัวอื่น (เช่น Paperclip / thcompany / Anthropic Managed Agents)
+  ตัวอื่น (เช่น scheduler, CI job หรือ control plane ของคุณเอง)
   จ้างไปทำงาน ทั้งแบบ **Employee** (`thclaws_local` — process บน
   เครื่องเดียวกัน — เทียบเท่า in-process sandbox) และ **Freelancer**
   (`thclaws_pod` — pod แยก รันบน VPS, cloud หรือ k3s ของคุณเอง —
   เทียบเท่า self-hosted sandbox ที่ agent loop อยู่ฝั่ง orchestrator
   ส่วน tool execution อยู่ใน perimeter ของ *คุณ*) orchestrator พูดผ่าน
   HTTP API เดียวกับที่ user/IDE ใช้
-  ([บทที่ 22](ch22-paperclip-adapter.md))
+  (ผ่าน `POST /agent/run` และ `GET /v1/agent/info`)
 - **จำสิ่งที่สำคัญในระยะยาว 3 ระดับ** —
   **`AGENTS.md` (หรือ `CLAUDE.md`)** ในโปรเจกต์ โดนฉีดเข้า prompt อัตโนมัติ
   ([บทที่ 8](ch08-memory-and-agents-md.md));
-  **memory store** ที่ `~/.config/thclaws/memory/` เก็บข้อเท็จจริงที่ agent
+  **memory store** ที่ `~/.local/share/thclaws/memory/` เก็บข้อเท็จจริงที่ agent
   เรียนรู้เกี่ยวกับตัวคุณและโปรเจกต์;
-  **KMS (knowledge bases)** สำหรับเอกสารยาว ๆ ที่มี search + reconcile +
-  หลายหน้า แนบเข้า session ได้ (`/kms attach`) — ทั้งหมดเป็น markdown
-  ที่คุณอ่าน แก้ไข หรือ commit ได้ ([บทที่ 9](ch09-knowledge-bases-kms.md))
+  **KMS (knowledge bases)** wiki หลายหน้าที่ agent ค้น/อ่าน/เขียนเอง
+  ค้นได้ทั้งแบบ grep และ **BM25 จัดอันดับความเกี่ยวข้อง** (`query:`)
+  โดยไม่ใช้ embedding — ตามแนว LLM-wiki ของ Karpathy ดูแลอัตโนมัติด้วย
+  side-channel agent (`/dream`, `/kms reconcile`, `/kms challenge`);
+  **เปิดดูและวาดกราฟ** ใน GUI: browser ของ KMS, **graph view** แบบ
+  Obsidian ของ `[[wikilink]]` และ `/kms html` export เว็บ interactive
+  ไฟล์เดียวไว้แชร์ได้; และ **แลกเปลี่ยนข้ามทีมด้วย OKF** (Open Knowledge
+  Format ของ Google): `/kms export-okf` / `/kms import-okf` — ทั้งหมด
+  เป็น markdown ที่คุณอ่าน แก้ไข หรือ commit ได้
+  ([บทที่ 9](ch09-knowledge-bases-kms.md))
 - **ประกอบ agent เองจาก building block** —
   **Skill** ([บทที่ 12](ch12-skills.md)) สำหรับ workflow ที่ใช้ซ้ำได้,
   **MCP server** ([บทที่ 14](ch14-mcp.md)) สำหรับเสียบ tool ภายนอก
@@ -80,14 +117,14 @@ registry ชุดเดียวกัน — ห้า surface แรกสำ
   Agent SDK), OpenAI (Chat + Responses/Codex), Google Gemini & Gemma,
   Alibaba DashScope (Qwen), DeepSeek, Z.ai (GLM Coding Plan), NVIDIA
   NIM, NSTDA Thai LLM (OpenThaiGPT, Typhoon, Pathumma, THaLLE),
-  OpenRouter, Agentic Press, Azure AI Foundry, Ollama (local +
+  OpenRouter, Moonshot, xAI, Groq, Azure AI Foundry, Ollama (local +
   Anthropic-compat + Cloud), LMStudio และ slot OpenAI-compatible
   ทั่วไป (`oai/*`) — สลับกลางคันด้วย `/model` หรือ `/provider` ได้
   ([บทที่ 6](ch06-providers-models-api-keys.md))
 - **API พร้อมใช้กับเครื่องมือมาตรฐาน** — `--serve` เปิดทั้ง
   `/v1/chat/completions` (OpenAI-compatible สำหรับ Cursor, Aider, n8n,
   openai-python) และ `/agent/run` + `/v1/agent/info` (thClaws-native
-  สำหรับ orchestrator เช่น thcompany) — agent ตัวเดียวให้บริการได้
+  สำหรับ orchestrator) — agent ตัวเดียวให้บริการได้
   ทั้งคนและซอฟต์แวร์พร้อมกัน
 - **Async webhook delivery** — งานที่รันยาว (deploy, build, multi-step
   research) ส่ง prompt + `x_callback` แล้วปิด connection ได้ thClaws
@@ -140,9 +177,9 @@ registry ชุดเดียวกัน — ห้า surface แรกสำ
   ของทุก turn แสดงครบ orchestrator/UI คำนวณ cost ในเครื่องได้โดยไม่
   ต้องถาม provider
 - **Host thClaws ที่ไหนก็ได้** — ใช้บนเครื่องตัวเองได้ หรือ deploy ขึ้น
-  [thCompany.ai](https://thcompany.ai) เพื่อให้ thClaws รันบน cloud
+  host ที่คุณเลือก เพื่อให้ thClaws รันบน cloud
   ในชื่อของคุณ — จะถูก *Company จ้าง* (เป็น employee / freelancer ผ่าน
-  [บทที่ 22](ch22-paperclip-adapter.md)) หรือยืนเดี่ยวรับงานเองก็ได้
+  orchestrator) หรือยืนเดี่ยวรับงานเองก็ได้
   flow การ deploy มาในรูป plugin host จึงสลับเปลี่ยนได้ ไม่มีการล็อก
   client
 - **Session resume** — `thclaws --resume last` ทำงานต่อจาก session
@@ -162,7 +199,7 @@ registry ชุดเดียวกัน — ห้า surface แรกสำ
 - OS ที่รองรับ: macOS (arm64 หรือ x86_64), Linux (arm64 หรือ x86_64)
   หรือ Windows (arm64 หรือ x86_64)
 - API key ของ LLM อย่างน้อยหนึ่งเจ้า — Anthropic, OpenAI, Gemini,
-  OpenRouter, Agentic Press, DashScope, DeepSeek, Z.ai, NVIDIA NIM,
+  OpenRouter, Moonshot, xAI, Groq, DashScope, DeepSeek, Z.ai, NVIDIA NIM,
   NSTDA Thai LLM หรือ Azure AI Foundry (หรือจะติดตั้ง Ollama /
   LMStudio บนเครื่องเอง ถ้าต้องการใช้แบบ offline)
 
@@ -172,7 +209,7 @@ key ที่ไหนและอย่างไร
 
 ## คู่มือเล่มนี้จัดเรียงอย่างไร
 
-คู่มือเล่มนี้ 22 บท จัดเรียงเป็น reference อธิบายวิธีติดตั้งและทุก
+คู่มือเล่มนี้ 28 บท จัดเรียงเป็น reference อธิบายวิธีติดตั้งและทุก
 ฟีเจอร์ที่ผู้ใช้สัมผัสได้ ทีละเรื่อง พร้อมคำสั่งและการตั้งค่าที่จำเป็น:
 
 **ตั้งค่าและเริ่มต้น**
@@ -199,12 +236,20 @@ key ที่ไหนและอย่างไร
 - [บทที่ 18](ch18-plan-mode.md) — plan mode
 - [บทที่ 19](ch19-scheduling.md) — scheduling
 - [บทที่ 20](ch20-research.md) — `/research` (background research)
+- [บทที่ 25](ch25-workflows.md) — Workflows (orchestration ระดับที่สี่)
 
 **เข้าถึงจากที่อื่น**
 - [บทที่ 21](ch21-line-and-browser-chat.md) — LINE chat + browser bridge
-- [บทที่ 22](ch22-paperclip-adapter.md) — Paperclip adapter (จ้าง thClaws ไปทำงานใน orchestrator)
+- [บทที่ 23](ch23-telegram.md) — Telegram bot
+- [บทที่ 24](ch24-messenger.md) — Facebook Page Messenger bot
+- [บทที่ 27](ch27-thclaws-cloud.md) — thClaws.cloud (catalog + hosted runtime)
+
+**Surface ขั้นสูงและงานอัตโนมัติ**
+- [บทที่ 26](ch26-gui-shells.md) — GUI Shells (frontend เฉพาะทาง)
+- [บทที่ 28](ch28-browser-automation.md) — Browser automation
 
 ถ้าเพิ่งเริ่ม อ่านบทที่ 2 ต่อได้เลย ถ้าย้ายมาจาก Claude Code แนะนำให้
 ข้ามไปบทที่ 6, 7, 11 และ 13 ถ้าคุ้นเคยพื้นฐานแล้วและสนใจของใหม่ ฟีเจอร์
 ที่เพิ่งเพิ่มเข้ามาอยู่ในบทที่ 9 (auto-learn และ `/dream`), บทที่ 15
-(`/agent` side-channels), บทที่ 21 (LINE) และบทที่ 22 (Paperclip adapter)
+(`/agent` side-channels), บทที่ 21 (LINE), บทที่ 23 (Telegram), บทที่ 24
+(Messenger) และ — ไฮไลต์ของรุ่นนี้ — บทที่ 27 (thClaws.cloud)

@@ -43,6 +43,7 @@ $ thclaws schedule run morning-brief
 | `cwd` | — | ไดเรกทอรีปัจจุบัน | Working directory ที่งานจะรัน เป็นตัวกำหนดว่าจะใช้ `.thclaws/settings.json`, sandbox, memory, และ MCP config ระดับโปรเจกต์ของไดเรกทอรีไหน |
 | `model` | — | ตามที่ `cwd` กำหนด | Override ชื่อโมเดล (`gpt-4o`, `claude-sonnet-4-6` ฯลฯ) |
 | `maxIterations` | — | ตามที่ `cwd` กำหนด | จำกัดรอบการเรียก tool ของ agent loop |
+| `resumeSession` | — | ไม่ตั้ง (stateless) | **โหมด Heartbeat** (v0.88.0+): ใส่ `--resume-session last` แล้วทุกการยิงจะต่อ session เดียวที่โตขึ้นเรื่อยๆ แทนการเริ่มใหม่ — ดู [Heartbeat](#heartbeats) |
 | `timeoutSecs` | — | 600 (10 นาที) | Timeout แบบ hard ถ้าเกินจะ kill งานและบันทึกเป็น `timed_out` ใส่ `--timeout 0` ตอน add ถ้าไม่ต้องการ timeout |
 | `enabled` | — | `true` | ถ้าเป็น `false` scheduler จะข้าม และ `schedule run` จะปฏิเสธไม่ยิง |
 | `watchWorkspace` | — | `false` | ถ้า `true` daemon จะยิงงานเมื่อมีไฟล์ใน `cwd` เปลี่ยนแปลง (debounce ~2 วินาที) — ดู [Trigger เมื่อ workspace เปลี่ยนแปลง](#trigger-เมื่อ-workspace-เปลี่ยนแปลง) ด้านล่าง รองรับเฉพาะ daemon เท่านั้น in-process scheduler จะข้าม flag นี้ |
@@ -62,6 +63,42 @@ POSIX แบบ 5 ฟิลด์มาตรฐาน: `minute hour day-of-mont
 | `0 9,13,17 * * *` | 09:00, 13:00, 17:00 ทุกวัน |
 
 รองรับ syntax แบบ range/list (`MON-FRI`, `1,15`) Cron expression จะถูกตรวจสอบตอนรัน `schedule add` — พิมพ์ผิดจะแสดง error ที่อ่านง่ายแทนที่จะล้มเหลวเงียบ ๆ ตอนงานยิง
+
+## Heartbeat — schedule ที่จำได้ {#heartbeats}
+
+โดยปกติทุกการยิงเป็นแบบ **stateless**: scheduler spawn `thclaws --print`
+ใหม่ agent รู้เฉพาะสิ่งที่อ่านได้จาก disk (KMS, ไฟล์, memory) — บทสนทนา
+ของการยิงครั้งก่อนหายไปหมด ซึ่งเหมาะกับงาน maintenance แต่ผิดรูปสำหรับ
+loop ต่อเนื่องที่อยากให้ agent ฉลาดขึ้นทุกรอบ เช่น กลยุทธ์เทรดที่ปรับตัว,
+monitor ที่จำได้ว่าเคยแจ้งอะไรไปแล้ว, งานวิจัยข้ามคืนที่ต่อยอดเหตุผลเดิม
+
+**โหมด Heartbeat** (v0.88.0+) ต่อทุกการยิงเข้า session เดียว:
+
+```bash
+thclaws schedule add trade-loop \
+  --cron "*/15 * * * *" \
+  --prompt "ตรวจพอร์ต แล้วปรับกลยุทธ์จากผลของการตัดสินใจครั้งก่อนๆ" \
+  --resume-session last
+```
+
+`--resume-session last` ทำให้แต่ละการยิงรัน
+`thclaws --print --resume last` — ยิงแรกเริ่ม session, ยิงถัดๆ ไปโหลด
+history ทั้งหมด เพิ่มหนึ่ง exchange แล้วบันทึก agent จำการตัดสินใจ
+ของตัวเองและผลลัพธ์ได้จริง (จะใส่ session id ตรงๆ เพื่อต่อบทสนทนา
+ที่มีอยู่ก็ได้)
+
+ข้อควรรู้:
+
+- **แยก working directory ให้ heartbeat โดยเฉพาะ** (`--cwd`) — `last`
+  หมายถึง session ล่าสุดของ *cwd นั้น* ถ้าคุณแชทเองใน workspace
+  เดียวกัน แชทของคุณจะกลายเป็น "last" แล้ว heartbeat จะไปต่อผิดเส้น
+- **ค่า token โตตาม history** — ทุกการยิงอ่านบทสนทนาทั้งหมดซ้ำ
+  (compaction ช่วยอัตโนมัติเมื่อยาว) loop 24/7 จึงแพงกว่าแบบ stateless
+  พอสมควร นี่คือราคาของความจำ — งานที่ KMS บน disk เพียงพอ
+  ใช้แบบ stateless เถอะ
+- **เปิดดูบทสนทนาได้ตลอด** — เป็น session ปกติ เปิดจาก session list
+  ใน GUI หรือ `thclaws --cli` → `/resume <id>` ใน cwd เดียวกัน
+- ใช้ได้กับ trigger ทั้งสามชั้น (manual `schedule run`, in-process, daemon)
 
 ## Trigger เมื่อ workspace เปลี่ยนแปลง
 

@@ -60,6 +60,7 @@ Slash commands คือ control plane ของ thClaws พิมพ์ `/` ต
 
 | Command | ทำอะไร |
 |---|---|
+| `/marketplace [--refresh]` | เปิด marketplace browser รวม (GUI modal: skills · MCP · plugins · subagents); CLI พิมพ์สรุปรวม |
 | `/skills` | แสดงรายการ skill ที่โหลดไว้ |
 | `/skill show NAME` | แสดงคำอธิบายเต็มพร้อม path ของ skill |
 | `/skill marketplace [--refresh]` | เปิดดู catalog จาก thclaws.ai/api/marketplace.json |
@@ -73,6 +74,10 @@ Slash commands คือ control plane ของ thClaws พิมพ์ `/` ต
 | `/plugin marketplace [--refresh]` | เปิดดู plugin catalog |
 | `/plugin search QUERY` | ค้น plugin marketplace แบบ substring |
 | `/plugin info NAME` | รายละเอียด plugin จาก marketplace (`/plugin show NAME` ใช้สำหรับ plugin ที่ติดตั้งแล้ว) |
+| `/subagent marketplace [--refresh]` | เปิดดู subagent (agent defs) ใน catalog |
+| `/subagent search QUERY` | ค้นหา subagent ใน marketplace |
+| `/subagent info NAME` | รายละเอียด subagent ใน marketplace |
+| `/subagent install [--user] <name-or-url> [name]` | ติดตั้งไฟล์ `.md` ของ subagent — ชื่อล้วน → marketplace, หรือ git/`.zip` URL |
 | `/<skill-name> [args]` | เรียกใช้ skill ที่ติดตั้งไว้โดยตรง |
 | `/<command-name> [args]` | เรียกใช้ legacy prompt command (template) |
 | `/plugins` | แสดงรายการ plugin ที่ติดตั้งไว้ (ทั้งเปิดและปิด) |
@@ -124,6 +129,8 @@ Slash commands คือ control plane ของ thClaws พิมพ์ `/` ต
 | `/agent NAME PROMPT` | Spawn user-driven side-channel subagent (GUI-only รันขนานกับ main) |
 | `/agents` | ลิสต์ side-channel agent ที่กำลังทำงาน (id, name, elapsed) |
 | `/agent cancel ID` | ยกเลิก side-channel agent ที่กำลังรัน |
+| `/agent new NAME` | เปิด GUI editor เขียน agent def ใหม่ (`.thclaws/agents/NAME.md`) — GUI เท่านั้น |
+| `/agent edit NAME` | เปิด GUI editor แก้ agent def เดิม/built-in — GUI เท่านั้น |
 | `/dream [FOCUS]` | Dispatch built-in dream agent เพื่อ consolidate KMS (GUI-only) — ดู [บทที่ 9](ch09-knowledge-bases-kms.md) |
 | `/team` | เข้าร่วม tmux session ของทีม (หรือแสดงสถานะทีม) |
 | `/doctor` | รันการตรวจสอบวินิจฉัย |

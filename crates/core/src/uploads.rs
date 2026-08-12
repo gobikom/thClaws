@@ -2,7 +2,7 @@
 //! browser-chat surface).
 //!
 //! Two responsibilities: pick a non-colliding filename under the
-//! workspace `uploads/` dir, and synthesize a user-turn chat message
+//! workspace `_uploads/` dir, and synthesize a user-turn chat message
 //! after one or more files land. The agent picks the synthetic message
 //! up via the normal session input path, so project `AGENTS.md` /
 //! `CLAUDE.md` instructions steer behavior (e.g. "when the user
@@ -27,7 +27,9 @@ use std::path::{Path, PathBuf};
 
 pub const UPLOAD_MAX_BYTES: u64 = 25 * 1024 * 1024;
 pub const UPLOAD_MAX_FILES: usize = 5;
-pub const UPLOADS_DIRNAME: &str = "uploads";
+// Underscore prefix marks it as a purpose-specific workspace subfolder (user
+// uploads / drag-drop), visible to the user and readable by the agent.
+pub const UPLOADS_DIRNAME: &str = "_uploads";
 
 /// Resolve a non-colliding destination path under `dir` for an upload
 /// whose client-supplied filename is `filename`. Strategy:
@@ -94,10 +96,40 @@ fn sanitize_filename(raw: &str) -> String {
     trimmed.to_string()
 }
 
-/// Ensure `<workspace>/uploads/` exists and return the absolute path.
+/// Ensure `<workspace>/_uploads/` exists and return the absolute path.
 /// Idempotent; safe to call before every upload.
 pub fn ensure_uploads_dir(workspace: &Path) -> std::io::Result<PathBuf> {
     let dir = workspace.join(UPLOADS_DIRNAME);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Ensure `<workspace>/<rel>/` exists and return the absolute path,
+/// rejecting any `rel` that would escape the workspace. Used by the
+/// upload endpoint's `?dir=` param so a shell can stage files into a
+/// specific subfolder (e.g. `raw/`) instead of the default `_uploads/`.
+/// `rel` must be a relative path with only normal components — no `..`,
+/// no leading `/`, no drive/root — anything else returns an error
+/// rather than writing outside the workspace.
+pub fn ensure_target_dir(workspace: &Path, rel: &str) -> std::io::Result<PathBuf> {
+    let rel = rel.trim().trim_matches('/');
+    if rel.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty target dir",
+        ));
+    }
+    let candidate = Path::new(rel);
+    let unsafe_component = candidate
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)));
+    if unsafe_component {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("unsafe upload dir: {rel}"),
+        ));
+    }
+    let dir = workspace.join(candidate);
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
@@ -108,13 +140,13 @@ pub fn ensure_uploads_dir(workspace: &Path) -> std::io::Result<PathBuf> {
 ///
 /// ```text
 /// [Uploaded 2 files via serve:
-///   - uploads/photo_3.jpg (image/jpeg, 1.2 MB)
-///   - uploads/notes.pdf (application/pdf, 240 KB)
+///   - _uploads/photo_3.jpg (image/jpeg, 1.2 MB)
+///   - _uploads/notes.pdf (application/pdf, 240 KB)
 /// ]
 /// ```
 ///
 /// `relative_paths` should already be expressed relative to the
-/// workspace root (e.g. `uploads/photo_3.jpg`) so the agent can
+/// workspace root (e.g. `_uploads/photo_3.jpg`) so the agent can
 /// pass them straight to `Read` / `PdfRead` / `XlsxRead` without
 /// translation.
 pub fn render_upload_message(origin: &str, files: &[UploadedFile]) -> String {
@@ -130,7 +162,7 @@ pub fn render_upload_message(origin: &str, files: &[UploadedFile]) -> String {
 /// The hint renders as an extra line in the bracketed block:
 /// ```text
 /// [Uploaded 1 file via line:
-///   - uploads/photo_3.jpg (image/jpeg, 1.2 MB)
+///   - _uploads/photo_3.jpg (image/jpeg, 1.2 MB)
 ///   Local classification: receipt, text-heavy, restaurant bill
 ///   Read the file and respond.]
 /// ```
@@ -211,6 +243,24 @@ fn format_bytes(n: u64) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn ensure_target_dir_accepts_safe_subdir_rejects_escape() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path();
+        // Safe relative subdir → created under the workspace.
+        let raw = ensure_target_dir(ws, "raw").unwrap();
+        assert_eq!(raw, ws.join("raw"));
+        assert!(raw.is_dir());
+        // Nested safe path also fine.
+        assert!(ensure_target_dir(ws, "a/b/c").unwrap().starts_with(ws));
+        // Leading slash trimmed, still safe.
+        assert_eq!(ensure_target_dir(ws, "/raw/").unwrap(), ws.join("raw"));
+        // Escapes + absolute + empty are rejected.
+        for bad in ["../escape", "raw/../../etc", "..", "  "] {
+            assert!(ensure_target_dir(ws, bad).is_err(), "should reject {bad:?}");
+        }
+    }
 
     #[test]
     fn unique_path_returns_original_when_free() {

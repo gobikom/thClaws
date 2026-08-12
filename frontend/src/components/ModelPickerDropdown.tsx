@@ -1,10 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { send, subscribe } from "../hooks/useIPC";
+import { FusionConfigModal } from "./FusionConfigModal";
 
 /// One model row from the backend's `all_models_list` response.
 type ModelRow = {
   id: string;
   context?: number | null;
+  /// `true` when `context` is the provider's blanket default rather than
+  /// a figure they published. Rendered as `200k?` — a floor shown as a
+  /// specification is what made a 1M model advertise 131k (#190).
+  context_unverified?: boolean | null;
 };
 
 /// One provider group as the backend ships it. `provider` is the
@@ -12,6 +17,9 @@ type ModelRow = {
 /// by id ascending.
 type Group = {
   provider: string;
+  /// "featured" | "additional" — the backend orders Featured groups first
+  /// and tags each with its tier so the picker can show section headers.
+  tier?: string;
   models: ModelRow[];
 };
 
@@ -40,7 +48,6 @@ function stripProviderPrefix(id: string, provider: string): string {
   // Special-cased shortcuts where the model prefix and provider name diverge.
   // Falls through to the general "strip any leading <prefix>/" otherwise.
   const aliases: Record<string, string> = {
-    "agentic-press": "ap",
     "ollama-anthropic": "oa",
     "openai-compat": "oai",
   };
@@ -62,6 +69,10 @@ export function ModelPickerDropdown({ current, onClose }: Props) {
   const [groups, setGroups] = useState<Group[]>([]);
   const [loading, setLoading] = useState(true);
   const [query, setQuery] = useState("");
+  // `openrouter/fusion+` opens a config modal instead of switching
+  // immediately — the model only takes effect once the panel/judge
+  // params are saved.
+  const [fusionOpen, setFusionOpen] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -110,7 +121,7 @@ export function ModelPickerDropdown({ current, onClose }: Props) {
     if (!q) return groups;
     return groups
       .map((g) => ({
-        provider: g.provider,
+        ...g,
         models: g.models.filter(
           (m) =>
             m.id.toLowerCase().includes(q) ||
@@ -126,9 +137,24 @@ export function ModelPickerDropdown({ current, onClose }: Props) {
   );
 
   const pick = (id: string) => {
+    if (id === "openrouter/fusion+") {
+      // Defer the switch: the modal saves the config and sends model_set
+      // itself on Save. Keep the dropdown mounted underneath.
+      setFusionOpen(true);
+      return;
+    }
     send({ type: "model_set", model: id });
     onClose();
   };
+
+  if (fusionOpen) {
+    return (
+      <FusionConfigModal
+        onApplied={onClose}
+        onCancel={() => setFusionOpen(false)}
+      />
+    );
+  }
 
   return (
     <div
@@ -187,8 +213,29 @@ export function ModelPickerDropdown({ current, onClose }: Props) {
             No models match "{query}".
           </div>
         ) : (
-          filtered.map((g) => (
+          filtered.map((g, i) => {
+            // Tier divider: shown once above the first group of each tier
+            // (Featured providers come first, then Additional).
+            const showTier = i === 0 || filtered[i - 1].tier !== g.tier;
+            const tierLabel =
+              g.tier === "featured"
+                ? "Featured"
+                : g.tier === "additional"
+                  ? "Additional"
+                  : null;
+            return (
             <div key={g.provider}>
+              {showTier && tierLabel && (
+                <div
+                  className="px-2 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-widest"
+                  style={{
+                    color: "var(--text-primary)",
+                    borderTop: i === 0 ? "none" : "1px solid var(--border)",
+                  }}
+                >
+                  {tierLabel}
+                </div>
+              )}
               <div
                 className="px-2 py-1 text-[10px] uppercase tracking-wider sticky top-0"
                 style={{
@@ -236,15 +283,22 @@ export function ModelPickerDropdown({ current, onClose }: Props) {
                           color: "var(--text-secondary)",
                           fontSize: "10px",
                         }}
+                        title={
+                          m.context_unverified
+                            ? `${ctx} is this provider's default, not a published figure — treat it as a lower bound.`
+                            : undefined
+                        }
                       >
                         {ctx}
+                        {m.context_unverified ? "?" : ""}
                       </span>
                     )}
                   </button>
                 );
               })}
             </div>
-          ))
+            );
+          })
         )}
       </div>
     </div>

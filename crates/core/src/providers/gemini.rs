@@ -277,7 +277,7 @@ impl GeminiProvider {
                     json!({
                         "name": t.name,
                         "description": t.description,
-                        "parameters": t.input_schema,
+                        "parameters": sanitize_schema_for_gemini(&t.input_schema),
                     })
                 })
                 .collect();
@@ -285,6 +285,90 @@ impl GeminiProvider {
         }
         body
     }
+}
+
+/// The Schema fields Gemini's `functionDeclarations` accepts (a strict
+/// OpenAPI-3.0 subset, per ai.google.dev). Anything else 400s the whole
+/// request — `Unknown name "<kw>" … Cannot find field` — and built-in +
+/// MCP tool schemas carry plenty (`$schema`, `additionalProperties`,
+/// `propertyNames`, refs, combinators, …). An allowlist is robust where a
+/// denylist whack-a-moles: an unknown keyword can at worst loosen the
+/// schema, never error.
+const GEMINI_ALLOWED_KEYS: &[&str] = &[
+    "type",
+    "format",
+    "title",
+    "description",
+    "nullable",
+    "default",
+    "enum",
+    "items",
+    "properties",
+    "required",
+    "propertyOrdering",
+    "minimum",
+    "maximum",
+    "minItems",
+    "maxItems",
+    "minLength",
+    "maxLength",
+    "minProperties",
+    "maxProperties",
+    "pattern",
+    "example",
+    "anyOf",
+];
+
+/// Make a JSON-Schema tool parameter object acceptable to Gemini's
+/// `functionDeclarations`, which otherwise 400s and breaks Gemini for
+/// tool-using sessions (the default). Keep only [`GEMINI_ALLOWED_KEYS`]
+/// (dropping unsupported JSON-Schema keywords), and drop any non-string
+/// `enum` (Gemini's `enum` is string-only — the epub/pdf tools'
+/// `enum:[0,1,2]` errored). Property `type` + `description` still guide the
+/// model and the tool receives native types. OpenAI / Anthropic keep the
+/// original schema (they accept it).
+fn sanitize_schema_for_gemini(v: &Value) -> Value {
+    let Value::Object(map) = v else {
+        return v.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (k, val) in map {
+        if !GEMINI_ALLOWED_KEYS.contains(&k.as_str()) {
+            continue;
+        }
+        let cleaned = match k.as_str() {
+            // `properties`: a map of property NAME → sub-schema. Keep the
+            // names (don't allowlist-filter them); sanitize each value.
+            "properties" => match val {
+                Value::Object(props) => Value::Object(
+                    props
+                        .iter()
+                        .map(|(name, sch)| (name.clone(), sanitize_schema_for_gemini(sch)))
+                        .collect(),
+                ),
+                _ => val.clone(),
+            },
+            // Single sub-schema.
+            "items" => sanitize_schema_for_gemini(val),
+            // Array of sub-schemas.
+            "anyOf" => match val {
+                Value::Array(arr) => {
+                    Value::Array(arr.iter().map(sanitize_schema_for_gemini).collect())
+                }
+                _ => val.clone(),
+            },
+            // Gemini's enum is string-only — drop if any value isn't a string.
+            "enum" => match val.as_array() {
+                Some(arr) if arr.iter().all(Value::is_string) => val.clone(),
+                _ => continue,
+            },
+            // Scalars / value arrays (type, description, required, default,
+            // min*/max*, …): keep verbatim.
+            _ => val.clone(),
+        };
+        out.insert(k.clone(), cleaned);
+    }
+    Value::Object(out)
 }
 
 #[async_trait]
@@ -341,9 +425,7 @@ impl Provider for GeminiProvider {
             req.model
         );
 
-        let resp = self
-            .client
-            .post(&url)
+        let resp = crate::multi_tenant::attach_member(self.client.post(&url))
             .header("x-goog-api-key", &self.api_key)
             .header("content-type", "application/json")
             .json(&body)
@@ -734,6 +816,45 @@ mod tests {
     use super::*;
     use crate::providers::{assemble, collect_turn};
     use crate::types::Message;
+
+    #[test]
+    fn sanitize_schema_drops_non_string_enum_keeps_string_enum() {
+        // Mirrors the epub/pdf tools: an integer enum 400s Gemini.
+        let schema = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "outline_depth": {
+                    "type": "integer",
+                    "enum": [0, 1, 2],
+                    "description": "0 = none, 1 = H1, 2 = H1+H2",
+                },
+                "font": { "type": "string", "enum": ["sans", "serif"] },
+                "tags": {
+                    "type": "array",
+                    "items": { "type": "object", "additionalProperties": false },
+                },
+            },
+        });
+        let out = sanitize_schema_for_gemini(&schema);
+        // Unsupported JSON-Schema keywords stripped (top-level + nested).
+        assert!(out.get("$schema").is_none());
+        assert!(out.get("additionalProperties").is_none());
+        assert!(out["properties"]["tags"]["items"]
+            .get("additionalProperties")
+            .is_none());
+        let props = &out["properties"];
+        // Non-string enum dropped; type + description preserved.
+        assert!(props["outline_depth"].get("enum").is_none());
+        assert_eq!(props["outline_depth"]["type"], "integer");
+        assert_eq!(
+            props["outline_depth"]["description"],
+            "0 = none, 1 = H1, 2 = H1+H2"
+        );
+        // All-string enum preserved.
+        assert_eq!(props["font"]["enum"], json!(["sans", "serif"]));
+    }
 
     fn parse_all(events: &[&str]) -> Vec<ProviderEvent> {
         let mut state = ParseState::default();

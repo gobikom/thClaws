@@ -72,7 +72,7 @@ impl ToolRegistry {
 }
 ```
 
-`with_builtins()` registers the 26 "built-in" tools (file + search + shell + web + ask + planning + 12 document tools). Task tools (TaskCreate/Update/Get/List) require shared state and are registered separately via `register_task_tools(&mut registry) -> SharedTaskStore`. Team tools register via `register_team_tools` (see team docs). MCP tools register at MCP-server-spawn time.
+`with_builtins()` registers the 26 "built-in" tools (file + search + shell + web + ask + planning + 12 document tools). Task tools (TaskCreate/Update/Get/List) require shared state and are registered separately via `register_task_tools(&mut registry) -> SharedTaskStore`. Team tools register via `register_team_tools` (see team docs). `Skill` / `SkillList` / `SkillSearch` register per-surface (need `SkillStore` access). `WorkflowRun` registers per-surface (needs the live `Provider` + `model` + Subagent `Tool` reference at construction — see §9b). MCP tools register at MCP-server-spawn time.
 
 `tool_defs()` is what gets sent to the provider — sorted by name for deterministic output (helps with prompt caching: the byte-stable ordering means the tools array doesn't change across turns until a tool registers/removes).
 
@@ -182,12 +182,14 @@ Search file contents for a regex pattern. Optional `glob` filter restricts to ma
 | Name | `Bash` |
 | Approval | always (`requires_approval` returns true unconditionally) |
 | Schema | `{command: string, cwd?: string, timeout?: integer, timeout_secs?: integer (legacy), description?: string}` |
-| Path validation | `Sandbox::check` for `cwd` |
+| Path validation | `Sandbox::check` for `cwd` (the command itself is **not** path-checked — see OS confinement below) |
 | Default timeout | 120000 ms (max 600000 ms) |
 
 Run a shell command via `/bin/sh -c`. Captures stdout + stderr, interleaves in the returned string. On timeout, kills the child and reports the timeout (partial output discarded).
 
-**Hard-coded denylists** (run AFTER approval, BEFORE exec):
+**OS-level confinement (dev-plan/49).** `run_shell_command` builds the `sh -c` invocation through `crate::confine::shell_command_async` rather than `util::shell_command_async` directly — one chokepoint, so subagent/workflow Bash is confined identically. When `bash.sandbox` (settings.json) is `workspace`/`strict` and a confiner is available, the command is wrapped in **macOS `sandbox-exec`** (Seatbelt profile: `deny file-write*` except workspace + `/tmp` + `/dev` char-devices + package-manager caches; `deny file-read*` on `~/.ssh`/`~/.aws`/secrets) or **Linux `bwrap`** (ro-bind `/`, re-bind the write-roots, tmpfs the deny-read paths). Default `off` = plain `sh -c` (unchanged). The write root is `Sandbox::root()` / `workdir::current_workdir()` (per-session in multi-tenant). This is the **hard** boundary under the soft `pre_tool_use` hook gate (dev-plan/48) — `Sandbox::check` only scopes the `cwd` *argument*, so `echo x > /abs` would otherwise escape.
+
+**Hard-coded denylists** (run AFTER approval, BEFORE exec) — a tripwire layer, not the boundary:
 - `lead_forbidden_command` — when running as team lead, blocks `git reset --hard`, `git clean -f/-d`, `git push --force`, `git rebase`, `git worktree remove/prune`, `git checkout -- / .`, `git restore --worktree / .`, `git merge --abort`, `rm -rf / -fr / -r`. Reason: lead is a coordinator; destructive ops belong to teammates inside their own worktrees.
 - `teammate_forbidden_command` — when running as a teammate, blocks `git reset --hard <other-branch-or-remote>`. `HEAD`, `HEAD~N`, `HEAD^`, `HEAD@{N}`, hex SHAs ≥7 chars, `tags/...` are allowed (legitimate same-branch recovery).
 - `is_destructive_command` — yellow `⚠` print but doesn't block (already approved). 80+ patterns for defense-in-depth: `rm -rf`, `sudo`, `kill -9`, `mkfs`, `dd if=`, `drop database`, `kubectl delete`, `terraform destroy`, `aws s3 rm`, `curl ... | sh`, etc.
@@ -257,7 +259,8 @@ Multi-backend web search with auto-detection. Backend priority:
 
 1. **Tavily** — `TAVILY_API_KEY`; clean JSON, includes a synthesized `answer` field
 2. **Brave Search** — `BRAVE_SEARCH_API_KEY`; clean JSON
-3. **DuckDuckGo HTML scrape** — no key required; fallback
+3. **SerpAPI** — `SERPAPI_API_KEY`; real Google results as JSON (key rides as the `api_key` query param; gateway route `/serpapi`)
+4. **DuckDuckGo HTML scrape** — no key required; fallback
 
 Constructed via `WebSearchTool::new("auto" | "tavily" | "brave" | "duckduckgo")`. With `"auto"` (default), tries each in priority order. Explicit engine name forces that backend; `"duckduckgo"` skips the keyed backends entirely.
 
@@ -434,6 +437,16 @@ Primary motivation: `/dream`'s Pass 5 calls `KmsCreate({name: "dreams", scope: "
 
 All KMS tools rely on `kms::resolve(name)` (project KMS list first, then user). They're now always-registered regardless of `kms_active` contents.
 
+### KmsDelete
+
+| | |
+|---|---|
+| Name | `KmsDelete` |
+| Approval | **yes** (destructive — removes a page) |
+| Schema | `{kms: string, page: string}` |
+
+Delete a page from a KMS via `kms::delete_page` (path-safety through the shared `writable_page_path`, prunes the index bullet, writes a deleted-log entry). Added alongside `/dream` (see [`dream.md`](dream.md)). This is the sixth KMS tool referenced by the section intro.
+
 ### MemoryRead / MemoryWrite / MemoryAppend (M6.26)
 
 Three tools register **always** (not conditional on entry presence — the agent needs them to create the first entry). See [`memory.md`](memory.md) for the full subsystem (resolution, frontmatter, system-prompt injection, slash commands, sandbox carve-out).
@@ -503,6 +516,136 @@ Same intentional sandbox carve-out as KMS / Memory writes — `.thclaws/` is res
 
 ---
 
+## 9b. Orchestration: WorkflowRun
+
+| | |
+|---|---|
+| Name | `WorkflowRun` |
+| Approval | **yes** — every call prompts (same posture as `Bash`; runs LLM-authored JavaScript) |
+| Schema | `{prompt?: string, script_path?: string, args?: any}` — `prompt` = NL goal for the author; `script_path` = run a pre-authored `.js` verbatim (no authoring); `args` = structured input exposed to the script as the global `args` (dev-plan/47) |
+| Source | `crates/core/src/tools/workflow_run.rs` |
+| Returns | Script's final-expression value as a string, plus a one-line token rollup `[workflow: N subagent turn(s), X in / Y out tokens]` |
+
+Model-callable wrapper around the same `crate::workflow::script::author` + `crate::workflow::WorkflowSandbox::run` flow the user-typed `/workflow run` slash command takes. The model decides when fan-out is the right primitive instead of the user typing the slash command. Both paths share one engine — no duplicate authoring logic.
+
+Internally:
+
+1. **Nested-call guard** — `crate::workflow::is_inside_workflow()` checks the `WORKFLOW_USAGE_SINK` thread-local. If set (we're inside a running sandbox), bail with "WorkflowRun cannot be invoked from inside a running workflow…" before authoring so we don't burn tokens on an unrunnable script.
+2. **Author phase** — `workflow::script::author(provider, model, prompt, None)` makes ONE provider stream call with `WORKFLOW_AUTHOR` as the system prompt and the user goal as the only message. Returns the JS script body (markdown fences stripped).
+3. **Execute phase** — `tokio::task::spawn_blocking` opens a worker thread; inside:
+   - `workflow::set_task_tool(Some(subagent_arc))` — installs the Subagent (`Task`) tool the sandbox's `thclaws.subagent(...)` host binding dispatches through.
+   - `workflow::set_usage_sink(true)` — enables per-turn usage capture.
+   - `WorkflowSandbox::new()` + `sandbox.run(&script)` — Boa runs the script.
+   - `workflow::take_all_usages()` drains; `set_task_tool(None)` + `set_usage_sink(false)` unwind the thread-locals.
+4. **Result** — script's final-expression string + token rollup.
+
+**Captured state at registration:** `Arc<dyn Provider>`, `model: String`, `Option<Arc<dyn Tool>>` (the live Subagent tool). The provider+model snapshot means a `/model` swap mid-session leaves WorkflowRun pinned to the swap-time provider until the surface re-registers (REPL: on `/reload`, GUI: on rebuild_agent path). The Subagent reference may be `None` on surfaces that don't register Subagent (print mode, `agent_runtime` HTTP) — non-subagent scripts still work; scripts calling `thclaws.subagent(...)` fail with the runtime's own "Task tool not available" error.
+
+**Surface availability matrix:**
+
+| Surface | Registered? | Subagent threaded? |
+|---|---|---|
+| CLI REPL (`thclaws --cli`) | yes | yes |
+| GUI / `--serve` (worker) | yes | yes |
+| Print mode (`thclaws -p`) | yes | no |
+| `agent_runtime` HTTP (`/v1`) | yes | no |
+
+**dev-plan/47 runtime additions** (`crates/core/src/workflow/runtime.rs`):
+- **`args` global** — `WorkflowRun({script_path, args})` injects `args` via `WorkflowSandbox::set_args` (a writable global, defaults to `null`). Lets a pre-authored workflow take typed input instead of a `.thclaws/TASK.md` side-channel.
+- **`thclaws.log(msg)`** — registered alongside `subagent`/`include`; emits a stdout narrator line (+ a GUI chat indicator under `feature="gui"`). The blessed observability channel since `console` is stripped.
+- **Schema-from-def** — when `thclaws.subagent({agent})` omits `schema`, the runtime calls `Tool::subagent_output_schema(agent)` (overridden by `SubAgentTool` to read `AgentDef::output_schema`) and validates against it. One source of truth instead of duplicating the schema per call.
+- **Loud surface guard** — when no `Task` tool is wired (`Subagent threaded = no` above) **and** `is_inside_workflow()`, `thclaws.subagent` returns a hard error (not the old silent `(stub for: …)`), so a `-p` / `/v1` run fails clearly instead of role-playing the subagent.
+- **Per-subagent `writePaths`** — `AgentDef::write_paths` globs wrap the file-write tools (`PathScopedWriteTool` in `subagent.rs`) so a worker can't write outside its lane (file-write tools only, not `Bash`).
+
+**dev-plan/48 runtime additions** (`crates/core/src/workflow/runtime.rs`):
+- **`thclaws.parallel([spec, …])`** (48.1) — the genuine fan-out primitive: builds one future per spec and runs them via `futures::join_all` under a `Semaphore(min(16, cores-2))` on the workflow's tokio handle, returning results in input order (throws on first worker failure). Plain `Promise.all` over `subagent` stays serial (that host fn `block_on`s per call). **Caps isolation:** each future is `WORKER_CAPS_TASK.scope(...)`'d (a `tokio::task_local!`); `check_kms_write_capability` prefers the task-local over the thread-local, so concurrent workers' KMS-write grants can't bleed. The parallel path skips the per-worker token-budget soft-cap + replay-cache `subagent` applies (total usage still metered).
+- **`thclaws.pollUntil(checkFn, opts)`** (48.5) — bounded (`opts.timeout`) + Stop-token-aware submit→poll→done loop; calls `checkFn()` every `opts.interval` until `opts.until(result)` is truthy. `checkFn` is synchronous from the host's view (may call `subagent`), so the loop only `block_on`s the inter-poll sleep.
+
+**Tests** in `crates/core/src/tools/workflow_run.rs::tests`:
+- `workflow_run_executes_authored_script_and_returns_result` — stub provider returns `"'hi'"`, tool runs end-to-end through `spawn_blocking` + Boa, returns `"hi"` + token rollup. Pins the pipeline composes from the tool layer, not just from the slash-command handler.
+- `nested_workflow_run_is_rejected_via_thread_local` — sets `WORKFLOW_USAGE_SINK` by hand, calls tool, expects "inside a running workflow" error.
+
+**Cancellation** — the workflow runtime's polling boundary observes the standard cancellation token set by the calling worker (`shell_dispatch.rs:3733` for GUI / `repl.rs:9080` for CLI slash-command path). The tool inherits whichever surface invoked it; no extra plumbing here.
+
+**Why a tool and not just the slash command** — pre-fix users wanted the model to reach for the workflow primitive on its own when a task looked like deterministic fan-out, without needing to remember `/workflow run`. The slash command stays as the interactive-review path for novel patterns; the tool path skips review for speed. Both go through the same author + sandbox flow so changes to the engine don't drift.
+
+---
+
+## 9d. Media generation tools (dev-plan/40)
+
+Five tools — `TextToImage`, `ImageToImage`, `TextToVideo`, `ImageToVideo`, `MediaJobStatus` (`src/tools/image_gen.rs`, `src/tools/video_gen.rs`) — sit on a provider abstraction in `src/media/`:
+
+- **`provider.rs`** — `ImageProvider` / `VideoProvider` traits, `ImageRequest` / `VideoRequest` (the latter carries `resolution` + `duration_seconds` + optional `init_image`), `JobState` (`Running { pct } | Done { bytes } | Failed { msg }`), `ProviderJobRef`, and `resolve_endpoint(native_key_vars, native_base, gateway_segment)` (native key env-var cascade + gateway overlay).
+- **`registry.rs`** — `all()` (image: `gemini`, `openai`, `qwen`), `video_all()` (video: `veo`, `dashscope_video`), `resolve()` / `resolve_video()` map a `(provider, model)` pair to an impl. Each provider's `resolve_model()` accepts ids + aliases.
+- **`providers/{gemini,openai,qwen,veo,dashscope_video}.rs`** — one file per backend.
+- **`job.rs`** — append-only JSONL job store at `.thclaws/media-jobs.jsonl` (latest line per id wins). Video is intrinsically async: the `*Video` tools `submit()` and return a `job_id`; `MediaJobStatus` reloads the ref and `poll()`s the provider, downloading the clip on `Done`.
+- **`mod.rs`** — `save_image` → `output/img-<ts>-<sha8>.<ext>`, `save_video` → `output/vid-<ts>-<sha8>.mp4`, plus `sniff_ext` / `sniff_video_ext` content sniffers. `save_under_output` anchors that `output/` at the **active sandbox root**, so in a multiuser `--serve` pod each user's media lands under their own `workspace-<id>/output/` (per-user isolation, dev-plan/42), not a shared process-cwd dir; the returned path stays workspace-relative.
+
+| Tool | Approval | Backends (model → key) |
+|---|---|---|
+| `TextToImage` / `ImageToImage` | prompt | Gemini `gemini-3.1-{flash,pro}-image` (`GEMINI_API_KEY`/`GOOGLE_API_KEY`), OpenAI `gpt-image-2` (`OPENAI_API_KEY`), Qwen `qwen-image-2.0[-pro]` (`DASHSCOPE_API_KEY`) |
+| `TextToVideo` / `ImageToVideo` | prompt | Veo `veo-3.1-{fast,,lite}-generate-preview` (Google key; `durationSeconds` clamped 4–8), DashScope `happyhorse-1.0-{t2v,i2v}` (`DASHSCOPE_API_KEY`; `720P`/`1080P`) |
+| `MediaJobStatus` | auto | reads `.thclaws/media-jobs.jsonl`, polls the owning provider |
+
+`ImageToVideo` sends the local first-frame image inline as a base64 data URI (DashScope `input.media[].first_frame`; Veo equivalent) — no upload round-trip.
+
+**Pricing** rides two catalogue fields beyond per-mtok: `price_per_image_usd` and `price_per_video_second_usd` (see [`model-catalogue.md`](model-catalogue.md)).
+
+**Gating** — all five are registered only when `AppConfig::image_tools_enabled` is true (`settings.json` `mediaToolsEnabled`, legacy alias `imageToolsEnabled`). The exception is the built-in **Media Studio** gui-shell: `ipc.rs::gui_shell_tool_invoke` force-enables the media tools when `shell_id == "media-studio"` regardless of the flag (`let media_enabled = shell_id == "media-studio" || AppConfig::load()…image_tools_enabled`), so the shell is a zero-config on-ramp while the agent surface stays opt-in. Registration happens at the agent/shared-session/shell sites listed in `shared_session.rs` (6 sites, each guarded by the flag).
+
+---
+
+## 9e. Video review — WatchVideo
+
+| | |
+|---|---|
+| Name | `WatchVideo` (`src/tools/watch_video.rs`) |
+| Approval | **yes** (the Whisper transcript is a paid, gateway-metered call) |
+| Schema | `{path, scene?, fps_floor?, max_frames?, dedup?, lang?}` |
+
+Lets a vision model actually *watch* a local video: extracts scene-aware,
+deduplicated key frames (capped/downscaled) and returns them as inline
+images via `call_multimodal`, plus an optional Whisper transcript when
+`GROQ_API_KEY` is set. Registered unconditionally (not media-gated).
+Frame extraction is local + free; only the transcript costs. Used by the
+Movie Maker agent to review/critique a generated clip and drive re-rolls.
+
+## 9f. Content localizer — FetchImages
+
+| | |
+|---|---|
+| Name | `FetchImages` (`src/tools/fetch_images.rs`) |
+| Approval | **yes** · gated behind the `content-extractor` subagent |
+| Schema | `{markdown_path, base_url?, timeout_secs?, max_mb?}` |
+
+Downloads every remote image referenced by a markdown file into a sibling
+`images/` dir and rewrites the links in place. The `markdown_path` is
+`Sandbox::check_write`-confined (rejects absolute / `..` / cross-tenant
+paths) — important because in multiuser mode approval is auto-granted.
+
+## 9g. FilmScript / Movie Maker tools
+
+Five tools — `FilmCompile`, `FilmGenerate`, `FilmJobStatus`, `FilmJobCancel`,
+`FilmAssetImport` (`src/tools/filmscript.rs`) — turn a `.film` screenplay
+into a finished AI video. All are **gated behind the `filmscript` tool-gate**
+(dormant + invisible until the Movie Maker agent's skill or the Film Studio
+gui-shell opens the gate). `FilmGenerate` (`requires_approval`) is gated by a
+**required `budgetUsd`** — the real spend consent — and `FilmAssetImport`
+(`requires_approval`) writes up to 30 MB into `.thclaws/film/assets/`;
+`FilmCompile`/`FilmJobStatus`/`FilmJobCancel` are read-only/pure. Full
+subsystem — the DSL, two-phase compiler, cost model, backends, harness — is
+in [`filmscript.md`](filmscript.md).
+
+## 9h. Document publishing — EpubCreate, QuizRender
+
+`EpubCreate` (`src/tools/epub_create.rs`, `requires_approval`) compiles
+Markdown → EPUB, joining the Docx/Xlsx/Pptx/Pdf document family (see
+[`document-tools.md`](document-tools.md)). `QuizRender`
+(`src/tools/quiz_render.rs`, no approval) renders an interactive quiz
+artifact.
+
+---
+
 ## 10. Code organization
 
 ```
@@ -523,7 +666,7 @@ crates/core/src/tools/
 │                                                          completion auto-restore (covered in
 │                                                          permissions.md §7-8)
 ├── read.rs (411 LOC)                                   ── Read (text + image multimodal)
-├── search.rs (238 LOC)                                 ── WebSearch (Tavily/Brave/DDG)
+├── search.rs (238 LOC)                                 ── WebSearch (Tavily/Brave/SerpAPI/DDG)
 ├── tasks.rs (299 LOC)                                  ── TaskCreate/Update/Get/List + SharedTaskStore
 ├── todo.rs (382 LOC)                                   ── TodoWrite (markdown checklist)
 ├── web.rs (91 LOC)                                     ── WebFetch

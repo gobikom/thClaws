@@ -1,8 +1,8 @@
 # OpenAI Chat Completions provider
 
-`OpenAIProvider` (`providers/openai.rs`, 1429 LOC) speaks the OpenAI Chat Completions SSE format. It's the workhorse: **9 of 17 `ProviderKind` variants** route to this single impl with different URL/auth/prefix-strip configurations. The provider was deliberately built with a configuration knob design (`with_base_url` + `with_strip_model_prefix` + `with_api_key_header` + `with_list_models_url`) so adding a new OpenAI-compat aggregator is a `match` arm in `build_provider` rather than a new file.
+`OpenAIProvider` (`providers/openai.rs`, 1429 LOC) speaks the OpenAI Chat Completions SSE format. It's the workhorse: **16 of the 25 `ProviderKind` variants** route to this single impl with different URL/auth/prefix-strip configurations. The provider was deliberately built with a configuration knob design (`with_base_url` + `with_strip_model_prefix` + `with_api_key_header` + `with_list_models_url`) so adding a new OpenAI-compat aggregator is a `match` arm in `build_provider` rather than a new file.
 
-The 9 variants: `OpenAI` (api.openai.com), `OpenRouter`, `AgenticPress`, `DashScope`, `ZAi`, `LMStudio`, `OpenAICompat`, `DeepSeek`, `ThaiLLM`.
+The 16 variants: `OpenAI` (api.openai.com), `OpenRouter`, `TokenRouter`, `DashScope`, `QwenCloud`, `ZAi`, `LMStudio`, `OpenAICompat`, `DeepSeek`, `ThaiLLM`, `Nvidia`, `Minimax`, `Moonshot`, `XAi`, `Groq`, `OpenCodeGo`.
 
 **Source:** `crates/core/src/providers/openai.rs`
 **Constants:**
@@ -89,9 +89,12 @@ pub struct OpenAIProvider {
     client: Client,
     api_key: String,
     base_url: String,                       // defaults to DEFAULT_API_URL
-    strip_model_prefix: Option<String>,     // e.g. "openrouter/" / "ap/" / "zai/"
+    strip_model_prefix: Option<String>,     // e.g. "openrouter/" / "moonshot/" / "zai/"
     api_key_header: Option<String>,         // None → "authorization" with "Bearer {key}"
     list_models_url: Option<String>,        // override for non-derived /models path
+    model_override: Option<String>,         // replace req.model before wire (openrouter/fusion+ → outer; §7)
+    injected_tools: Vec<Value>,             // appended to tools[] (e.g. openrouter:fusion)
+    tool_choice: Option<Value>,             // body tool_choice override (e.g. "required")
 }
 
 impl OpenAIProvider {
@@ -100,6 +103,9 @@ impl OpenAIProvider {
     pub fn with_strip_model_prefix(mut self, prefix: impl Into<String>) -> Self;
     pub fn with_api_key_header(mut self, name: impl Into<String>) -> Self;
     pub fn with_list_models_url(mut self, url: impl Into<String>) -> Self;
+    pub fn with_model_override(mut self, model: impl Into<String>) -> Self;  // §7 fusion+
+    pub fn with_injected_tool(mut self, tool: Value) -> Self;                // §7 fusion+
+    pub fn with_tool_choice(mut self, choice: Value) -> Self;                // §7 fusion+
 }
 ```
 
@@ -130,9 +136,8 @@ if let Some(prefix) = &self.strip_model_prefix {
 }
 ```
 
-Mutates `req.model` before serializing. Configured per-variant:
+Mutates `req.model` before serializing. As of v0.61.0 the actual call is `strip_wire_prefix(&req.model, …)`, which guards the OpenRouter vendor collision (`openrouter/fusion` / `openrouter/auto` keep their id — see §7). Configured per-variant:
 - `OpenRouter` → `openrouter/`
-- `AgenticPress` → `ap/`
 - `ZAi` → `zai/`
 - `LMStudio` → `lmstudio/`
 - `OpenAICompat` → `oai/`
@@ -156,7 +161,7 @@ Mutates `req.model` before serializing. Configured per-variant:
 
 - `max_completion_tokens` (the newer name) is sent — older o-series models accept both `max_tokens` and `max_completion_tokens`; gpt-5+ series requires the new name.
 - `stream_options.include_usage: true` requests the trailing usage frame.
-- `tools` is omitted when empty.
+- `tools` is omitted when empty. `build_body` is an **instance method**: it appends any `self.injected_tools` (e.g. the `openrouter:fusion` tool — see §7 `openrouter/fusion+`) after the agent's function tools, and sets `tool_choice` from `self.tool_choice` when present.
 
 ### Message conversion (`messages_to_openai`)
 
@@ -223,8 +228,9 @@ produces:
 
 ```rust
 async fn stream(&self, mut req: StreamRequest) -> Result<EventStream> {
-    if let Some(prefix) = &self.strip_model_prefix { /* mutate req.model */ }
-    let body = Self::build_body(&req);
+    if let Some(m) = &self.model_override { req.model = m.clone(); }            // fusion+ → outer model
+    req.model = strip_wire_prefix(&req.model, self.strip_model_prefix.as_deref());  // vendor-collision-safe (§7)
+    let body = self.build_body(&req);   // instance method (appends injected_tools + tool_choice)
     let resp = self.client.post(&self.base_url)
         .header(self.auth_header_name(), self.auth_header_value())
         .header("content-type", "application/json")
@@ -276,7 +282,7 @@ async fn list_models(&self) -> Result<Vec<ModelInfo>> {
 
 URL transform: replaces `/chat/completions` with `/models`. Override via `with_list_models_url` for backends where this doesn't work.
 
-**Prefix re-application:** when a `strip_model_prefix` is configured, the listing prepends it back so users can paste IDs straight into `/model`. E.g. AgenticPress's `/v1/models` returns `gemma4-12b`; the listing surfaces `ap/gemma4-12b` so `/model ap/gemma4-12b` round-trips through `detect()` correctly.
+**Prefix re-application:** when a `strip_model_prefix` is configured, the listing prepends it back so users can paste IDs straight into `/model`. E.g. Moonshot`s `/v1/models` returns `kimi-k2.6`; the listing surfaces `moonshot/kimi-k2.6` so `/model moonshot/kimi-k2.6` round-trips through `detect()` correctly.
 
 ---
 
@@ -328,15 +334,40 @@ OpenAIProvider::new(api_key)
 
 Models look like `openrouter/anthropic/claude-sonnet-4-6`. Strip yields `anthropic/claude-sonnet-4-6` which OpenRouter routes to upstream.
 
-### `AgenticPress`
+**Vendor-prefix collision (`strip_wire_prefix`).** OpenRouter's own router models — `openrouter/fusion`, `openrouter/auto` — have vendor `openrouter`, which collides with the `openrouter/` routing prefix. Naively stripping sent the vendor-less `fusion` upstream → `404 No endpoints found that support tool use`. `strip_wire_prefix(model, prefix)` keeps the id intact when stripping `openrouter/` would leave a **bare single segment** (a real OpenRouter id is always `vendor/model`, i.e. contains a `/`). Other providers' prefixes strip to a bare id by design and are unaffected.
 
 ```rust
-OpenAIProvider::new(api_key)
-    .with_base_url("https://llm.artech.cloud/v1/chat/completions")
-    .with_strip_model_prefix("ap/")
+fn strip_wire_prefix(model: &str, strip_prefix: Option<&str>) -> String {
+    let Some(prefix) = strip_prefix else { return model.to_string(); };
+    match model.strip_prefix(prefix) {
+        Some(rest) if prefix == "openrouter/" && !rest.contains('/') => model.to_string(),
+        Some(rest) => rest.to_string(),
+        None => model.to_string(),
+    }
+}
 ```
 
-Hosted gateway; URL is fixed (no env override). Models look like `ap/gemma4-12b`.
+### `openrouter/fusion+` — configurable Fusion (v0.61.0+)
+
+`openrouter/fusion+` is a **thClaws pseudo-model**, not a real OpenRouter id. The bare `openrouter/fusion` uses OpenRouter's default deliberation panel; `fusion+` exposes the panel/judge/limit parameters via the `openrouter:fusion` tool. It's wired with three `OpenAIProvider` builders set in `build_provider`'s OpenRouter arm when `config.model == config::FUSION_PLUS_MODEL`:
+
+```rust
+let mut provider = OpenAIProvider::new(key)
+    .with_base_url(base).with_strip_model_prefix("openrouter/");
+if config.model == crate::config::FUSION_PLUS_MODEL {
+    let f = &config.openrouter_fusion;                 // FusionConfig
+    provider = provider
+        .with_model_override(f.outer_model.clone())    // wire model = outer, NOT "fusion+"
+        .with_injected_tool(f.tool_json());            // {type:"openrouter:fusion", parameters:{…}}
+    if let Some(tc) = f.tool_choice_value() { provider = provider.with_tool_choice(tc); }
+}
+```
+
+- **`model_override`** — `stream()` replaces `req.model` with the configured outer model *before* `strip_wire_prefix` runs (so `openrouter/openai/gpt-4.1` → `openai/gpt-4.1`). The user-facing model id stays `openrouter/fusion+`.
+- **`injected_tools`** — appended to the request `tools` array after the agent's own function tools (so Fusion coexists with Bash/Edit/etc. under `tool_choice: auto`). `FusionConfig::tool_json()` emits `{"type":"openrouter:fusion","parameters":{…snake_case…}}`, omitting any unset field so empty config ⇒ OpenRouter defaults.
+- **`tool_choice`** — `FusionConfig::tool_choice_value()` returns `Some(json!("required"))` only for the `required` setting; `auto` is OpenRouter's default and is omitted.
+
+`FusionConfig` (`config.rs`, `settings.json` key `openrouterFusion`, camelCase fields: `outerModel`, `analysisModels[1–8]`, `judgeModel`, `maxToolCalls`, `maxCompletionTokens`, `temperature`, `reasoning`, `toolChoice`) lives on both `AppConfig` (always present, defaulted) and `ProjectConfig` (optional overlay). IPC round-trips it via `fusion_config_get` / `fusion_config_set` (`ipc.rs`), which the GUI's fusion config modal opens when the user picks `openrouter/fusion+`. The catalogue entry is pinned in `refresh-model-catalogue.py` (`PROVIDERS["openrouter"]["pin"]`) so auto-prune doesn't delete the pseudo-id (it has no upstream `/v1/models` row).
 
 ### `DashScope`
 

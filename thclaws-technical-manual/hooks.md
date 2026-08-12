@@ -99,6 +99,13 @@ All fields optional. `null` / missing / empty string → event not registered (`
 
 `AppConfig::load` merges three sources (later wins): compiled defaults → `~/.config/thclaws/settings.json` (user) → `.thclaws/settings.json` (project).
 
+> **History (issue #180):** before v0.88.0 this merge silently dropped the
+> `hooks` key — `ProjectConfig` (the struct BOTH settings files deserialize
+> through) had no `hooks` field, so `AppConfig.hooks` stayed `default()` and
+> no hook ever fired, in any mode, despite the loop being fully wired. Fixed
+> by adding the field + `apply_to` mapping; a regression test
+> (`hooks_in_settings_json_reach_app_config`) pins it.
+
 For nested struct fields (HooksConfig), serde performs **field-by-field replacement on the whole struct** — i.e. project's `"hooks"` block fully overrides user's. Setting `"hooks": {}` in a project file disables ALL hooks even if the user has them configured. Field-level merge is NOT supported today (TEAM-IF-WIRED-14 deferred).
 
 ### Hook command shell

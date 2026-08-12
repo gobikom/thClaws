@@ -89,6 +89,15 @@ pub struct GoalState {
     /// still deserialize cleanly on /load.
     #[serde(default)]
     pub auto_continue: bool,
+    /// Engine-level completion gate: file paths (relative to cwd) that
+    /// MUST exist on disk before `MarkGoalComplete` is accepted. Empty =
+    /// no artifact requirement (prompt-level "done" only). Set via
+    /// `/goal start ... --require <path>` (repeatable). Turns the agent's
+    /// prompt convention into a hard, unfakeable gate: a missing artifact
+    /// keeps the goal Active so the `--auto` loop keeps working (bounded
+    /// by the hard cap). `#[serde(default)]` for older sessions.
+    #[serde(default)]
+    pub require_paths: Vec<String>,
 }
 
 impl GoalState {
@@ -110,7 +119,24 @@ impl GoalState {
             last_message: None,
             completed_at: None,
             auto_continue,
+            require_paths: Vec::new(),
         }
+    }
+
+    /// Attach engine-enforced completion artifacts (see `require_paths`).
+    pub fn with_require_paths(mut self, paths: Vec<String>) -> Self {
+        self.require_paths = paths;
+        self
+    }
+
+    /// Required artifacts that are not present on disk (relative to cwd).
+    /// Empty when every requirement is met (or none were declared).
+    pub fn missing_required_paths(&self) -> Vec<String> {
+        self.require_paths
+            .iter()
+            .filter(|p| !std::path::Path::new(p).exists())
+            .cloned()
+            .collect()
     }
 
     /// Wall-clock seconds since goal started.
@@ -123,7 +149,47 @@ impl GoalState {
         self.budget_tokens
             .map(|b| b.saturating_sub(self.tokens_used))
     }
+
+    /// Gap 1 — hard backstop against a runaway `/goal continue` loop.
+    ///
+    /// The soft `GOAL_BUDGET_LIMIT` prompt fires at 1.0× the token budget but
+    /// only *asks* the model to wrap up — a stubborn model can keep calling
+    /// `RecordGoalProgress` forever, and with NO budget set the soft prompt
+    /// never fires at all. This is the deterministic kill switch: returns
+    /// `Some(reason)` when the loop MUST stop regardless of the model —
+    /// either a token/time budget overrun past a 1.5× grace margin, or the
+    /// absolute iteration cap (the only backstop when no budget is set).
+    pub fn hard_limit_reached(&self) -> Option<String> {
+        if self.iterations_done >= HARD_MAX_ITERATIONS {
+            return Some(format!(
+                "iteration cap reached ({HARD_MAX_ITERATIONS} /goal continue firings)"
+            ));
+        }
+        // tokens_used >= budget × 1.5, integer-safe (×2 vs ×3).
+        if let Some(budget) = self.budget_tokens {
+            if self.tokens_used.saturating_mul(2) >= budget.saturating_mul(3) {
+                return Some(format!(
+                    "token budget overrun ({} used ≥ 1.5× {budget} budget)",
+                    self.tokens_used
+                ));
+            }
+        }
+        if let Some(budget) = self.budget_time_secs {
+            let used = self.time_used_secs();
+            if used.saturating_mul(2) >= budget.saturating_mul(3) {
+                return Some(format!(
+                    "time budget overrun ({used}s used ≥ 1.5× {budget}s budget)"
+                ));
+            }
+        }
+        None
+    }
 }
+
+/// Absolute backstop on `/goal continue` firings — caps unbounded cost when
+/// no budget is set (or the model ignores the budget soft-stop). Generous:
+/// a real deep audit converges well under this; it only catches runaways.
+pub const HARD_MAX_ITERATIONS: u64 = 100;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -297,6 +363,25 @@ mod tests {
     }
 
     #[test]
+    fn missing_required_paths_reports_absent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("here.txt");
+        std::fs::write(&present, b"x").unwrap();
+        let absent = dir.path().join("nope.txt");
+
+        let g = GoalState::new("x".into(), None, None, false).with_require_paths(vec![
+            present.to_string_lossy().into_owned(),
+            absent.to_string_lossy().into_owned(),
+        ]);
+        let missing = g.missing_required_paths();
+        assert_eq!(missing, vec![absent.to_string_lossy().into_owned()]);
+
+        // No requirements declared → nothing missing → completable.
+        let g2 = GoalState::new("y".into(), None, None, false);
+        assert!(g2.missing_required_paths().is_empty());
+    }
+
+    #[test]
     fn set_and_get_round_trip() {
         let _g = lock();
         reset();
@@ -366,6 +451,44 @@ mod tests {
         let mut g = GoalState::new("x".into(), Some(1_000), None, false);
         g.tokens_used = 1_500;
         assert_eq!(g.tokens_remaining(), Some(0));
+    }
+
+    #[test]
+    fn hard_limit_none_when_under_caps() {
+        let g = GoalState::new("x".into(), None, None, false);
+        assert!(g.hard_limit_reached().is_none());
+    }
+
+    #[test]
+    fn hard_limit_iteration_cap() {
+        let mut g = GoalState::new("x".into(), None, None, false);
+        g.iterations_done = HARD_MAX_ITERATIONS;
+        assert!(g.hard_limit_reached().is_some());
+    }
+
+    #[test]
+    fn hard_limit_token_overrun_is_1_5x_not_1x() {
+        let mut g = GoalState::new("x".into(), Some(1_000), None, false);
+        // At 1.0× the budget the *soft* GOAL_BUDGET_LIMIT prompt nudges; the
+        // hard kill switch must NOT fire yet.
+        g.tokens_used = 1_000;
+        assert!(
+            g.hard_limit_reached().is_none(),
+            "1.0× budget must not hard-stop"
+        );
+        // 1.5× → hard stop.
+        g.tokens_used = 1_500;
+        assert!(
+            g.hard_limit_reached().is_some(),
+            "1.5× budget must hard-stop"
+        );
+    }
+
+    #[test]
+    fn hard_limit_time_overrun() {
+        let mut g = GoalState::new("x".into(), None, Some(10), false);
+        g.started_at = 0; // epoch start → time_used ≈ now ≫ 1.5×10s
+        assert!(g.hard_limit_reached().is_some());
     }
 
     #[test]

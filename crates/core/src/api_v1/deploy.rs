@@ -1,9 +1,10 @@
 //! `POST /v1/deploy*` — agent-bundle deploy (dev-plan/28).
 //!
-//! Lets a laptop ship `.thclaws/` (skills, MCP, plugins, KMS, AGENTS.md,
-//! settings.json, …) to a running pod and have the pod's next agent
-//! turn pick up the new state. Sessions / memory / team-runtime live on
-//! the pod side and are preserved across deploys.
+//! Lets a laptop ship `.thclaws/` (skills, MCP, plugins, data/,
+//! agent_workflow/, AGENTS.md, settings.json, …) to a running pod and
+//! have the pod's next agent turn pick up the new state. All runtime
+//! state lives under `.thclaws/state/` on the pod side (sessions, team,
+//! kms, usage, workflow run-state) and is preserved across deploys.
 //!
 //! Three endpoints:
 //!
@@ -12,7 +13,7 @@
 //!   diff tar instead of the whole bundle.
 //! - `POST /v1/deploy/files` — accepts a streaming tar (any subset of
 //!   the workspace `.thclaws/`), extracts to a scratch dir, atomically
-//!   swaps into the live `.thclaws/`, preserves sessions/team/memory.
+//!   swaps into the live `.thclaws/`, preserves state/ and memory/.
 //!   Phase-1 clients hit this directly with a full bundle; Phase-2
 //!   clients call /manifest first and ship only `missing`.
 //! - `POST /v1/deploy` — alias for `/v1/deploy/files` for orchestrators
@@ -50,7 +51,8 @@ const ALLOWED_TOP_LEVEL: &[&str] = &[
     "plugins.json",
     "prompt",
     "rules",
-    "kms",
+    "data",
+    "agent_workflow",
 ];
 
 /// Tar-path prefix marking entries that land at the workspace root
@@ -70,7 +72,7 @@ const PROJECT_ROOT_ALLOWED: &[&str] = &["AGENTS.md", "CLAUDE.md"];
 /// extract phase skips them. (Defense in depth — the client should
 /// already be filtering them out per dev-plan/28's "what gets uploaded
 /// vs skipped" table.)
-const PRESERVE_ON_POD: &[&str] = &["sessions", "team", "memory", ".env"];
+const PRESERVE_ON_POD: &[&str] = &["state", "memory", ".env"];
 
 /// Maximum tar size we'll accept on `/v1/deploy/files`. 100 MB matches
 /// the plan's quota guard.
@@ -591,11 +593,15 @@ mod tests {
         assert!(is_safe_rel_path("skills/foo/SKILL.md"));
         assert!(is_safe_rel_path("settings.json"));
         assert!(is_safe_rel_path("__root__/AGENTS.md"));
+        assert!(is_safe_rel_path("data/kb.md"));
+        assert!(is_safe_rel_path("agent_workflow/run.js"));
         assert!(!is_safe_rel_path("../etc/passwd"));
         assert!(!is_safe_rel_path("/etc/passwd"));
         assert!(!is_safe_rel_path("skills/../etc"));
-        assert!(!is_safe_rel_path("sessions/leaked.jsonl"));
-        assert!(!is_safe_rel_path("team/workdir"));
+        // Workspace v2: all runtime state is preserved on the pod under
+        // state/, so an upload must never overwrite it.
+        assert!(!is_safe_rel_path("state/sessions/leaked.jsonl"));
+        assert!(!is_safe_rel_path("state/team/workdir"));
         assert!(!is_safe_rel_path("memory/private.md"));
         assert!(!is_safe_rel_path(".env"));
         assert!(!is_safe_rel_path(""));

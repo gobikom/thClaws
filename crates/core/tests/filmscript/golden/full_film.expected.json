@@ -1,0 +1,172 @@
+{
+  "assembly_plan": {
+    "music": [
+      {
+        "duck_on_dialogue": true,
+        "from_shot": "0",
+        "handle": "เพลงเศร้า",
+        "path": "./sad_theme.mp3",
+        "to_shot": "2",
+        "volume": 0.5
+      }
+    ],
+    "order": [
+      "0",
+      "1",
+      "2"
+    ],
+    "sfx": [],
+    "subtitle_burn": false,
+    "subtitles": [
+      {
+        "shot_id": "1",
+        "speaker": "แอน",
+        "text": "คุณหายไปไหนมาตั้งแต่เช้า"
+      },
+      {
+        "shot_id": "2",
+        "speaker": "โทนี่",
+        "text": "ไปทำงาน"
+      }
+    ],
+    "transitions": [
+      {
+        "after_shot": "2",
+        "sec": 1.0,
+        "transition": "to_black"
+      }
+    ]
+  },
+  "asset_requests": [
+    {
+      "id": "file-e1bdae4223cc362c",
+      "kind": "file",
+      "media_type": "image",
+      "path": "./room.png"
+    },
+    {
+      "id": "file-d7cf899e4fa9ed23",
+      "kind": "file",
+      "media_type": "image",
+      "path": "./anny.png"
+    },
+    {
+      "id": "file-de7bfb9101983368",
+      "kind": "file",
+      "media_type": "image",
+      "path": "./tony.png"
+    },
+    {
+      "id": "file-35a85ab27d0e0c3b",
+      "kind": "file",
+      "media_type": "image",
+      "path": "./room_window.png"
+    },
+    {
+      "id": "file-b46ce6461d47f6d8",
+      "kind": "file",
+      "media_type": "image",
+      "path": "./table.png"
+    },
+    {
+      "id": "file-e7994f70f9c22970",
+      "kind": "file",
+      "media_type": "image",
+      "path": "./room_wall.png"
+    },
+    {
+      "constraints": {
+        "max_bytes": 52428800,
+        "max_duration_s": 15,
+        "max_fps": 60,
+        "max_total_pixels": 927408,
+        "min_fps": 24,
+        "min_total_pixels": 409600
+      },
+      "id": "video-078ed2f1206fcd2d",
+      "kind": "video",
+      "source_shot": "1"
+    }
+  ],
+  "cost": {
+    "per_shot": [
+      {
+        "billed_seconds": 4,
+        "note": "fresh: duration × no-video rate",
+        "shot_id": "0",
+        "usd": 0.82
+      },
+      {
+        "billed_seconds": 6,
+        "note": "fresh: duration × no-video rate",
+        "shot_id": "1",
+        "usd": 1.23
+      },
+      {
+        "billed_seconds": 12,
+        "note": "continuation: (6s ref + 6s new) × with-video rate",
+        "shot_id": "2",
+        "usd": 1.5
+      }
+    ],
+    "total_usd": 3.55
+  },
+  "payloads": [
+    {
+      "backend": "grok",
+      "payload": {
+        "input": {
+          "aspect_ratio": "16:9",
+          "duration": 4,
+          "image_urls": [
+            "mock://file-e1bdae4223cc362c"
+          ],
+          "nsfw_checker": false,
+          "prompt": "ห้องนั่งเล่นยามเช้า แสงลอดผ่านหน้าต่าง. Inside ห้อง @Image1. slow push-in, wide. Natural daylight. naturalistic Thai drama, warm muted palette. No text overlays.",
+          "resolution": "720p"
+        },
+        "model": "grok-imagine/image-to-video"
+      },
+      "shot_id": "0"
+    },
+    {
+      "backend": "grok",
+      "payload": {
+        "input": {
+          "aspect_ratio": "16:9",
+          "duration": 6,
+          "image_urls": [
+            "mock://file-d7cf899e4fa9ed23",
+            "mock://file-de7bfb9101983368",
+            "mock://file-35a85ab27d0e0c3b",
+            "mock://file-b46ce6461d47f6d8"
+          ],
+          "nsfw_checker": false,
+          "prompt": "หญิงสาวผมยาว @Image1 นั่งที่ โต๊ะ @Image4 ฉากหลังเป็นหน้าต่าง, ชายหนุ่มไว้เครา @Image2 นั่งตรงข้าม ฉากหลังเป็นกำแพง. Inside ห้อง @Image3. two-shot, static. Natural daylight. naturalistic Thai drama, warm muted palette. หญิงสาวผมยาว @Image1 says in Thai exactly: \"คุณหายไปไหนมาตั้งแต่เช้า\", speaking this line verbatim and no other words, lips moving clearly, locked framing, minimal head movement. No other people, no text overlays, no extra or invented dialogue.",
+          "resolution": "720p"
+        },
+        "model": "grok-imagine/image-to-video"
+      },
+      "shot_id": "1"
+    },
+    {
+      "backend": "grok",
+      "depends_on": "1",
+      "payload": {
+        "input": {
+          "aspect_ratio": "16:9",
+          "duration": 6,
+          "image_urls": [
+            "mock://file-de7bfb9101983368",
+            "mock://file-e7994f70f9c22970"
+          ],
+          "nsfw_checker": false,
+          "prompt": "close-up ชายหนุ่มไว้เครา @Image1. Inside ห้อง @Image2. Expression: หงุดหงิด. static. Natural daylight. naturalistic Thai drama, warm muted palette. ชายหนุ่มไว้เครา @Image1 says in Thai exactly: \"ไปทำงาน\", speaking this line verbatim and no other words, lips moving clearly, locked framing, minimal head movement. แล้วลุกจากโต๊ะเดินออกจากเฟรม. No other people, no text overlays, no extra or invented dialogue.",
+          "resolution": "720p"
+        },
+        "model": "grok-imagine/image-to-video"
+      },
+      "shot_id": "2"
+    }
+  ]
+}

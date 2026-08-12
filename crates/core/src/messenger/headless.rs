@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use crate::bridge::BridgeConfig;
 use async_trait::async_trait;
 use futures::StreamExt;
 
@@ -111,6 +112,7 @@ pub async fn run(config: AppConfig) -> Result<()> {
     tools.register(Arc::new(crate::tools::KmsReadTool));
     tools.register(Arc::new(crate::tools::KmsSearchTool));
     tools.register(Arc::new(crate::tools::KmsWriteTool));
+    tools.register(Arc::new(crate::tools::KmsWriteSourceTool));
     tools.register(Arc::new(crate::tools::KmsAppendTool));
     tools.register(Arc::new(crate::tools::KmsDeleteTool));
     tools.register(Arc::new(crate::tools::KmsCreateTool));

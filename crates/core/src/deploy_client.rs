@@ -11,9 +11,10 @@
 //!
 //! - Top-level entries shipped: settings.json, mcp.json, AGENTS.md,
 //!   agents/, skills/, commands/, plugins/, plugins.json, prompt/,
-//!   rules/, kms/. memory/ added when --include-memory.
-//! - Never shipped: sessions/, team/, .env (server would refuse
-//!   anyway — defense in depth on both sides).
+//!   rules/, data/, agent_workflow/. memory/ added when --include-memory.
+//! - Never shipped: state/ (all runtime — sessions, team, kms, usage,
+//!   workflow run-state, …), .env (server would refuse anyway — defense
+//!   in depth on both sides).
 //! - mcp.json with stdio entries refused unless --allow-stdio-mcp
 //!   (paths/binaries reference the laptop, won't resolve on the pod).
 
@@ -52,10 +53,11 @@ const ALLOWED_TOP_LEVEL: &[&str] = &[
     "plugins.json",
     "prompt",
     "rules",
-    "kms",
+    "data",
+    "agent_workflow",
 ];
 
-const NEVER_SHIP: &[&str] = &["sessions", "team", ".env"];
+const NEVER_SHIP: &[&str] = &["state", ".env"];
 
 /// Whether a logged line is informational or an error — used by the
 /// sink to route stdout vs stderr / regular vs error styling.

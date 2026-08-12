@@ -44,7 +44,7 @@ thClaws มาพร้อม built-in tools ประมาณสามสิ�
 | Tool | การอนุมัติ | สรุป |
 |---|---|---|
 | `WebFetch` | prompt | HTTP GET (จำกัด body 100 KB ต่อ section) ถ้ามี `HAL_API_KEY` → ยิงทั้ง HAL headless-browser scrape **และ** plain HTTP GET พร้อมกัน return เป็น response เดียวที่มี 2 section แยกป้าย (ดูด้านล่าง) |
-| `WebSearch` | prompt | ค้นเว็บผ่าน Tavily / Brave / DuckDuckGo |
+| `WebSearch` | prompt | ค้นเว็บผ่าน Tavily / Brave / SerpAPI (Google) / DuckDuckGo |
 | `WebScrape` | prompt | HAL scrape ตรงๆ พร้อม parameter ขั้นสูง (`wait_for` CSS selector, `scroll_to_bottom`, `remove_selectors`, `output_format`) — จะปรากฏเฉพาะเมื่อมี `HAL_API_KEY` |
 | `YouTubeTranscript` | prompt | ดึง transcript ของวิดีโอ YouTube ผ่าน HAL (รองรับหลายภาษา + timestamps) — จะปรากฏเฉพาะเมื่อมี `HAL_API_KEY` |
 
@@ -138,6 +138,69 @@ thClaws redistribute ได้ภายใต้ MIT/Apache ฟอนต์ Noto
   style, formula, chart และ conditional formatting ในส่วนที่ไม่เกี่ยวข้อง
   จะอยู่ครบหลังจากโหลด+แก้+เซฟ เซลล์ใช้ที่อยู่แบบ A1 (`B7`, `AA12`)
 
+## สื่อ — สร้างภาพและวิดีโอ
+
+เครื่องมือสร้างและแก้ไขภาพ/วิดีโอแบบ provider-abstracted หนึ่ง tool ต่อ
+หนึ่งงาน เลือก backend ด้วยอาร์กิวเมนต์ `provider` + `model` **ปิดอยู่โดย
+ค่าเริ่มต้น** — ดู "เปิดใช้ media tools" ด้านล่าง ภาพถูกเขียนไปที่
+`output/img-<ts>-<hash>.<ext>` ส่วนวิดีโอรันเป็น async job แล้วไปอยู่ที่
+`output/vid-<ts>-<hash>.mp4` เมื่อเสร็จ
+
+| Tool | การอนุมัติ | สรุป |
+|---|---|---|
+| `TextToImage` | prompt | prompt → ภาพ |
+| `ImageToImage` | prompt | ภาพต้นทาง + prompt → ภาพที่แก้แล้ว |
+| `TextToVideo` | prompt | prompt → วิดีโอ (async job) |
+| `ImageToVideo` | prompt | ภาพต้นทางเป็นเฟรมแรก + prompt → วิดีโอ (async job) |
+| `MediaJobStatus` | auto | poll งาน async ด้วย `job_id` → `running` / `done` (path) / `failed` |
+
+**โมเดลและ key** (เลือกด้วยอาร์กิวเมนต์ `model`):
+
+| Provider | โมเดลภาพ | โมเดลวิดีโอ | Key |
+|---|---|---|---|
+| Google Gemini | `gemini-3.1-flash-image`, `gemini-3.1-pro-image` | `veo-3.1-fast-generate-preview`, `veo-3.1-generate-preview`, `veo-3.1-lite-generate-preview` | `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
+| OpenAI | `gpt-image-2` | — | `OPENAI_API_KEY` |
+| Alibaba DashScope | `qwen-image-2.0`, `qwen-image-2.0-pro` | `happyhorse-1.0-t2v` (text→video), `happyhorse-1.0-i2v` (image→video) | `DASHSCOPE_API_KEY` |
+
+- **วิดีโอเป็นแบบ asynchronous** `TextToVideo` / `ImageToVideo` จะ submit
+  งานแล้วคืน `job_id` ทันที — ไฟล์ยังไม่พร้อม เรียก
+  `MediaJobStatus { job_id }` เพื่อ poll: `running`, `done` (พร้อม path
+  `output/…mp4`) หรือ `failed` (พร้อม error ของ provider) สถานะงานถูก
+  บันทึกที่ `.thclaws/media-jobs.jsonl` การ poll จึงรอดแม้รีสตาร์ท
+- **คลิป Veo ยาว 4–8 วินาที** Veo และ HappyHorse รับ `resolution` เป็น
+  `720P` หรือ `1080P`
+- **`ImageToVideo`** ใช้ภาพในเครื่องเป็นเฟรมแรก ส่งแบบ inline (base64
+  data URI) — ไม่มีขั้นตอน upload แยก
+
+### เปิดใช้ media tools
+
+media tools มีค่าใช้จ่ายต่อภาพ / ต่อวินาทีวิดีโอ จึง **ปิดอยู่โดยค่า
+เริ่มต้น** เปิดใน `settings.json`:
+
+```jsonc
+// ./.thclaws/settings.json
+{ "mediaToolsEnabled": true }   // alias เดิม: "imageToolsEnabled"
+```
+
+GUI shell **Media Studio** ที่มีมาให้ (บทที่ 26) จะเปิด media tools ให้
+อัตโนมัติสำหรับ session ของมันเองโดยไม่สนใจ flag นี้ — เป็นทางเข้าแบบ
+คลิก ๆ ไม่ต้องตั้งค่า สำหรับคนที่ไม่ได้สั่ง agent ผ่านแชต
+
+## รีวิววิดีโอ & สร้างหนัง
+
+| Tool | การอนุมัติ | ทำอะไร |
+|---|---|---|
+| `WatchVideo` | prompt | ให้ model **ดู** วิดีโอในเครื่อง: ดึง key frame แบบรู้ฉาก (เพื่อให้มัน *เห็น* ว่าเกิดอะไรขึ้น) + transcript จาก Whisper เมื่อมี `GROQ_API_KEY` ใช้รีวิว/วิจารณ์คลิป |
+| `FilmCompile` / `FilmGenerate` / `FilmJobStatus` / `FilmJobCancel` / `FilmAssetImport` | `FilmGenerate` + `FilmAssetImport` = prompt | ชุดเครื่องมือ **Movie Maker** — เปลี่ยนบท `.film` เป็นวิดีโอ AI ที่เสร็จสมบูรณ์ ซ่อนอยู่จนกว่าจะติดตั้ง agent Movie Maker (ซึ่งเปิด gate `filmscript`) `FilmGenerate` ต้องมี `budgetUsd` — เป็นทั้งเพดานเงินและการยินยอม ดูบทที่ 29 |
+
+## Tool อื่น ๆ
+
+- **`FetchImages`** — ดาวน์โหลดรูปจากเน็ตทุกรูปที่อ้างในไฟล์ Markdown ลง
+  โฟลเดอร์ `images/` ข้าง ๆ แล้วแก้ลิงก์ให้ (ใช้โดย agent content-extractor)
+  จำกัดอยู่ใน workspace ของคุณ
+- **`EpubCreate`** — Markdown → e-book EPUB (เข้ากับชุด document tool
+  Word/Excel/PowerPoint/PDF ด้านบน)
+
 ## ปฏิสัมพันธ์กับผู้ใช้
 
 | Tool | การอนุมัติ | สรุป |
@@ -166,9 +229,33 @@ agent มักเลือกใช้ระหว่าง turn ที่ต�
 | Tool | การอนุมัติ | สรุป |
 |---|---|---|
 | `Task` | prompt | สร้าง sub-agent สำหรับปัญหาย่อยที่แยกเป็นเอกเทศ |
+| `WorkflowRun` | prompt | author + รัน workflow (JavaScript) ที่กระจายงานไปยัง subagent หลายตัว |
 
 sub-agent มี tool registry ของตัวเอง และ recurse ได้ลึกสุด 3 ระดับ
-รายละเอียดอยู่ใน [บทที่ 15](ch15-subagents.md)
+([บทที่ 15](ch15-subagents.md)) ส่วน `WorkflowRun` คือทางเข้า workflow
+แบบที่ model สั่งเอง ([บทที่ 25](ch25-workflows.md))
+
+## Memory
+
+| Tool | การอนุมัติ | สรุป |
+|---|---|---|
+| `MemoryRead` | auto | อ่าน entry จาก persistent file-based memory |
+| `MemoryWrite` | prompt | สร้าง/แทนที่ memory entry (frontmatter + body) |
+| `MemoryAppend` | prompt | ต่อท้าย memory entry ที่มีอยู่ |
+
+หน่วยความจำข้ามเซสชัน เก็บว่าคุณเป็นใครและชอบทำงานแบบไหน —
+ดู [บทที่ 8](ch08-memory-and-agents-md.md)
+
+## Goals (โหมด `/goal` อัตโนมัติ)
+
+| Tool | การอนุมัติ | สรุป |
+|---|---|---|
+| `RecordGoalProgress` | auto | บันทึกความคืบหน้าหนึ่งขั้นของ goal ที่ทำอยู่ |
+| `MarkGoalComplete` | auto | ประกาศว่า goal เสร็จ — จบลูปอัตโนมัติ |
+| `MarkGoalBlocked` | auto | ทำเครื่องหมายว่า goal ติด (ต้องให้ผู้ใช้ช่วย) |
+
+register เฉพาะตอนมี `/goal` รันอยู่ — ลูปใช้ tool พวกนี้รายงานความคืบหน้า
+และตัดสินใจว่าจะหยุดเมื่อไร
 
 ## ฐานความรู้ (KMS)
 
@@ -195,6 +282,39 @@ tool ของ MCP server ทุกตัวจะถูกค้นพบตอ
 ที่มี server นำหน้า เช่น `weather__get_forecast`,
 `github__list_issues` เป็นต้น ทุกตัวจะ prompt ขออนุมัติก่อนรัน
 รายละเอียดอยู่ใน [บทที่ 14](ch14-mcp.md)
+
+## Tool ที่มี gate — GUI Shell
+
+tool บางตัว **register ไว้แต่ซ่อน** จนกว่า skill จะเปิด *gate* ของมัน
+ตอนปิดอยู่ **กิน token = 0** (model ไม่เห็นชื่อ tool เลย) แล้วโผล่มาเฉพาะ
+ตอนต้องใช้จริง tool สำหรับสร้าง GUI Shell (custom HTML frontend,
+[บทที่ 26](ch26-gui-shells.md)) ทำงานแบบนี้:
+
+| Tool | การอนุมัติ | สรุป |
+|---|---|---|
+| `GuiShellCreate` | prompt | สร้าง GUI Shell ใหม่ (manifest + entry HTML) ที่ `.thclaws/gui-shell/<id>/` |
+| `GuiShellWriteFile` | prompt | เขียน/แทนที่ไฟล์ใน GUI Shell — path-jail อยู่ใน dir ของตัวเอง |
+| `GuiShellList` | auto | ลิสต์ GUI Shell ที่ติดตั้งไว้ |
+| `GuiShellRemove` | prompt | ลบ GUI Shell |
+
+### gate เปิดยังไง
+
+1. **แต่ละ gated tool ประกาศ gate ของตัวเอง** — `Tool::requires_gate()`
+   คืน `Some("gui-shell")` ทำให้ **per-turn tool filter ซ่อนมันไว้**
+   (กลไกเดียวกับ `requires_env` ของ service-key tool) → `GuiShell*` ทั้ง 4
+   ตัวมองไม่เห็นโดย model และไม่เพิ่มอะไรใน system prompt
+2. **มี skill เป็นเจ้าของ gate** — skill **`gui-shell`** ที่ ship มาประกาศ
+   `tool-gate: gui-shell` ใน frontmatter ([บทที่ 12](ch12-skills.md))
+3. **เรียก skill = เปิด gate** — skill นี้ trigger เมื่อขอ "สร้าง UI /
+   dashboard / custom frontend …" พอ model เรียก `SkillTool::call` จะรัน
+   `activate_gate("gui-shell")`
+4. **มีผลรอบถัดไป** — gate เป็น **process-global + session-sticky** เปิด
+   แล้วอยู่ยาวทั้ง session per-turn filter เช็ค gate ใหม่ในรอบถัดไป →
+   `GuiShell*` โผล่มาเรียกได้ **โดยไม่ต้อง rebuild agent/registry**
+
+→ model จะใช้ GUI-Shell tool ลอยๆ ไม่ได้ ต้องผ่าน skill ก่อน ซึ่งเป็น
+ตัวที่ทำให้ tool โผล่มา กลไก gated-tool-group นี้ reuse ได้ — tool group
+ในอนาคตก็ surface แบบนี้ได้ (skill เปิด gate → group โผล่)
 
 ## อ่าน tool stream
 

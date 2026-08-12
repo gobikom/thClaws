@@ -1,6 +1,6 @@
 # Chapter 6 — Providers, models & API keys
 
-thClaws talks to **twenty-two providers**, auto-detected from the model name.
+thClaws talks to **twenty-five providers**, auto-detected from the model name.
 Switch any time with `/model`, `/provider`, or by clicking the provider/model
 chip in the sidebar (Desktop GUI, v0.7.2+).
 
@@ -8,7 +8,10 @@ chip in the sidebar (Desktop GUI, v0.7.2+).
 
 | Provider | Model prefix | Auth env var | Notes |
 |---|---|---|---|
-| Agentic Press | `ap/*` | `AGENTIC_PRESS_LLM_API_KEY` | OpenAI-compatible gateway; many backends under one key |
+| Moonshot | `moonshot/*` | `MOONSHOT_API_KEY` | Moonshot AI (Kimi); `moonshot/kimi-k2.6` default |
+| xAI | `xai/*` | `XAI_API_KEY` | xAI Grok; `xai/grok-4.3` default |
+| Groq | `groq/*` | `GROQ_API_KEY` | Groq LPU (very fast); `groq/llama-3.3-70b-versatile` default |
+| TokenRouter | `tokenrouter/*` | `TOKENROUTER_API_KEY` | Unified router to 300+ models (`tokenrouter/<vendor>/<model>`) |
 | Anthropic | `claude-*` | `ANTHROPIC_API_KEY` | Extended thinking, prompt caching (system + tools) |
 | Anthropic Agent SDK | `agent/*` | — (uses Claude Code's own auth) | Drives the `claude` CLI under your Claude Pro / Max subscription instead of API billing. v0.9.6 added an in-process MCP bridge so the model gets thClaws's tool registry (KMS, Memory, MCP-contributed, Bash, Edit, …) in addition to Claude Code's built-ins — no need to switch to `claude-*` for tool parity. Task / Team / Skill / Plan / AskUserQuestion are intentionally not bridged. |
 | OpenAI | `gpt-*`, `o1-*`, `o3*`, `o4-*` | `OPENAI_API_KEY` | Chat Completions; automatic prompt caching |
@@ -21,11 +24,11 @@ chip in the sidebar (Desktop GUI, v0.7.2+).
 | Ollama | `ollama/*` | — (local) | NDJSON streaming; no auth |
 | Ollama Anthropic | `oa/*` | — (local, v0.14+) | Ollama's Anthropic-compatible `/v1/messages` endpoint |
 | DashScope | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` | Alibaba Qwen mainland endpoint (`dashscope.aliyuncs.com`); automatic caching |
-| QwenCloud | `qc/*` | `DASHSCOPE_API_KEY` (+ `QWENCLOUD_BASE_URL`) | Alibaba DashScope **Singapore** region (`dashscope-intl.aliyuncs.com`). Same Qwen catalogue as DashScope but lower latency from outside mainland China. `qc/` prefix stripped on the wire so the upstream sees the bare `qwen-*` id. Added in v0.9.0 |
+| QwenCloud | `qc/*` | `QWENCLOUD_API_KEY` (+ `QWENCLOUD_BASE_URL`) | Alibaba DashScope **Singapore** region (`dashscope-intl.aliyuncs.com`). Same Qwen catalogue as DashScope but lower latency from outside mainland China. `qc/` prefix stripped on the wire so the upstream sees the bare `qwen-*` id. Added in v0.9.0 |
 | DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` (+ `DEEPSEEK_BASE_URL`) | V4 line: `deepseek-v4-flash`, `deepseek-v4-pro`. Older aliases `deepseek-chat` / `deepseek-reasoner` still work as wire-level aliases |
 | ThaiLLM (NSTDA) | `thaillm/*` | `THAILLM_API_KEY` | Aggregator at `thaillm.or.th` for four 8B Thai-tuned models (OpenThaiGPT, Typhoon-S, Pathumma, THaLLE). Aliases (case-insensitive): `openthaigpt`, `typhoon`, `pathumma`, `thalle` |
-| Z.ai | `zai/*` | `ZAI_API_KEY` (+ `ZAI_BASE_URL`) | GLM Coding Plan endpoint at `api.z.ai`. Default `zai/glm-4.6`; latest `zai/glm-5.1` (202K context) added in v0.8.5. Override `ZAI_BASE_URL` for the general BigModel SKU at `open.bigmodel.cn` |
-| MiniMax | `minimax/*` | `MINIMAX_API_KEY` (+ `MINIMAX_BASE_URL`) | International endpoint at `api.minimax.io`. Models: `minimax/MiniMax-M2` (200K/131K — flagship, default), `minimax/MiniMax-M1` (1M context), `minimax/abab7-chat-preview`. China-platform users on `api.minimax.chat` need to override `MINIMAX_BASE_URL` (different auth scheme — YMMV). Added in v0.8.5 |
+| Z.ai | `zai/*` | `ZAI_API_KEY` (+ `ZAI_BASE_URL`) | GLM Coding Plan endpoint at `api.z.ai`. Default `zai/glm-5.2`. Override `ZAI_BASE_URL` for the general BigModel SKU at `open.bigmodel.cn` |
+| MiniMax | `minimax/*` | `MINIMAX_API_KEY` (+ `MINIMAX_BASE_URL`) | International endpoint at `api.minimax.io`. Models: `minimax/MiniMax-M3` (flagship, default), `minimax/MiniMax-M1` (1M context), `minimax/abab7-chat-preview`. China-platform users on `api.minimax.chat` need to override `MINIMAX_BASE_URL` (different auth scheme — YMMV). Added in v0.8.5 |
 | Ollama Cloud | `ollama-cloud/*` | `OLLAMA_CLOUD_API_KEY` | Hosted Ollama catalog (Kimi, GPT-OSS, DeepSeek, Llama, etc.). OpenAI-compatible at `ollama.com/v1` |
 | NVIDIA NIM | `nvidia/*` | `NVIDIA_API_KEY` (+ `NVIDIA_BASE_URL`) | NVIDIA hosted inference at `integrate.api.nvidia.com/v1`. Catalog spans Nemotron, Llama, DeepSeek, GLM and more — the `nvidia/` prefix routes everything; the outer prefix is stripped on the wire. Override the env var for on-prem NIM deployments |
 | LMStudio | `lmstudio/*` | — (local) | LMStudio's local OpenAI-compatible server at `localhost:1234/v1`. No auth. Models follow whatever's loaded in the LMStudio app |
@@ -38,7 +41,6 @@ The default on first run is `claude-sonnet-4-6`; change it with
 
 ```
 ❯ /providers
-    agentic-press → ap/gemma4-12b
   * anthropic     → claude-sonnet-4-6
     anthropic-agent → agent/claude-sonnet-4-6
     openrouter    → openrouter/anthropic/claude-sonnet-4-6
@@ -63,7 +65,7 @@ conversation is saved, a new one starts with the new provider.
 | `sonnet` | `claude-sonnet-4-6` |
 | `opus`   | `claude-opus-4-6` |
 | `haiku`  | `claude-haiku-4-5` |
-| `flash`  | `gemini-2.0-flash` |
+| `flash`  | `gemini-2.5-flash` |
 
 ```
 ❯ /model sonnet
@@ -82,8 +84,8 @@ A typo like `/model gemma4-9999` leaves the current model in place and
 prints `unknown model '…' — try /models`.
 
 `/models` lists the server's reported catalogue for the current
-provider. For Ollama and Agentic Press, IDs come back prefixed (e.g.
-`ollama/llama3.2`, `ap/gemma4-26b`) so you can paste them straight
+provider. For prefixed providers (Ollama, Moonshot, Groq, …), IDs come
+back prefixed (e.g. `ollama/llama3.2`, `moonshot/kimi-k2.6`) so you can paste them straight
 into `/model`.
 
 ## Reasoning / "thinking" models
@@ -258,7 +260,6 @@ ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 OPENROUTER_API_KEY=sk-or-v1-...
 GEMINI_API_KEY=AI...
-AGENTIC_PRESS_LLM_API_KEY=llm_v1_...
 DASHSCOPE_API_KEY=sk-...
 OLLAMA_BASE_URL=http://localhost:11434   # defaults to this anyway
 OPENAI_COMPAT_BASE_URL=http://localhost:8000/v1   # any OAI-compat gateway
@@ -291,20 +292,6 @@ OPENAI_COMPAT_API_KEY=...
 
 No API key. For a remote Ollama server, set `OLLAMA_BASE_URL`
 (Settings modal or env var).
-
-## Using Agentic Press (hosted multi-model)
-
-Agentic Press is a gateway that serves several backends (Gemma 3, GPT
-4o-mini, Claude Sonnet, Llama 4, Qwen 3) under one API key. Great for
-trying different models without signing up everywhere.
-
-1. Get a key from your Agentic Press dashboard.
-2. Paste it into Settings → API Keys (Agentic Press) — or set
-   `AGENTIC_PRESS_LLM_API_KEY`.
-3. `/model ap/gemma4-26b` (or any listed model).
-
-The `ap/` prefix routes requests through the gateway. `/models` lists
-everything the gateway currently serves.
 
 ## Using OpenRouter (300+ models via one key)
 
@@ -371,6 +358,42 @@ on-disk catalogue stores them bare, because
 prefix and `/model <id>` would error "unknown model provider".
 Anything you copy from `/models` straight into `/model <id>` will
 route correctly.
+
+### Fusion Router — multi-model deliberation (v0.61.0+)
+
+OpenRouter's **Fusion** router is one model id that, behind the scenes,
+fans your question out to a **panel** of up to 8 models in parallel
+(each can search / fetch the web), then a **judge** model compares all
+the answers — where they agree (consensus), where they conflict, what's
+missing, unique angles, blind spots — and synthesizes the final reply.
+In short: "many heads + a referee," packaged as a single model.
+
+Two ways to use it in thClaws:
+
+- **`openrouter/fusion`** — the default panel (Claude Opus + GPT +
+  Gemini), zero configuration. Just `/model openrouter/fusion`.
+- **`openrouter/fusion+`** — the **configurable** variant. Selecting it
+  in the model picker opens a config panel where you tune the
+  deliberation:
+
+  | Field | Meaning |
+  |---|---|
+  | **Analysis models** | The panel — 1–8 OpenRouter model ids (e.g. `anthropic/claude-opus-4.8`). Leave empty to use Fusion's default panel. |
+  | **Judge model** | Synthesizes the final answer. Blank = same as the outer model. |
+  | **Outer model** | The orchestrator call thClaws makes (a thClaws id, e.g. `openrouter/openai/gpt-4.1`); also the default judge. |
+  | **Max tool calls** | Web-search/fetch steps each panel/judge model may take (1–16, default 8). |
+  | **Max output tokens** | Per inner panel/judge call. |
+  | **Temperature** | Forwarded to panel + judge (0–2). |
+  | **Reasoning effort** | Forwarded to panel + judge. |
+  | **Tool choice** | `auto` (Fusion fires when useful and coexists with the agent's own tools) or `required` (always deliberate). |
+
+  Your choices persist to `.thclaws/settings.json` under
+  `openrouterFusion`, so they also apply when you run thClaws headless or
+  with `--serve` — not just in the GUI.
+
+Fusion is billed by the panel + judge it runs, so a single turn costs
+more than a single-model call. It's the practical stand-in when a model
+you'd otherwise reach for isn't available on the platform.
 
 ## Using a generic OpenAI-compatible endpoint (`oai/*`)
 

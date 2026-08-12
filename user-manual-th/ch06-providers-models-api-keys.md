@@ -1,6 +1,6 @@
 # บทที่ 6 — provider, model และ API key
 
-thClaws คุยกับ **provider ได้ทั้งหมดสิบสามราย** โดยตรวจจับให้อัตโนมัติ
+thClaws คุยกับ **provider ได้ทั้งหมดยี่สิบห้าราย** โดยตรวจจับให้อัตโนมัติ
 จากชื่อ model และสลับได้ตลอดเวลาด้วย `/model`, `/provider` หรือ
 คลิกที่แถบ provider/model ใน sidebar (Desktop GUI, v0.7.2+)
 
@@ -8,7 +8,10 @@ thClaws คุยกับ **provider ได้ทั้งหมดสิบส
 
 | Provider | Model prefix | Auth env var | หมายเหตุ |
 |---|---|---|---|
-| Agentic Press | `ap/*` | `AGENTIC_PRESS_LLM_API_KEY` | gateway แบบ OpenAI-compatible; หลาย backend ภายใต้ key เดียว |
+| Moonshot | `moonshot/*` | `MOONSHOT_API_KEY` | Moonshot AI (Kimi); ค่า default `moonshot/kimi-k2.6` |
+| xAI | `xai/*` | `XAI_API_KEY` | xAI Grok; ค่า default `xai/grok-4.3` |
+| Groq | `groq/*` | `GROQ_API_KEY` | Groq LPU (เร็วมาก); `groq/llama-3.3-70b-versatile` |
+| TokenRouter | `tokenrouter/*` | `TOKENROUTER_API_KEY` | Router รวมเข้าถึง 300+ model (`tokenrouter/<vendor>/<model>`) |
 | Anthropic | `claude-*` | `ANTHROPIC_API_KEY` | extended thinking, prompt caching (system + tools) |
 | Anthropic Agent SDK | `agent/*` | — (ใช้ auth ของ Claude Code เอง) | ขับ `claude` CLI ผ่าน subscription Claude Pro / Max แทนการคิดเงินแบบ API ⚠ tool registry ของ thClaws ไม่ข้าม subprocess boundary — model เห็นเฉพาะ toolset ของ Claude Code เท่านั้น tool ของ KMS / MCP / Agent Teams เข้าถึงไม่ได้จาก provider นี้ ต้องสลับไป `claude-*` หากต้องการใช้ |
 | OpenAI | `gpt-*`, `o1-*`, `o3*`, `o4-*` | `OPENAI_API_KEY` | Chat Completions; prompt caching อัตโนมัติ |
@@ -22,8 +25,8 @@ thClaws คุยกับ **provider ได้ทั้งหมดสิบส
 | DashScope | `qwen-*`, `qwq-*` | `DASHSCOPE_API_KEY` | Qwen ของ Alibaba; caching อัตโนมัติ |
 | DeepSeek | `deepseek-*` | `DEEPSEEK_API_KEY` (+ `DEEPSEEK_BASE_URL`) | สาย V4: `deepseek-v4-flash`, `deepseek-v4-pro` ส่วน alias เดิม `deepseek-chat` / `deepseek-reasoner` ยังใช้ได้ในระดับ wire |
 | ThaiLLM (สวทช.) | `thaillm/*` | `THAILLM_API_KEY` | aggregator ที่ `thaillm.or.th` รวม model 8B ภาษาไทยสี่ตัว (OpenThaiGPT, Typhoon-S, Pathumma, THaLLE) มี alias (case-insensitive): `openthaigpt`, `typhoon`, `pathumma`, `thalle` |
-| Z.ai | `zai/*` | `ZAI_API_KEY` (+ `ZAI_BASE_URL`) | Endpoint GLM Coding Plan ที่ `api.z.ai` ค่า default `zai/glm-4.6` ตัวล่าสุด `zai/glm-5.1` (context 202K) เพิ่มใน v0.8.5 ใช้ `ZAI_BASE_URL` override สำหรับ BigModel SKU ที่ `open.bigmodel.cn` |
-| MiniMax | `minimax/*` | `MINIMAX_API_KEY` (+ `MINIMAX_BASE_URL`) | Endpoint สากลที่ `api.minimax.io` รุ่น: `minimax/MiniMax-M2` (200K/131K — flagship, default), `minimax/MiniMax-M1` (context 1M), `minimax/abab7-chat-preview` ผู้ใช้แพลตฟอร์มจีน (`api.minimax.chat`) ต้อง override `MINIMAX_BASE_URL` (auth scheme ต่างกัน — YMMV) เพิ่มใน v0.8.5 |
+| Z.ai | `zai/*` | `ZAI_API_KEY` (+ `ZAI_BASE_URL`) | Endpoint GLM Coding Plan ที่ `api.z.ai` ค่า default `zai/glm-5.2` ใช้ `ZAI_BASE_URL` override สำหรับ BigModel SKU ที่ `open.bigmodel.cn` |
+| MiniMax | `minimax/*` | `MINIMAX_API_KEY` (+ `MINIMAX_BASE_URL`) | Endpoint สากลที่ `api.minimax.io` รุ่น: `minimax/MiniMax-M3` (flagship, default), `minimax/MiniMax-M1` (context 1M), `minimax/abab7-chat-preview` ผู้ใช้แพลตฟอร์มจีน (`api.minimax.chat`) ต้อง override `MINIMAX_BASE_URL` (auth scheme ต่างกัน — YMMV) เพิ่มใน v0.8.5 |
 | Ollama Cloud | `ollama-cloud/*` | `OLLAMA_CLOUD_API_KEY` | Catalog Ollama แบบ hosted (Kimi, GPT-OSS, DeepSeek, Llama ฯลฯ) เป็น OpenAI-compatible ที่ `ollama.com/v1` |
 | NVIDIA NIM | `nvidia/*` | `NVIDIA_API_KEY` (+ `NVIDIA_BASE_URL`) | NVIDIA hosted inference ที่ `integrate.api.nvidia.com/v1` ครอบคลุม Nemotron, Llama, DeepSeek, GLM และอื่น ๆ — prefix `nvidia/` route ทุกตัว ระบบจะตัด prefix ก่อนยิง wire ใช้ env var override สำหรับ on-prem NIM |
 | LMStudio | `lmstudio/*` | — (local) | LMStudio server บน local ที่ `localhost:1234/v1` (OpenAI-compatible) ไม่ต้อง auth model ตามที่โหลดไว้ในแอป LMStudio |
@@ -36,7 +39,6 @@ thClaws คุยกับ **provider ได้ทั้งหมดสิบส
 
 ```
 ❯ /providers
-    agentic-press → ap/gemma4-12b
   * anthropic     → claude-sonnet-4-6
     anthropic-agent → agent/claude-sonnet-4-6
     openrouter    → openrouter/anthropic/claude-sonnet-4-6
@@ -54,7 +56,7 @@ current provider: openai (model: gpt-4o)
 การสลับ model/provider จะตัดสินใจให้คุณอัตโนมัติว่าบทสนทนาจะถูกต่อ
 หรือถูก fork เป็น session ใหม่ โดยดูจากว่า **provider family**
 เปลี่ยนหรือไม่ (Anthropic, OpenAI, Gemini, Ollama, DashScope,
-OpenRouter, Agentic Press ฯลฯ):
+OpenRouter, Moonshot ฯลฯ):
 
 | สลับจาก → ไป | พฤติกรรม | เหตุผล |
 |---|---|---|
@@ -111,8 +113,8 @@ model → claude-sonnet-4-6 (provider: anthropic; saved to .thclaws/settings.jso
 และระบบจะพิมพ์ว่า `unknown model '…' — try /models`
 
 `/models` จะแสดง catalogue ที่ server รายงานมาสำหรับ provider
-ปัจจุบัน สำหรับ Ollama และ Agentic Press ID จะถูกใส่ prefix กลับมาให้ด้วย
-(เช่น `ollama/llama3.2`, `ap/gemma4-26b`) เพื่อให้คุณ paste เข้า
+ปัจจุบัน สำหรับ provider ที่มี prefix (Ollama, Moonshot, Groq ฯลฯ) ID จะถูกใส่ prefix กลับมาให้ด้วย
+(เช่น `ollama/llama3.2`, `moonshot/kimi-k2.6`) เพื่อให้คุณ paste เข้า
 `/model` ได้ทันที
 
 ## Model catalogue — ขนาด context ของแต่ละโมเดล
@@ -303,7 +305,6 @@ ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 OPENROUTER_API_KEY=sk-or-v1-...
 GEMINI_API_KEY=AI...
-AGENTIC_PRESS_LLM_API_KEY=llm_v1_...
 DASHSCOPE_API_KEY=sk-...
 OLLAMA_BASE_URL=http://localhost:11434   # defaults to this anyway
 OPENAI_COMPAT_BASE_URL=http://localhost:8000/v1   # gateway OAI-compat ใดๆ
@@ -364,19 +365,6 @@ token leak
 ไม่ต้องใช้ API key หากใช้ Ollama server ระยะไกล ให้ตั้ง `OLLAMA_BASE_URL`
 (ผ่าน Settings modal หรือ env var)
 
-## ใช้ Agentic Press (multi-model แบบ hosted)
-
-Agentic Press คือ gateway ที่ให้บริการหลาย backend (Gemma 3, GPT
-4o-mini, Claude Sonnet, Llama 4, Qwen 3) ภายใต้ API key เดียว
-เหมาะสำหรับทดลอง model หลายตัวโดยไม่ต้องไปสมัครทีละเจ้า
-
-1. ขอ key จาก dashboard ของ Agentic Press
-2. Paste ลงใน Settings → API Keys (Agentic Press) — หรือตั้ง
-   `AGENTIC_PRESS_LLM_API_KEY`
-3. `/model ap/gemma4-26b` (หรือ model ใดที่มีใน list)
-
-prefix `ap/` จะ route request ผ่าน gateway และ `/models` จะแสดง
-ทุก model ที่ gateway ให้บริการอยู่ในตอนนี้
 
 ## ใช้ OpenRouter (model 300+ ผ่าน key เดียว)
 
@@ -402,6 +390,40 @@ Model ID มีรูปแบบ `openrouter/<vendor>/<model>` — copy ได�
 
 หมายเหตุ: OpenRouter จะบวก markup เล็กน้อยทับต้นทุนของ vendor แต่ละเจ้า
 สำหรับงาน production ที่ volume สูง ใช้ตรงกับ provider ต้นทางจะคุ้มกว่า
+
+### Fusion Router — ปรึกษาหลายโมเดล (v0.61.0+)
+
+Fusion router ของ OpenRouter คือ model id เดียวที่เบื้องหลังจะกระจาย
+คำถามของคุณไปยัง **คณะโมเดล (panel)** สูงสุด 8 ตัวพร้อมกันแบบขนาน
+(แต่ละตัวค้น/ดึงเว็บได้) จากนั้น **โมเดลกรรมการ (judge)** จะเอาคำตอบ
+ทั้งหมดมาเปรียบเทียบ — ตรงกันตรงไหน (consensus), ขัดแย้งตรงไหน, ตกหล่น
+อะไร, มุมที่ไม่เหมือนใคร, จุดบอด — แล้วสังเคราะห์เป็นคำตอบสุดท้าย พูด
+ง่าย ๆ คือ "ระดมความเห็นหลายหัว + มีกรรมการตัดสิน" ยัดมาในรูป model เดียว
+
+ใช้ใน thClaws ได้สองแบบ:
+
+- **`openrouter/fusion`** — panel เริ่มต้น (Claude Opus + GPT + Gemini)
+  ไม่ต้องตั้งค่าอะไร แค่ `/model openrouter/fusion`
+- **`openrouter/fusion+`** — แบบ **ปรับแต่งได้** เมื่อเลือกใน model
+  picker จะเปิดหน้าตั้งค่าให้ปรับการปรึกษา:
+
+  | ฟิลด์ | ความหมาย |
+  |---|---|
+  | **Analysis models** | คณะโมเดล (panel) — model id ของ OpenRouter 1–8 ตัว (เช่น `anthropic/claude-opus-4.8`) เว้นว่างไว้เพื่อใช้ panel เริ่มต้นของ Fusion |
+  | **Judge model** | โมเดลกรรมการที่สังเคราะห์คำตอบสุดท้าย เว้นว่าง = ใช้ outer model |
+  | **Outer model** | โมเดลที่ thClaws เรียกจริง (id แบบ thClaws เช่น `openrouter/openai/gpt-4.1`) และเป็นกรรมการเริ่มต้นด้วย |
+  | **Max tool calls** | จำนวนรอบ web-search/fetch ต่อโมเดล (1–16, ค่าเริ่มต้น 8) |
+  | **Max output tokens** | จำกัด token ต่อการเรียกย่อยแต่ละครั้ง |
+  | **Temperature** | ส่งต่อให้ panel + judge (0–2) |
+  | **Reasoning effort** | ส่งต่อให้ panel + judge |
+  | **Tool choice** | `auto` (Fusion ถูกเรียกเมื่อจำเป็น และอยู่ร่วมกับ tool ของ agent ได้) หรือ `required` (บังคับให้ปรึกษาทุกครั้ง) |
+
+  ค่าที่ตั้งจะถูกบันทึกใน `.thclaws/settings.json` ใต้คีย์
+  `openrouterFusion` จึงมีผลตอนรันแบบ headless หรือ `--serve` ด้วย
+  ไม่เฉพาะใน GUI
+
+Fusion คิดเงินตาม panel + judge ที่รันจริง หนึ่งเทิร์นจึงแพงกว่าการเรียก
+โมเดลเดียว เหมาะเป็นตัวแทนเมื่อโมเดลที่อยากใช้ไม่มีให้บริการบนแพลตฟอร์ม
 
 ## ใช้ endpoint OpenAI-compatible แบบ generic (`oai/*`)
 
@@ -456,3 +478,108 @@ Auth เป็น header `Authorization: Bearer $OPENAI_COMPAT_API_KEY`
 ถ้า endpoint ของคุณ implement `/v1/models` ด้วย คำสั่ง
 `/models refresh` จะดึง catalogue มาให้อัตโนมัติ ถ้าไม่มี
 endpoint นั้น refresh จะ fail เงียบ ๆ และ chat ยังทำงานต่อได้ปกติ
+
+## ใช้ Codex ผ่าน subscription ChatGPT (`chatgpt-codex/*`)
+
+รัน Codex model กับ `chatgpt.com/backend-api/codex/responses` โดย
+**คิดเงินจาก subscription ChatGPT Plus / Pro / Team** แทนการใช้
+OpenAI API key แบบเสียเงิน เป็น wire path เดียวกับที่ Codex CLI
+ตัวทางการใช้
+
+การตั้งค่าทำครั้งเดียว และ thClaws จะอาศัย auth ของ Codex CLI
+ตัวทางการ:
+
+1. ติดตั้ง Codex CLI (`npm i -g @openai/codex-cli` หรือทำตามเอกสาร
+   ของเขา)
+2. รัน `codex login` หนึ่งครั้ง — จะเปิด browser ให้คุณ sign in เข้า
+   บัญชี ChatGPT แล้ว CLI จะเก็บ token ไว้ที่
+   `~/.codex/auth.json`
+3. ใน thClaws: `/model chatgpt-codex/gpt-5.4` (หรือ Codex model ตัว
+   อื่นตาม tier ของ subscription คุณ)
+
+thClaws จะ auto-import ไฟล์ auth ให้ตอนใช้งานครั้งแรก — ไม่ต้อง
+login ฝั่ง thClaws แยกอีก เมื่อ access token หมดอายุ ให้รัน `codex
+login` ใหม่ thClaws จะหยิบไฟล์ที่ refresh แล้วมาใช้ในการเรียกครั้งถัดไป
+
+ข้อควรระวัง:
+
+- endpoint นี้ไม่มีเอกสาร OpenAI อาจเปลี่ยน wire shape ได้โดยไม่แจ้ง
+  ล่วงหน้า ถ้าเจอ 400 พร้อมชื่อ field ที่ไม่คาดคิด ลองเช็ค
+  [thclaws issues](https://github.com/thClaws/thClaws/issues) ก่อน
+  ลงมือ debug
+- rate limit ของ subscription มีผล (โดยทั่วไปใจกว้างกว่า free API
+  tier มาก แต่ก็ยังมีขีดจำกัด — automation หนัก ๆ อาจชนเพดานได้)
+- การ refresh token ยังไม่ถูกทำให้อัตโนมัติใน thClaws (ให้รัน `codex
+  login` ใหม่เมื่อเจอ error เรื่อง auth)
+
+เพิ่มใน v0.9.5 ผ่าน PR #88 เครดิต: port มาจาก `client_codex.rs`
+ของ themion
+
+## Sign in เข้า thClaws Cloud — ตัวเลือกเสริม
+
+มุมขวาบนของ navbar มีปุ่ม **Sign in** ตั้งแต่ v0.9.6 เป็นต้นไป
+dropdown มี IdP ให้เลือกสองตัว:
+
+- **Sign in with Google** — สำหรับบัญชี Google / Workspace ส่วนตัว
+- **Sign in with Microsoft** — สำหรับบัญชี Microsoft 365 / Azure Entra
+  (multi-tenant — Entra org ไหนก็ใช้ได้โดยไม่ต้องลงทะเบียนต่อ tenant)
+  บัญชี Microsoft ส่วนตัว (Outlook, Hotmail) ก็ใช้ได้ผ่าน endpoint
+  `/common` เดียวกัน
+
+ทั้งสองทางจะ authenticate คุณกับ `gateway.thclaws.ai` และปลดล็อก
+ฟีเจอร์ cloud-gateway (proxy ต่อ provider, shared credit pool — ดูที่
+หัวข้อ **thClaws Gateway** ด้านล่าง)
+
+**สำคัญ:** thClaws ใช้งานได้เต็มที่โดยไม่ต้อง sign in ปุ่มนี้เป็น
+opt-in ถ้าไม่สนใจก็ไม่มีอะไรพัง
+
+### จาก source — ชี้ไป OAuth project ของคุณเอง
+
+ใส่คู่ `*_CLIENT_ID` / `*_CLIENT_SECRET` ที่ตรงกันลงใน `.env`
+(หรือ environment ของ workspace) ก่อนเปิดใช้งาน:
+
+```sh
+# Google (web/native app — ต้องมีทั้ง ID และ secret)
+GOOGLE_CLIENT_ID=...apps.googleusercontent.com
+GOOGLE_CLIENT_SECRET=GOCSPX-...
+
+# Microsoft Entra (public/native client — PKCE-only, ไม่มี secret)
+AZURE_CLIENT_ID=00000000-0000-0000-0000-000000000000
+```
+
+Azure เป็น client แบบ **public** และรัน PKCE โดยไม่ต้องมี secret
+การ register Entra app ต้องตั้ง "Allow public client flows = Yes"
+และใส่ `http://localhost` เป็น redirect URI (ไม่ระบุ port — Entra
+จับ ephemeral port ตัวไหนก็ได้) คู่มือฉบับ operator ครบ ๆ อยู่ที่
+[`docs/azure-setting.md`](../docs/azure-setting.md)
+
+คลิกปุ่ม → browser เปิด → หน้า consent → desktop รับ callback →
+ปุ่มจะเปลี่ยนเป็น email ของคุณพร้อมเครื่องหมายถูก token จะถูกเก็บลง
+OS keychain (macOS Keychain / Windows Credential Manager / Linux
+Secret Service) **ไม่ใช่ใน `.env`** — แม้ว่าคุณจะเลือก backend แบบ
+dotenv สำหรับเก็บ API key ก็ตาม
+
+### จาก dmg / msi ตัวทางการ
+
+OAuth credential ที่ bundle มาถูกฝังเข้าไปใน build ตัวทางการผ่านการ
+inject secret ตอน CI (`BUNDLED_GOOGLE_CLIENT_ID`,
+`BUNDLED_GOOGLE_CLIENT_SECRET`, `BUNDLED_AZURE_CLIENT_ID` ถูกอ่าน
+ตอน compile) ปุ่ม Sign-in ทำงานได้ทันที — ไม่ต้องตั้งค่า `.env` เอง
+
+### ไม่มี prompt จาก keychain ตอนเปิดครั้งแรก
+
+การอ่าน OS keychain จะ trigger prompt ขอสิทธิ์เข้าถึงครั้งแรกที่
+binary ที่เพิ่งเซ็นใหม่ไปแตะ entry แม้ entry นั้นจะยังไม่มีอยู่ก็ตาม
+v0.9.6 เพิ่มไฟล์ marker เล็ก ๆ ที่
+`~/.config/thclaws/sso-known.json` ซึ่งระบุ issuer ที่คุณ sign in
+ไปจริง ๆ ตอน startup จะปรึกษา marker นี้ก่อนจะ probe keychain
+ดังนั้นผู้ใช้ที่ไม่เคย sign in (และผู้ใช้ backend แบบ dotenv ที่ SSO
+ไม่เกี่ยวข้องด้วย) จะไม่เจอ prompt เลย marker นี้ไม่มี secret ใด ๆ —
+เป็นแค่ hint แบบ denormalised ว่า "ใช่ มี session ของ X อยู่"
+
+### override สำหรับองค์กร
+
+องค์กรที่ ship ไฟล์ policy ที่เซ็นแล้วพร้อม `policies.sso` จะ
+override ปุ่ม Google/Microsoft มาตรฐาน — navbar จะแสดง IdP ของเขา
+แทน ดูโมเดล verification ฝั่ง gateway ได้ในเอกสาร SSO ของ technical
+manual

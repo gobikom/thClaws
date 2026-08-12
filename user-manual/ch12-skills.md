@@ -25,10 +25,28 @@ SKILL.md content + resolved path.
 
 ## Marketplace
 
-The thClaws marketplace is a curated, license-vetted catalog of skills
+The thClaws marketplace is a curated, license-vetted catalog
 maintained at [thClaws/marketplace](https://github.com/thClaws/marketplace).
-The client fetches the catalog from `thclaws.ai/api/marketplace.json`
-and exposes three discovery commands:
+The client fetches it from `thclaws.ai/api/marketplace.json` (with an
+embedded baseline for offline use and a per-user cache). It's a
+**unified catalog of four installable types**, each with the same
+`marketplace` / `search` / `info` / `install` subcommands:
+
+| Type | Command prefix | Installs to | Chapter |
+|---|---|---|---|
+| Skills | `/skill` | `.thclaws/skills/<name>/` | this chapter |
+| MCP servers | `/mcp` | `mcp.json` entry (+ optional clone) | [14](ch14-mcp.md) |
+| Plugins | `/plugin` | plugin dir | [16](ch16-plugins.md) |
+| Subagents | `/subagent` | `.thclaws/agents/<name>.md` | [15](ch15-subagents.md) |
+
+In the desktop GUI, **`/marketplace`** opens a browser modal with a tab
+per type, a search box, and one-click **Install** buttons (it injects
+the matching `/<type> install <name>` for you and the result streams
+into chat). The per-type text commands below work in both the CLI and
+GUI. The rest of this section uses skills as the example; the other
+three behave the same.
+
+For skills specifically:
 
 ```
 ❯ /skill marketplace

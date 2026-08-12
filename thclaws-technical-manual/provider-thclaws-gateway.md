@@ -12,7 +12,7 @@ The header **scheme** is unchanged: OpenAI / OpenRouter clients still send `Auth
 > **Not to be confused with the EE policy gateway.** [`provider-gateway.md`](provider-gateway.md) documents `providers/gateway.rs`, an **enterprise-policy substitution** that replaces every cloud provider with a single OpenAI-Chat-Completions client pointed at LiteLLM / Portkey / Helicone / etc. That overlay is org-policy driven and unconditional; this overlay is user-toggled per-provider and preserves wire shape. They share a name and never share a file.
 
 **Source:** `crates/core/src/providers/thclaws_gateway.rs`
-**Server-side:** `crates/gateway/` (workspace-only — not in the public repo; runs on the operator's k3s cluster behind `gateway.thclaws.ai`)
+**Server-side:** `thclaws-cloud/gateway/` (workspace-only — not in the public repo; runs on the operator's k3s cluster behind `gateway.thclaws.cloud`)
 **Trigger:** per-provider toggle in `AppConfig.gateway_use_for: Vec<String>` + a resolvable access key
 **Shipped:** v0.9.6 (gateway server + desktop overlay landed together)
 
@@ -21,7 +21,7 @@ The header **scheme** is unchanged: OpenAI / OpenRouter clients still send `Auth
 ## 1. Base URL
 
 ```rust
-pub const GATEWAY_BASE_URL: &str = "https://gateway.thclaws.ai";
+pub const GATEWAY_BASE_URL: &str = "https://gateway.thclaws.cloud";
 ```
 
 The base URL is **fixed**. End users can't change it from the Settings UI — there's nothing to misconfigure. The DNS resolves to the operator's k3s ingress; the cluster terminates TLS via cert-manager and routes by Host header.
@@ -38,7 +38,7 @@ THCLAWS_GATEWAY_BASE_URL=http://localhost:8080 cargo run --bin thclaws
 
 ## 2. Per-provider segment
 
-Each provider gets a fixed segment under the gateway base. The matching server-side routes live in `crates/gateway/src/routes/mod.rs`:
+Each provider gets a fixed segment under the gateway base. The matching server-side routes live in `thclaws-cloud/gateway/src/routes/mod.rs`:
 
 ```rust
 pub fn provider_segment(kind: ProviderKind) -> Option<&'static str> {
@@ -52,14 +52,21 @@ pub fn provider_segment(kind: ProviderKind) -> Option<&'static str> {
 }
 ```
 
+**10 LLM segments** are wired (`shared::GATEWAY_ALL_PROVIDERS`) — exactly the `ProviderTier::Featured` providers, an equality a unit test enforces. The ones with an OpenAI-compatible upstream share the `compat` proxy:
+
 | ProviderKind | Segment | Example URL |
 |---|---|---|
-| `OpenAI` / `OpenAIResponses` | `openai` | `https://gateway.thclaws.ai/openai/v1/chat/completions` |
-| `Anthropic` | `anthropic` | `https://gateway.thclaws.ai/anthropic/v1/messages` |
-| `Gemini` | `google` | `https://gateway.thclaws.ai/google/v1/...` |
-| `OpenRouter` | `openrouter` | `https://gateway.thclaws.ai/openrouter/api/v1/chat/completions` |
+| `OpenAI` / `OpenAIResponses` | `openai` | `https://gateway.thclaws.cloud/openai/v1/chat/completions` |
+| `Anthropic` | `anthropic` | `https://gateway.thclaws.cloud/anthropic/v1/messages` |
+| `Gemini` | `google` | `https://gateway.thclaws.cloud/google/v1/...` |
+| `OpenRouter` | `openrouter` | `https://gateway.thclaws.cloud/openrouter/...` |
+| `DashScope` `ZAi` `DeepSeek` `Minimax` `XAi` `Moonshot` | `dashscope` / `zai` / `deepseek` / `minimax` / `xai` / `moonshot` | `…/<segment>/v1/chat/completions` (compat proxy) |
 
-Anything outside this set (Ollama, LMStudio, AgentSdk, OllamaCloud, DashScope, AgenticPress, …) returns `None` from `provider_segment` and bypasses the overlay — they call upstream directly. Local providers don't need a proxy; OllamaCloud has its own auth model; the rest haven't been wired through the gateway yet.
+Anything outside this set (Ollama, LMStudio, AgentSdk, OllamaCloud, TokenRouter, …) returns `None` from `provider_segment` and bypasses the overlay — they call upstream directly (local providers need no proxy; OllamaCloud/TokenRouter have their own auth/pricing model).
+
+`QwenCloud`, `ThaiLLM` and `Groq` were in this table until 2026-08-10. The gateway now proxies only what it sells, and the sold tier is the ten Featured providers: thaillm is free upstream but rate-limited far below anything a paid tier can promise, and qwen-cloud duplicates dashscope from another region. All three still work on the desktop with the user's own key — what was withdrawn is the proxy, not the provider. Groq is the subtle one: its **LLM** segment is gone while `/groq/audio` (Whisper) stays, because the media routes are billed and routed independently. Its Whisper rows therefore keep syncing to `model_pricing` while its chat rows do not — see `MEDIA_ONLY` in `scripts/sync-cloud-pricing.py`.
+
+**Media routes.** Beyond LLMs the gateway meters generation per-unit (dev-plan/53): per-second video (`/ltx`, DashScope `video-synthesis`), per-character TTS (`/elevenlabs`, `/openai/v1/audio/speech`, `/minimax/v1/t2a_v2`), per-image (`/dashscope/...multimodal-generation`), Whisper per-second (`/groq/audio`), and Kie async jobs billed by `creditsConsumed`. See [`provider-gateway.md`](provider-gateway.md) and the gateway server's `proxy/media.rs`.
 
 ---
 
@@ -150,7 +157,7 @@ A user with no access key but checked toggles → `for_kind` returns `None` (acc
 - `for_kind_uses_fixed_base_url_by_default` — default base URL.
 - `for_kind_honors_base_url_env_override` — `THCLAWS_GATEWAY_BASE_URL` flips the base URL at lookup time.
 
-No end-to-end test of the live wire path — that requires the gateway server (workspace-only `crates/gateway/`) running. Manual repro: `docker compose up gateway` in the workspace + `THCLAWS_GATEWAY_BASE_URL=http://localhost:8080 cargo run`.
+No end-to-end test of the live wire path — that requires the gateway server (workspace-only `thclaws-cloud/gateway/`) running. Manual repro: `docker compose up gateway` in the workspace + `THCLAWS_GATEWAY_BASE_URL=http://localhost:8080 cargo run`.
 
 ---
 
@@ -161,7 +168,7 @@ No end-to-end test of the live wire path — that requires the gateway server (w
 - **No per-key gateway preferences yet.** Every key carries the same upstream-routing surface. Per-key rate-limit / model-allowlist is a server-side feature for a later release.
 - **OllamaCloud is NOT routed through the gateway.** It's hosted (so not "local") but has its own auth model; no segment is wired.
 - **Header passthrough preserves wire shape.** A request bug in the Anthropic provider would manifest the same way whether the gateway is on or off — the gateway just changes the destination + the credential, not the body or other headers.
-- **Server crate is workspace-only.** The `crates/gateway/` Axum service is excluded from `make sync-public` because it's operator infra (runs on our k3s cluster). The desktop overlay you're reading about here ships normally to end users.
+- **Server crate is workspace-only.** The `thclaws-cloud/gateway/` Axum service is excluded from `make sync-public` because it's operator infra (runs on our k3s cluster). The desktop overlay you're reading about here ships normally to end users.
 
 ---
 

@@ -12,7 +12,7 @@
 
 #![cfg(feature = "gui")]
 
-use crate::repl::{default_model_for_provider, parse_slash, render_help, SlashCommand};
+use crate::repl::{default_model_for_provider, parse_slash, render_help, CloudSlash, SlashCommand};
 use crate::session::Session;
 use crate::shared_session::{
     build_session_list, save_history, DisplayMessage, ViewEvent, WorkerState,
@@ -210,14 +210,33 @@ pub async fn dispatch(
                 crate::usage::UsageTracker::new(crate::usage::UsageTracker::default_path());
             emit(events_tx, tracker.summary());
         }
-        SlashCommand::Doctor => emit(events_tx, doctor_report(state)),
+        SlashCommand::Doctor { fix } => {
+            let mut out = doctor_report(state);
+            let report = crate::doctor::diagnose();
+            out.push_str(&crate::doctor::render(&report));
+            if fix {
+                out.push_str("\n── installing missing agent dependencies ──\n");
+                out.push_str(&crate::doctor::apply(&report));
+            }
+            emit(events_tx, out);
+        }
 
         // ─── model / provider / catalogue ───────────────────────────
         SlashCommand::Providers => {
+            use crate::providers::ProviderTier;
             let current = state.config.detect_provider_kind().ok();
             let mut out = String::from("Providers:\n");
-            for kind in crate::providers::ProviderKind::ALL {
-                let marker = if Some(*kind) == current { "*" } else { " " };
+            let mut last_tier: Option<ProviderTier> = None;
+            for kind in crate::providers::ProviderKind::display_ordered() {
+                let tier = kind.tier();
+                if Some(tier) != last_tier {
+                    out.push_str(match tier {
+                        ProviderTier::Featured => "\nFeatured (gateway-routable):\n",
+                        ProviderTier::Additional => "\nAdditional (bring your own key):\n",
+                    });
+                    last_tier = Some(tier);
+                }
+                let marker = if Some(kind) == current { "*" } else { " " };
                 out.push_str(&format!(
                     "  {marker} {:<12} → {}\n",
                     kind.name(),
@@ -354,6 +373,16 @@ pub async fn dispatch(
                 rows.retain(|(_, e)| e.free == Some(true));
             }
 
+            // Gateway routing is strictly metered: unpriced models 400
+            // upstream, so don't offer them. No-op on desktop (overlay
+            // off — the user's own keys are not metered by us).
+            if crate::providers::thclaws_gateway::hides_unpriced_models(
+                &state.config,
+                provider_name,
+            ) {
+                rows.retain(|(_, e)| e.input_per_mtok.is_some() && e.output_per_mtok.is_some());
+            }
+
             // Ollama is per-machine, so the catalogue alone can't know what
             // the user has pulled — hit `/api/tags` too and union any new
             // ids (without context until `/model <id>` auto-scans them).
@@ -450,11 +479,16 @@ pub async fn dispatch(
                 );
                 // GUI side: also broadcast a model_picker_open event so
                 // the existing ModelPickerModal opens with the active
-                // provider's catalogue. Skipped for tiny catalogues
-                // (<3 entries — no choice to make) and runtime-loaded
-                // backends (Ollama / LMStudio) whose model lists come
-                // from the live runtime, not the catalogue. Closes #25.
-                let runtime_loaded = matches!(prov, "ollama" | "ollama-anthropic" | "lmstudio");
+                // provider's catalogue. Skipped only when there's nothing
+                // to choose (<2 entries) and for runtime-loaded backends
+                // (Ollama / LMStudio) whose model lists come from the live
+                // runtime, not the catalogue. (Was <3, which wrongly hid the
+                // picker for 2-model providers like DeepSeek — flash/pro is a
+                // real choice.) Closes #25.
+                let runtime_loaded = matches!(
+                    prov,
+                    "ollama" | "ollama-anthropic" | "lmstudio" | "vllm" | "llamacpp"
+                );
                 if !runtime_loaded {
                     let cat = crate::model_catalogue::EffectiveCatalogue::load();
                     let mut models = cat.list_models_for_provider(prov);
@@ -462,7 +496,14 @@ pub async fn dispatch(
                     if prov == "openrouter" && state.config.openrouter_free_only {
                         models.retain(|(_, e)| e.free == Some(true));
                     }
-                    if models.len() >= 3 {
+                    // Strictly metered via gateway → hide unpriced rows.
+                    if crate::providers::thclaws_gateway::hides_unpriced_models(&state.config, prov)
+                    {
+                        models.retain(|(_, e)| {
+                            e.input_per_mtok.is_some() && e.output_per_mtok.is_some()
+                        });
+                    }
+                    if models.len() >= 2 {
                         let _ = crate::providers::ProviderKind::detect(&state.config.model);
                         let model_rows: Vec<serde_json::Value> = models
                             .iter()
@@ -522,6 +563,12 @@ pub async fn dispatch(
         SlashCommand::Clear => {
             state.agent.clear_history();
             state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
+            // Reset session-scoped trust + plan state too. ChangeCwd's
+            // hygiene block (shared_session.rs ~2820) is the reference;
+            // /clear used to skip these, so the previous conversation's
+            // yolo flag and plan persisted into the cleared session.
+            state.approver.reset_session_flag();
+            crate::tools::plan_state::clear();
             let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
             emit(events_tx, "(history cleared)".into());
         }
@@ -565,7 +612,7 @@ pub async fn dispatch(
                     Ok(loaded) => {
                         state.agent.set_history(loaded.messages.clone());
                         state.session = loaded;
-                        let display = DisplayMessage::from_messages(&state.session.messages);
+                        let display = DisplayMessage::from_session(&state.session);
                         let _ = events_tx.send(ViewEvent::HistoryReplaced(display));
                         emit(events_tx, format!("loaded session: {}", state.session.id));
                     }
@@ -818,6 +865,11 @@ pub async fn dispatch(
                 }
                 _ => String::new(),
             };
+            // Insurance: if any mid-session mutation (folder instructions
+            // edit, ad-hoc memory file write, etc.) bypassed its own
+            // rebuild, /compact is a natural moment to resync. Cheap —
+            // just re-runs build_full_system_prompt and calls set_system.
+            state.rebuild_system_prompt();
             emit(
                 events_tx,
                 format!(
@@ -827,24 +879,25 @@ pub async fn dispatch(
                 ),
             );
         }
+        SlashCommand::ReloadPrompt => {
+            // GUI mirror of the CLI `/reload-prompt`. Rebuilds
+            // state.system_prompt from current state (skills / MCP /
+            // KMS / memory / AGENTS.md) and pushes it into the agent
+            // via set_system — no process re-exec, no history loss.
+            state.rebuild_system_prompt();
+            emit(events_tx, "[reload-prompt] system prompt rebuilt".into());
+        }
         SlashCommand::Reload => {
             emit(
                 events_tx,
                 "[reload] re-executing thclaws — in-memory state will be reset, on-disk sessions survive…".into(),
             );
-            let events_tx_clone = events_tx.clone();
-            // Hand off to a detached task so the slash dispatcher can
-            // return cleanly and the SlashOutput message reaches the
-            // user before the process image is replaced. exec() on
-            // Unix only returns on error; on success there's nothing
-            // to clean up because we've stopped existing.
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(400));
-                let err = crate::util::reexec_self();
-                let _ = events_tx_clone.send(ViewEvent::SlashOutput(format!(
-                    "[reload] re-exec failed: {err}"
-                )));
-            });
+            // Route through the tao event loop (ViewEvent::ReloadRequested →
+            // UserEvent::ReloadRequested) so it persists the LIVE window size
+            // before re-execing. The size lives in the loop, not here, so a
+            // direct exec() from this thread would restore the last size saved
+            // on a normal close instead of the current one.
+            let _ = events_tx.send(ViewEvent::ReloadRequested);
             return;
         }
         SlashCommand::Fork => {
@@ -905,6 +958,9 @@ pub async fn dispatch(
             if let Some(store) = &state.session_store {
                 let _ = store.save(&mut state.session);
             }
+            // Insurance — same rationale as /compact above. Any mid-session
+            // mutation that bypassed its own rebuild gets resynced here.
+            state.rebuild_system_prompt();
             let display = crate::shared_session::DisplayMessage::from_messages(&summary_history);
             let _ = events_tx.send(crate::shared_session::ViewEvent::HistoryReplaced(display));
             let _ = events_tx.send(crate::shared_session::ViewEvent::SessionListRefresh(
@@ -1132,13 +1188,15 @@ pub async fn dispatch(
             budget_tokens,
             budget_time_secs,
             auto_continue,
+            require_paths,
         } => {
             let new_goal = crate::goal_state::GoalState::new(
                 objective.clone(),
                 budget_tokens,
                 budget_time_secs,
                 auto_continue,
-            );
+            )
+            .with_require_paths(require_paths);
             crate::goal_state::set(Some(new_goal));
             // Live-register the three goal-lifecycle tools (Phase C1):
             //   RecordGoalProgress  — mid-loop audit checkpoint, status stays Active
@@ -1606,6 +1664,150 @@ pub async fn dispatch(
                 ),
             }
         }
+        SlashCommand::SubagentMarketplace { refresh } => {
+            if refresh {
+                if let Err(e) = crate::marketplace::refresh_from_remote().await {
+                    emit(events_tx, format!("refresh failed: {e}"));
+                }
+            }
+            let mp = crate::marketplace::load();
+            let age_suffix = match crate::marketplace::cache_age_label() {
+                Some(label) => format!(", {label}"),
+                None => String::new(),
+            };
+            let mut out = format!(
+                "marketplace ({}, {} subagent(s){age_suffix})\n",
+                mp.source,
+                mp.subagents.len(),
+            );
+            for s in &mp.subagents {
+                let tags = crate::marketplace::entry_tags(s);
+                out.push_str(&format!("  {:<24}{tags} — {}\n", s.name, s.short_line()));
+            }
+            out.push_str("install with: /subagent install <name>   |   browse all: /marketplace");
+            emit(events_tx, out);
+        }
+        SlashCommand::SubagentSearch(query) => {
+            let mp = crate::marketplace::load();
+            let hits = mp.search_subagent(&query);
+            if hits.is_empty() {
+                emit(
+                    events_tx,
+                    format!("no matches for '{query}' — try /subagent marketplace"),
+                );
+            } else {
+                let mut out = format!("{} match(es) for '{query}':\n", hits.len());
+                for s in hits {
+                    out.push_str(&format!("  {:<24} — {}\n", s.name, s.short_line()));
+                }
+                emit(events_tx, out);
+            }
+        }
+        SlashCommand::SubagentInfo(name) => {
+            let mp = crate::marketplace::load();
+            match mp.find_subagent(&name) {
+                Some(s) => {
+                    let mut out = format!("name:        {}\n", s.name);
+                    out.push_str(&format!("description: {}\n", s.description));
+                    if !s.category.is_empty() {
+                        out.push_str(&format!("category:    {}\n", s.category));
+                    }
+                    out.push_str(&format!(
+                        "license:     {} ({})\n",
+                        s.license, s.license_tier
+                    ));
+                    if !s.homepage.is_empty() {
+                        out.push_str(&format!("homepage:    {}\n", s.homepage));
+                    }
+                    match (s.license_tier.as_str(), s.install_url.as_ref()) {
+                        ("linked-only", _) => out.push_str(&format!(
+                            "install:     not redistributable — install from {}",
+                            if s.homepage.is_empty() {
+                                "the upstream repo"
+                            } else {
+                                &s.homepage
+                            }
+                        )),
+                        (_, Some(url)) => out.push_str(&format!(
+                            "install:     /subagent install {} (resolves to {url})",
+                            s.name
+                        )),
+                        (_, None) => out.push_str("install:     no install_url in catalogue"),
+                    }
+                    emit(events_tx, out);
+                }
+                None => emit(
+                    events_tx,
+                    format!("no subagent named '{name}' in marketplace — try /subagent search"),
+                ),
+            }
+        }
+        SlashCommand::SubagentInstall { arg, name, project } => {
+            let (effective_url, abort_msg) =
+                crate::agent_defs::resolve_subagent_install_target(&arg);
+            if let Some(msg) = abort_msg {
+                emit(events_tx, msg);
+                return;
+            }
+            match crate::agent_defs::install_subagent_from_url(
+                &effective_url,
+                name.as_deref(),
+                project,
+            )
+            .await
+            {
+                Ok(report) => {
+                    // Reload the worker's def snapshot so a `/subagent
+                    // <name>` side-channel can spawn it right away (matches
+                    // the `AgentDefsChanged` handler). Model-driven Task
+                    // picks up the new def on the next session.
+                    let plugin_agent_dirs = crate::plugins::plugin_agent_dirs();
+                    let mut reloaded =
+                        crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
+                    reloaded.apply_builtin_subagent_overrides(&state.config);
+                    state.agent_defs = reloaded;
+                    let mut out = report.join("\n");
+                    out.push_str(
+                        "\n(spawn now via /subagent <name>; model-driven Task sees it next session)",
+                    );
+                    emit(events_tx, out);
+                }
+                Err(e) => emit(events_tx, format!("subagent install failed: {e}")),
+            }
+        }
+        SlashCommand::Marketplace { refresh } => {
+            if refresh {
+                if let Err(e) = crate::marketplace::refresh_from_remote().await {
+                    emit(events_tx, format!("refresh failed: {e}"));
+                }
+            }
+            let mp = crate::marketplace::load();
+            // Installed-name sets for the [installed ✓] badges. Skills
+            // from the live SkillStore; subagents from the loaded defs
+            // (built-in or disk). MCP / plugin badges are a follow-up.
+            let installed_skills: Vec<String> = state
+                .skill_store
+                .lock()
+                .map(|s| s.skills.keys().cloned().collect())
+                .unwrap_or_default();
+            let installed_subagents: Vec<String> = state
+                .agent_defs
+                .names()
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            let payload = serde_json::json!({
+                "type": "marketplace_open",
+                "source": mp.source,
+                "cacheAge": crate::marketplace::cache_age_label(),
+                "catalog": mp,
+                "installed": {
+                    "skills": installed_skills,
+                    "subagents": installed_subagents,
+                },
+            });
+            let _ = events_tx.send(ViewEvent::MarketplaceOpen(payload.to_string()));
+        }
         SlashCommand::McpMarketplace { refresh } => {
             if refresh {
                 if let Err(e) = crate::marketplace::refresh_from_remote().await {
@@ -1829,12 +2031,15 @@ pub async fn dispatch(
             }
         }
         SlashCommand::KmsNew { name, project } => {
-            let scope = if project {
-                crate::kms::KmsScope::Project
+            // Default (project) reuses any existing same-named KMS across
+            // scopes via `ensure_default` so `/kms new foo` can't duplicate a
+            // base that already lives in user scope. `--user` stays explicit.
+            let res = if project {
+                crate::kms::ensure_default(&name)
             } else {
-                crate::kms::KmsScope::User
+                crate::kms::create(&name, crate::kms::KmsScope::User)
             };
-            match crate::kms::create(&name, scope) {
+            match res {
                 Ok(k) => {
                     emit(
                         events_tx,
@@ -1879,6 +2084,9 @@ pub async fn dispatch(
                 state
                     .tool_registry
                     .register(std::sync::Arc::new(crate::tools::KmsWriteTool));
+                state
+                    .tool_registry
+                    .register(std::sync::Arc::new(crate::tools::KmsWriteSourceTool));
                 state
                     .tool_registry
                     .register(std::sync::Arc::new(crate::tools::KmsAppendTool));
@@ -1978,9 +2186,18 @@ pub async fn dispatch(
                     } else {
                         String::new()
                     };
+                    let images = if r.images_copied > 0 {
+                        format!(" (+{} local image(s))", r.images_copied)
+                    } else {
+                        String::new()
+                    };
                     emit(
                         events_tx,
-                        format!("{verb} → {} — {}{cascade}", r.target.display(), r.summary),
+                        format!(
+                            "{verb} → {} — {}{images}{cascade}",
+                            r.target.display(),
+                            r.summary
+                        ),
                     );
                 }
                 Err(e) => emit(events_tx, format!("ingest failed: {e}")),
@@ -2022,6 +2239,10 @@ pub async fn dispatch(
             file,
             alias,
             force,
+            // `--vision` is intercepted as an agent turn-rewrite in
+            // shared_session::handle_line before dispatch, so this arm only
+            // ever runs the deterministic text-extraction path.
+            vision: _,
         } => {
             // M6.25 BUG #8: PDF ingest via pdftotext.
             let Some(k) = crate::kms::resolve(&name) else {
@@ -2310,6 +2531,92 @@ pub async fn dispatch(
             }
             Err(e) => emit(events_tx, format!("/kms merge failed: {e}")),
         },
+        SlashCommand::KmsConsolidate { dst, scope, drop } => {
+            match crate::kms::consolidate(&dst, scope, drop) {
+                Ok(report) => {
+                    emit(events_tx, report.summary_lines().join("\n"));
+                    // dst created and/or sources dropped → refresh the sidebar.
+                    broadcast_kms_update(events_tx);
+                }
+                Err(e) => emit(events_tx, format!("/kms consolidate failed: {e}")),
+            }
+        }
+        SlashCommand::KmsExportOkf { name, output_dir } => {
+            let out = output_dir.unwrap_or_else(|| format!("{name}-okf"));
+            match crate::kms::export_okf(&name, std::path::Path::new(&out)) {
+                Ok(report) => emit(
+                    events_tx,
+                    format!(
+                        "exported '{name}' as OKF bundle → {} ({} page(s), {} reference(s)).",
+                        report.out_dir.display(),
+                        report.pages,
+                        report.sources,
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("/kms export-okf failed: {e}")),
+            }
+        }
+        SlashCommand::KmsImportOkf {
+            bundle,
+            name,
+            scope,
+        } => match crate::kms::import_okf(std::path::Path::new(&bundle), &name, scope) {
+            Ok(report) => {
+                emit(
+                    events_tx,
+                    format!(
+                        "imported OKF bundle '{bundle}' → KMS '{name}' ({} scope): {} page(s), {} source(s). \
+                         Attach it with `/kms use {name}`.",
+                        scope.as_str(),
+                        report.pages,
+                        report.sources,
+                    ),
+                );
+                broadcast_kms_update(events_tx);
+            }
+            Err(e) => emit(events_tx, format!("/kms import-okf failed: {e}")),
+        },
+        SlashCommand::KmsSearch {
+            name,
+            query,
+            is_pattern,
+        } => {
+            // dev-plan/36 follow-up: `/kms search <name|*> <query>`.
+            // Same shared helper the CLI uses so GUI + CLI behave
+            // identically.
+            let out = crate::tools::kms::run_slash_search(&name, &query, is_pattern);
+            emit(events_tx, out);
+        }
+        SlashCommand::KmsReindex(name) => {
+            // dev-plan/36 Tier 3.B: rebuild the BM25 index from
+            // pages/ on disk. Mirrors the CLI handler in repl.rs.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            #[cfg(feature = "kms_search_index")]
+            {
+                emit(events_tx, format!("/kms reindex {name} — rebuilding…"));
+                match crate::kms_search_index::full_rebuild(&k.root) {
+                    Ok(n) => emit(
+                        events_tx,
+                        format!("/kms reindex {name} — indexed {n} page(s)"),
+                    ),
+                    Err(e) => emit(events_tx, format!("/kms reindex {name} failed: {e}")),
+                }
+            }
+            #[cfg(not(feature = "kms_search_index"))]
+            {
+                let _ = k;
+                emit(
+                    events_tx,
+                    "/kms reindex requires the kms_search_index feature; \
+                     this binary was built without it. Use the official \
+                     thClaws release (which ships with the feature on)."
+                        .to_string(),
+                );
+            }
+        }
         SlashCommand::KmsLint(name) => {
             // M6.25 BUG #3: pure-read health check.
             let Some(k) = crate::kms::resolve(&name) else {
@@ -2380,6 +2687,61 @@ pub async fn dispatch(
                         Err(e) => emit(events_tx, format!("/kms wrap-up --fix: {e}")),
                     }
                 }
+            }
+        }
+        SlashCommand::KmsMaintain { name, apply } => {
+            // Umbrella maintenance: compute the structural report in Rust
+            // (same inputs the linker gets), then dispatch one kms-maintain
+            // agent to run the staged pipeline (structural → source-reconcile
+            // → stale → contradictions). Dry-run by default.
+            let Some(k) = crate::kms::resolve(&name) else {
+                emit(events_tx, format!("no KMS named '{name}'"));
+                return;
+            };
+            if state.config.kms_active.is_empty() {
+                // Subagent inherits the parent's tool registry; KMS tools
+                // register only when kms_active is non-empty.
+                emit(
+                    events_tx,
+                    format!(
+                        "/kms maintain {name}: no KMS attached to this session. \
+                         Run `/kms use {name}` first so KMS tools are registered."
+                    ),
+                );
+                return;
+            }
+            let lint = match crate::kms::lint(&k) {
+                Ok(r) => r,
+                Err(e) => {
+                    emit(events_tx, format!("maintain failed (lint): {e}"));
+                    return;
+                }
+            };
+            let stale = match crate::kms::scan_stale_markers(&k) {
+                Ok(s) => s,
+                Err(e) => {
+                    emit(events_tx, format!("maintain failed (stale scan): {e}"));
+                    return;
+                }
+            };
+            let prompt = compose_kms_maintain_prompt(&name, &lint, &stale, apply);
+            match crate::side_channel::spawn_side_channel(
+                "kms-maintain".to_string(),
+                prompt,
+                state.agent_factory.clone(),
+                state.agent_defs.clone(),
+                events_tx.clone(),
+            )
+            .await
+            {
+                Ok(id) => emit(
+                    events_tx,
+                    format!(
+                        "✓ kms-maintain dispatched (id: {id}, {})",
+                        if apply { "--apply" } else { "dry-run" }
+                    ),
+                ),
+                Err(e) => emit(events_tx, format!("/kms maintain: {e}")),
             }
         }
         SlashCommand::KmsHtml { name, .. } => {
@@ -2473,10 +2835,38 @@ pub async fn dispatch(
         }
 
         // ─── MCP servers ────────────────────────────────────────────
+        SlashCommand::Tools => {
+            // Ground truth: what the model actually sees this turn (gate/env
+            // filtered, sorted) — not an LLM prose enumeration.
+            let defs = state.tool_registry.tool_defs();
+            let mut out = format!("{} tools available:\n", defs.len());
+            for d in &defs {
+                let desc = d.description.lines().next().unwrap_or("").trim();
+                let desc: String = if desc.chars().count() > 90 {
+                    format!("{}…", desc.chars().take(89).collect::<String>())
+                } else {
+                    desc.to_string()
+                };
+                out.push_str(&format!("  {} — {}\n", d.name, desc));
+            }
+            emit(events_tx, out);
+        }
         SlashCommand::Mcp => {
-            let servers = crate::config::AppConfig::load()
+            let mut servers = crate::config::AppConfig::load()
                 .map(|c| c.mcp_servers)
                 .unwrap_or_default();
+            // Fold in plugin-contributed servers — the same merge the
+            // runtime does at spawn (agent_runtime.rs) — so the list
+            // reflects what actually loads. Without this a plugin's MCP
+            // is invisible here even though its tools are live. Config
+            // wins on a name clash.
+            let mut plugin_names = std::collections::HashSet::new();
+            for p_mcp in crate::plugins::plugin_mcp_servers() {
+                if !servers.iter().any(|s| s.name == p_mcp.name) {
+                    plugin_names.insert(p_mcp.name.clone());
+                    servers.push(p_mcp);
+                }
+            }
             if servers.is_empty() {
                 emit(events_tx, "no MCP servers configured".into());
             } else {
@@ -2487,7 +2877,12 @@ pub async fn dispatch(
                     } else {
                         "stdio"
                     };
-                    out.push_str(&format!("  {} ({kind})\n", s.name));
+                    let origin = if plugin_names.contains(&s.name) {
+                        " [plugin]"
+                    } else {
+                        ""
+                    };
+                    out.push_str(&format!("  {} ({kind}){origin}\n", s.name));
                 }
                 emit(events_tx, out);
             }
@@ -2512,6 +2907,7 @@ pub async fn dispatch(
                 // time (mcp::connect_http) so secrets stay out of mcp.json.
                 headers: headers.into_iter().collect(),
                 trusted: false,
+                engine_managed: false,
             };
             persist_and_register_mcp(state, events_tx, cfg, user).await;
         }
@@ -2538,6 +2934,7 @@ pub async fn dispatch(
                 url: String::new(),
                 headers: Default::default(),
                 trusted: false,
+                engine_managed: false,
             };
             persist_and_register_mcp(state, events_tx, cfg, user).await;
         }
@@ -2641,14 +3038,14 @@ pub async fn dispatch(
                 emit(events_tx, out);
             }
         }
-        SlashCommand::PluginInstall { url, user } => {
+        SlashCommand::PluginInstall { url, user, force } => {
             // Resolve marketplace slug → install_url (no-op for URLs).
             let (effective_url, abort_msg) = crate::repl::resolve_plugin_install_target(&url);
             if let Some(msg) = abort_msg {
                 emit(events_tx, msg);
                 return;
             }
-            match crate::plugins::install(&effective_url, user).await {
+            match crate::plugins::install(&effective_url, user, force).await {
                 Ok(plugin) => {
                     // Refresh the SkillTool store so plugin-contributed
                     // skills are callable in this session. Plugin-
@@ -2822,7 +3219,14 @@ pub async fn dispatch(
                     let mut out = String::from("Team:\n");
                     for a in &agents {
                         let task = a.current_task.as_deref().unwrap_or("-");
-                        out.push_str(&format!("  {} — {} (task: {})\n", a.agent, a.status, task));
+                        // A stale heartbeat means the teammate crashed / never
+                        // booted — show that instead of a frozen "idle".
+                        let shown = if a.status != "stopped" && a.is_stale() {
+                            "unresponsive".to_string()
+                        } else {
+                            a.status.clone()
+                        };
+                        out.push_str(&format!("  {} — {} (task: {})\n", a.agent, shown, task));
                     }
                     emit(events_tx, out);
                 }
@@ -2846,7 +3250,7 @@ pub async fn dispatch(
                     } else {
                         "      "
                     };
-                    let last = s.last_run.as_deref().unwrap_or("never");
+                    let last = crate::schedule::display_last_run(s.last_run.as_deref());
                     let exit = match s.last_exit {
                         Some(0) => "ok ",
                         Some(_) => "err",
@@ -2901,9 +3305,10 @@ pub async fn dispatch(
                     emit(
                         events_tx,
                         format!(
-                            "/schedule run '{id_for_msg}': exit={exit} duration={}.{:03}s log={}",
+                            "/schedule run '{id_for_msg}': exit={exit} duration={}.{:03}s → result={} (log={})",
                             outcome.duration.as_secs(),
                             outcome.duration.subsec_millis(),
+                            outcome.result_path.display(),
                             outcome.log_path.display(),
                         ),
                     );
@@ -2941,6 +3346,11 @@ pub async fn dispatch(
                             None => "—  ",
                         };
                         out.push_str(&format!("  {exit}  {:24}  {}\n", s.id, last));
+                        if !matches!(s.last_exit, Some(0)) {
+                            if let Some(log) = crate::schedule::latest_log(&s.id) {
+                                out.push_str(&format!("       \u{21b3} log: {}\n", log.display()));
+                            }
+                        }
                     }
                 }
             }
@@ -3075,7 +3485,7 @@ pub async fn dispatch(
                     events_tx,
                     format!("✓ spawned background agent '{name}' (id: {id})"),
                 ),
-                Err(e) => emit(events_tx, format!("/agent: {e}")),
+                Err(e) => emit(events_tx, format!("/subagent: {e}")),
             }
         }
         SlashCommand::AgentsList => {
@@ -3092,13 +3502,80 @@ pub async fn dispatch(
         }
         SlashCommand::AgentCancel(id) => {
             if crate::side_channel::cancel_side_channel(&id) {
-                emit(events_tx, format!("/agent cancel '{id}': signal sent"));
+                emit(events_tx, format!("/subagent cancel '{id}': signal sent"));
             } else {
                 emit(
                     events_tx,
-                    format!("/agent cancel '{id}': no such active agent (try /agents)"),
+                    format!("/subagent cancel '{id}': no such active agent (try /subagent list)"),
                 );
             }
+        }
+        SlashCommand::AgentNew(name) => {
+            let Some(name) = crate::agent_defs::sanitize_agent_name(&name) else {
+                emit(
+                    events_tx,
+                    "/subagent new: name must be non-empty letters, digits, '-' or '_'".into(),
+                );
+                return;
+            };
+            if crate::agent_defs::AgentDefsConfig::find_on_disk(&name).is_some() {
+                emit(
+                    events_tx,
+                    format!("/subagent new: '{name}' already exists — use /subagent edit {name}"),
+                );
+                return;
+            }
+            let payload = serde_json::json!({
+                "type": "agent_editor_open",
+                "mode": "new",
+                "name": name,
+                "body": agent_starter_template(&name),
+            });
+            let _ = events_tx.send(ViewEvent::AgentEditorOpen(payload.to_string()));
+        }
+        SlashCommand::AgentEdit(name) => {
+            let Some(name) = crate::agent_defs::sanitize_agent_name(&name) else {
+                emit(
+                    events_tx,
+                    "/subagent edit: name must be non-empty letters, digits, '-' or '_'".into(),
+                );
+                return;
+            };
+            // Prefer the raw on-disk file (preserves the user's exact
+            // YAML + formatting). Fall back to reconstructing from the
+            // loaded def so built-ins (translator, dream, …) open with
+            // their real content — saving lands a project override.
+            let body = match crate::agent_defs::AgentDefsConfig::find_on_disk(&name) {
+                Some(path) => match std::fs::read_to_string(&path) {
+                    Ok(raw) => raw,
+                    Err(e) => {
+                        emit(
+                            events_tx,
+                            format!("/subagent edit: can't read {}: {e}", path.display()),
+                        );
+                        return;
+                    }
+                },
+                None => {
+                    match state.agent_defs.get(&name) {
+                        Some(def) => def.to_markdown(),
+                        None => {
+                            emit(
+                            events_tx,
+                            format!("/subagent edit: no such agent '{name}' (try /subagent new {name})"),
+                        );
+                            return;
+                        }
+                    }
+                }
+            };
+            let payload = serde_json::json!({
+                "type": "agent_editor_open",
+                "mode": "edit",
+                "name": name,
+                "body": body,
+            });
+            let _ = events_tx.send(ViewEvent::AgentEditorOpen(payload.to_string()));
         }
         SlashCommand::Dream {
             focus,
@@ -3117,12 +3594,13 @@ pub async fn dispatch(
             // "all sessions" scope.
 
             // Ensure the project-scope `dreams` KMS exists before the
-            // agent runs. Pass 4 of the dream procedure writes its
-            // summary page there (NOT to the user's active KMSes) so
-            // run-audit logs don't contaminate the actual knowledge
-            // vault. `kms::create` is idempotent — returns the
-            // existing ref if already present, so calling on every
-            // /dream is safe and side-effect-free after the first.
+            // agent runs. The dream procedure writes per-session
+            // digests (Pass 2b) and the run summary (Pass 4) there
+            // (NOT to the user's active KMSes) so session/audit content
+            // doesn't contaminate the curated topic vaults. `kms::create`
+            // is idempotent — returns the existing ref if already
+            // present, so calling on every /dream is safe and
+            // side-effect-free after the first.
             // Best-effort: if creation somehow fails (permissions,
             // disk full), the agent's KmsWrite will surface a clear
             // error later in Pass 4 — surface it to the user as a
@@ -3143,7 +3621,7 @@ pub async fn dispatch(
             };
             let prompt = if focus.trim().is_empty() {
                 format!(
-                    "Consolidate the active KMS by mining recent sessions. Follow your standard four-pass procedure.{scope_note}"
+                    "Consolidate the project's knowledge by mining recent sessions into per-session digests and canonical topic pages. Follow your standard multi-pass procedure.{scope_note}"
                 )
             } else {
                 format!("{focus}{scope_note}")
@@ -3216,6 +3694,163 @@ pub async fn dispatch(
                 )));
             });
         }
+        SlashCommand::Cloud(sub) => {
+            let cloud_cfg = crate::config::ProjectConfig::load().and_then(|c| c.cloud.clone());
+            let events_tx_clone = events_tx.clone();
+            // The SESSION's root, not the process cwd: in a multiuser pod those
+            // are different directories, and every cloud command below reads or
+            // overwrites the one it is handed.
+            let cwd = state.cwd.clone();
+            tokio::spawn(async move {
+                // Stream every progress line the moment it is produced, so
+                // long-running syncs show life instead of a silent wait.
+                let mut emit = |line: String| {
+                    let _ = events_tx_clone.send(ViewEvent::SlashOutput(line));
+                };
+                match sub {
+                    CloudSlash::Status => {
+                        // One SlashOutput = one system bubble in chat. Emit the
+                        // whole report as a single block (like /providers) so it
+                        // reads as one list, not a bubble ("pill") per row.
+                        let lines = crate::cloud::cmd::status_lines(None, cloud_cfg.as_ref());
+                        emit(lines.join("\n"));
+                    }
+                    CloudSlash::List { mine } => {
+                        // Single block, same reasoning as Status above.
+                        let lines =
+                            crate::cloud::cmd::list_lines(mine, None, cloud_cfg.as_ref()).await;
+                        emit(lines.join("\n"));
+                    }
+                    CloudSlash::Get { slug } => {
+                        // Returns the whole progress log at once (not a live
+                        // stream), so emit it as one block — a bubble per line
+                        // reads as a stack of "pills". Same reasoning as Status.
+                        let lines = crate::cloud::cmd::get_into_cwd_lines(
+                            slug.clone(),
+                            &cwd,
+                            None,
+                            cloud_cfg.as_ref(),
+                        )
+                        .await;
+                        let installed = lines.iter().any(|l| l.starts_with("✓ Extracted"));
+                        emit(lines.join("\n"));
+                        // A just-installed agent is inert until the engine
+                        // re-reads it: the system prompt (AGENTS.md), agent
+                        // defs, skills, and seeded workflows were all built at
+                        // startup from the OLD/absent agent. Re-exec so
+                        // `/cloud get` just works — sessions survive on disk.
+                        // Gated on the success marker so a 404 / auth error /
+                        // uuid-mismatch refusal never restarts the process.
+                        if installed {
+                            emit(format!(
+                                "↻ activating '{slug}' — reloading thclaws to make it live (sessions survive)…"
+                            ));
+                            // `events_tx_clone` is the owned sender already moved
+                            // into this async task; clone it again for the
+                            // re-exec thread (can't borrow the outer `events_tx`
+                            // reference into a 'static task).
+                            let reexec_tx = events_tx_clone.clone();
+                            std::thread::spawn(move || {
+                                std::thread::sleep(std::time::Duration::from_millis(400));
+                                let err = crate::util::reexec_self();
+                                let _ = reexec_tx.send(ViewEvent::SlashOutput(format!(
+                                    "[reload] re-exec failed: {err} — run /reload to activate the agent"
+                                )));
+                            });
+                            return;
+                        }
+                    }
+                    CloudSlash::Publish => {
+                        // Single block, same reasoning as Get above.
+                        let lines =
+                            crate::cloud::cmd::publish_cwd_lines(&cwd, None, cloud_cfg.as_ref())
+                                .await;
+                        emit(lines.join("\n"));
+                    }
+                    CloudSlash::Unbind => {
+                        // Single block, same reasoning as Status above.
+                        emit(crate::cloud::cmd::unbind_lines().join("\n"));
+                    }
+                    CloudSlash::Revision { workspace } => {
+                        let lines = crate::cloud::cmd::revision_lines(
+                            &cwd,
+                            None,
+                            cloud_cfg.as_ref(),
+                            workspace.as_deref(),
+                        )
+                        .await;
+                        emit(lines.join("\n"));
+                    }
+                    CloudSlash::Push {
+                        delete,
+                        dry_run,
+                        workspace,
+                        force_rebind,
+                        force,
+                    } => {
+                        crate::cloud::cmd::push_streaming(
+                            &cwd,
+                            None,
+                            cloud_cfg.as_ref(),
+                            crate::cloud::cmd::SyncOpts {
+                                delete,
+                                dry_run,
+                                workspace,
+                                force_rebind,
+                                force,
+                            },
+                            &mut emit,
+                        )
+                        .await;
+                    }
+                    CloudSlash::Pull {
+                        delete,
+                        dry_run,
+                        workspace,
+                        force_rebind,
+                        force,
+                    } => {
+                        crate::cloud::cmd::pull_streaming(
+                            &cwd,
+                            None,
+                            cloud_cfg.as_ref(),
+                            crate::cloud::cmd::SyncOpts {
+                                delete,
+                                dry_run,
+                                workspace,
+                                force_rebind,
+                                force,
+                            },
+                            &mut emit,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+        SlashCommand::WorkflowRun(prompt) => {
+            dispatch_workflow_run(prompt, state, events_tx).await;
+        }
+        SlashCommand::WorkflowList => {
+            dispatch_workflow_list(events_tx);
+        }
+        SlashCommand::WorkflowInspect(prefix) => {
+            dispatch_workflow_inspect(prefix, events_tx);
+        }
+        SlashCommand::WorkflowResume(prefix) => {
+            dispatch_workflow_resume(prefix, state, events_tx).await;
+        }
+        SlashCommand::WorkflowExec(path) => {
+            dispatch_workflow_exec(path, state, events_tx).await;
+        }
+        SlashCommand::WorkflowRm(_) => {
+            emit(
+                events_tx,
+                "/workflow rm needs a stdin y/N confirm that the chat tab doesn't expose. \
+                 Run `thclaws --cli` to delete workflows, or use `rm -rf .thclaws/workflows/<id>/` directly."
+                    .to_string(),
+            );
+        }
         SlashCommand::Unknown(detail) => {
             emit(events_tx, format!("unknown command: {detail}"));
         }
@@ -3254,6 +3889,17 @@ async fn switch_model(
     events_tx: &broadcast::Sender<ViewEvent>,
     fallback_to_first: bool,
 ) {
+    // Shared-agent mode (dev-plan/41): when the company pins the model,
+    // members can't switch it. (Non-locked shared agents still allow
+    // switching among gateway models; build_provider rejects any
+    // non-gateway-routable target — see below.)
+    if crate::shared::is_model_locked() {
+        emit(
+            events_tx,
+            "this shared agent has a locked model — switching is disabled".into(),
+        );
+        return;
+    }
     let resolved_initial = crate::providers::ProviderKind::resolve_alias(new_model);
     if resolved_initial != new_model {
         emit(
@@ -3277,8 +3923,12 @@ async fn switch_model(
     // /provider X). Empty list / unsupported listing accepts the
     // requested model optimistically.
     let mut resolved = resolved_initial.clone();
+    // `openrouter/fusion+` is a thClaws pseudo-model (build_provider maps it
+    // to the configured outer model + injected fusion tool); it never appears
+    // in OpenRouter's live /models list, so skip the membership check for it.
+    let is_pseudo_model = resolved == crate::config::FUSION_PLUS_MODEL;
     if let Ok(models) = new_provider.list_models().await {
-        if !models.is_empty() && !models.iter().any(|m| m.id == resolved) {
+        if !is_pseudo_model && !models.is_empty() && !models.iter().any(|m| m.id == resolved) {
             if fallback_to_first {
                 let first = models[0].id.clone();
                 emit(
@@ -3303,38 +3953,32 @@ async fn switch_model(
         }
     }
 
-    // Intra-family swap (e.g. sonnet → opus, both Anthropic) keeps the
-    // same message/tool-call schema on the wire, so the existing
-    // conversation replays cleanly against the new model. Cross-family
-    // swaps (Anthropic → OpenAI → Gemini) change the wire shape and
-    // would either hard-error or silently corrupt context — fork to a
-    // fresh session instead.
-    let old_kind = crate::providers::ProviderKind::detect(&state.config.model);
-    let new_kind = crate::providers::ProviderKind::detect(&resolved);
-    let same_family = old_kind.is_some() && old_kind == new_kind;
-
-    // Flush prior session before swapping. We always want the on-disk
-    // copy up-to-date regardless of which branch we take next.
+    // Preserve history across every model swap, intra- or cross-family.
+    // The JSONL log is the canonical conversation; whichever provider
+    // serves the next turn translates ContentBlocks to its wire format
+    // (anthropic.rs serializes blocks directly, openai.rs maps ToolUse →
+    // tool_calls, etc.). Blocks that don't map cleanly (e.g. Anthropic
+    // Thinking on a non-reasoning OpenAI model) are silently dropped per
+    // provider — accepted tradeoff for continuity. Pre-fix, cross-family
+    // swaps forked to a fresh session because mid-conversation
+    // translation was deemed risky; user reversed that on
+    // thClaws/thClaws#142.
     save_history(&state.agent, &mut state.session, &state.session_store);
 
     state.config = candidate;
-    if same_family {
-        // Preserve history across the model swap. `rebuild_agent(true)`
-        // carries the existing message list into the fresh Agent; the
-        // session itself keeps its id and accumulated messages, we just
-        // update the `model` label so the header reflects the new model.
-        if let Err(e) = state.rebuild_agent(true) {
-            emit(events_tx, format!("rebuild failed: {e}"));
-            return;
-        }
-        state.session.model = state.config.model.clone();
+    if let Err(e) = state.rebuild_agent(true) {
+        emit(events_tx, format!("rebuild failed: {e}"));
+        return;
+    }
+    // Append a `model` event so the switch persists to the JSONL immediately
+    // (not only when the next chat turn writes an assistant line) and a restore
+    // recovers it. Updates the in-memory label too.
+    if let Some(store) = state.session_store.as_ref() {
+        let path = store.path_for(&state.session.id);
+        let model = state.config.model.clone();
+        let _ = state.session.record_model_to(&path, &model);
     } else {
-        if let Err(e) = state.rebuild_agent(false) {
-            emit(events_tx, format!("rebuild failed: {e}"));
-            return;
-        }
-        state.agent.clear_history();
-        state.session = Session::new(&state.config.model, state.session.cwd.clone());
+        state.session.model = state.config.model.clone();
     }
 
     // Persist the model choice to project settings so a restart lands
@@ -3344,15 +3988,10 @@ async fn switch_model(
     let _ = project.save();
 
     let provider = state.config.detect_provider().unwrap_or("unknown");
-    let session_note = if same_family {
-        "conversation preserved".to_string()
-    } else {
-        format!("new session {}", state.session.id)
-    };
     emit(
         events_tx,
         format!(
-            "model → {} (provider: {provider}; saved to .thclaws/settings.json; {session_note})",
+            "model → {} (provider: {provider}; saved to .thclaws/settings.json; conversation preserved)",
             state.config.model
         ),
     );
@@ -3366,6 +4005,9 @@ async fn switch_model(
     let (ctx, src) =
         crate::model_catalogue::effective_context_window_with(&cat, &state.config.model);
     if !src.is_known() {
+        // Re-derive the provider kind from the now-active model — the
+        // intra/cross-family classification we used pre-#142 is gone.
+        let new_kind = crate::providers::ProviderKind::detect(&state.config.model);
         let is_ollama = matches!(
             new_kind,
             Some(crate::providers::ProviderKind::Ollama)
@@ -3430,11 +4072,9 @@ async fn switch_model(
             );
         }
     }
-    // Only reset the view's history when we actually forked. On a same-
-    // family swap the bubbles / terminal replay stays as-is.
-    if !same_family {
-        let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
-    }
+    // Never reset the view's history on a model swap — the bubbles /
+    // terminal replay stay as-is and the next turn continues the
+    // conversation under the new provider.
     let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
         &state.session_store,
         &state.session.id,
@@ -3509,6 +4149,471 @@ fn doctor_report(state: &WorkerState) -> String {
 
 fn emit(events_tx: &broadcast::Sender<ViewEvent>, text: String) {
     let _ = events_tx.send(ViewEvent::SlashOutput(text));
+}
+
+/// Starter `.md` body for `/agent new` — a commented frontmatter
+/// skeleton plus a system-prompt stub. Mirrors the field set the
+/// parser understands (see [`crate::agent_defs`]).
+fn agent_starter_template(name: &str) -> String {
+    format!(
+        "---\n\
+         name: {name}\n\
+         description: \n\
+         tools: Read, Glob, Grep\n\
+         permissionMode: ask\n\
+         maxTurns: 20\n\
+         color: cyan\n\
+         ---\n\n\
+         You are the {name} agent.\n\n\
+         Describe the task this agent should focus on, what to return, and \
+         anything it must not do.\n"
+    )
+}
+
+/// dev-plan/32 Tier 3 `/workflow run` for the GUI / chat surface.
+/// Author phase calls the model; review phase emits
+/// `ViewEvent::WorkflowReviewRequest` and awaits the
+/// `WorkflowApprover`'s oneshot for an Approve / Cancel / Rework
+/// decision. Rework loops back into the author phase carrying the
+/// user's revision note + a bumped revision counter so the bubble
+/// can show "Revision 2" / "Revision 3" labels.
+async fn dispatch_workflow_run(
+    prompt: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let goal = prompt.trim();
+    if goal.is_empty() {
+        emit(events_tx, "/workflow run: missing goal".to_string());
+        let _ = events_tx.send(ViewEvent::TurnDone);
+        return;
+    }
+    let provider = match crate::repl::build_provider(&state.config) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow run: can't build provider: {e}"),
+            );
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        }
+    };
+
+    let workflow_id = crate::workflow::generate_workflow_id();
+    let mut revision_note: Option<String> = None;
+    let mut revision: u32 = 0;
+
+    loop {
+        emit(
+            events_tx,
+            format!(
+                "/workflow run: authoring script (model={}, revision {})…",
+                state.config.model,
+                revision + 1
+            ),
+        );
+        let script = match crate::workflow::author(
+            provider.as_ref(),
+            &state.config.model,
+            goal,
+            revision_note.as_deref(),
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                emit(events_tx, format!("/workflow run: author failed: {e}"));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+        };
+
+        let _ = events_tx.send(ViewEvent::WorkflowReviewRequest {
+            id: workflow_id.clone(),
+            prompt: goal.to_string(),
+            script: script.clone(),
+            model: state.config.model.clone(),
+            revision,
+        });
+
+        let decision = state.workflow_approver.request(workflow_id.clone()).await;
+        match decision {
+            crate::workflow::WorkflowDecision::Approve => {
+                run_workflow_inline(state, events_tx, goal, script, None).await;
+                // TurnDone clears the chat-tab `streaming` flag so the
+                // Stop button stops showing and Send re-enables.
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            crate::workflow::WorkflowDecision::Cancel => {
+                emit(events_tx, "/workflow run: cancelled".to_string());
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            crate::workflow::WorkflowDecision::Rework(note) => {
+                revision_note = Some(note);
+                revision += 1;
+                // Loop and re-author with the revision note.
+            }
+        }
+    }
+}
+
+async fn dispatch_workflow_resume(
+    prefix: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: can't read cwd: {e}"));
+            return;
+        }
+    };
+    let id = match crate::workflow::resolve_id_prefix(&cwd, &prefix) {
+        Ok(id) => id,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: {e}"));
+            return;
+        }
+    };
+    let script = match crate::workflow::read_workflow_script(&cwd, &id) {
+        Ok(s) => s,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow resume: can't read script.js for {id}: {e}"),
+            );
+            return;
+        }
+    };
+    let cache = match crate::workflow::read_completed_workers(&cwd, &id) {
+        Ok(v) => v,
+        Err(e) => {
+            emit(events_tx, format!("/workflow resume: {e}"));
+            return;
+        }
+    };
+    emit(
+        events_tx,
+        format!(
+            "/workflow resume: id={id} — {} cached worker(s)",
+            cache.len()
+        ),
+    );
+    run_workflow_inline(state, events_tx, "(resume)", script, Some((id, cache))).await;
+    // Mirror dispatch_workflow_run: clear chat-tab streaming flag so
+    // the Stop button hides after a resumed workflow ends (or is
+    // cancelled mid-run by the user).
+    let _ = events_tx.send(ViewEvent::TurnDone);
+}
+
+/// Mid-session equivalent of `thclaws --workflow <path>`: read a
+/// pre-authored script from disk and execute it under the active
+/// session — skipping the `/workflow run` author + review phase
+/// entirely. Output streams through the chat tab via the same
+/// `run_workflow_inline` engine that powers `/workflow run` /
+/// `/workflow resume`.
+async fn dispatch_workflow_exec(
+    path: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+) {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        emit(events_tx, "/workflow exec: missing path".to_string());
+        return;
+    }
+    let script_path = std::path::PathBuf::from(trimmed);
+    let script = match std::fs::read_to_string(&script_path) {
+        Ok(s) => s,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!(
+                    "/workflow exec: can't read '{}': {e}",
+                    script_path.display()
+                ),
+            );
+            return;
+        }
+    };
+    emit(
+        events_tx,
+        format!("/workflow exec: running {}…", script_path.display()),
+    );
+    let label = format!("(exec {})", script_path.display());
+    run_workflow_inline(state, events_tx, &label, script, None).await;
+    // Same chat-tab streaming-flag cleanup as the other two entry points.
+    let _ = events_tx.send(ViewEvent::TurnDone);
+}
+
+/// Shared spawn_blocking + thread-locals wiring used by
+/// `dispatch_workflow_run` (fresh) and `dispatch_workflow_resume`
+/// (with cache). Streams the final result + cost summary back through
+/// `emit`. Stage F/G/H/I/K behaviours all participate (logger, usage
+/// sink, replay cache); only the per-worker progress lines (Stage E)
+/// don't reach the chat surface since they print to stdout.
+async fn run_workflow_inline(
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    goal: &str,
+    script: String,
+    resume: Option<(String, Vec<(String, String)>)>,
+) {
+    let cwd_for_persist = std::env::current_dir().ok();
+    let (workflow_id, cache, is_resume) = match resume {
+        Some((id, c)) => (id, c, true),
+        None => (crate::workflow::generate_workflow_id(), Vec::new(), false),
+    };
+
+    let logger_handle: Option<crate::workflow::LoggerHandle> = match cwd_for_persist
+        .as_ref()
+        .and_then(|cwd| crate::workflow::WorkflowLogger::new(workflow_id.clone(), cwd).ok())
+    {
+        Some(mut l) => {
+            if is_resume {
+                l.set_next_worker_id(cache.len() as u32);
+            } else {
+                let _ = l.start(goal, &script);
+                if let Some(cwd) = cwd_for_persist.as_ref() {
+                    let _ = crate::workflow::write_workflow_script(cwd, &workflow_id, &script);
+                }
+            }
+            Some(std::sync::Arc::new(std::sync::Mutex::new(l)))
+        }
+        None => {
+            emit(
+                events_tx,
+                "/workflow run: state.jsonl unavailable — proceeding without checkpoint"
+                    .to_string(),
+            );
+            None
+        }
+    };
+    if !is_resume {
+        emit(events_tx, format!("/workflow run: id={workflow_id}"));
+    }
+
+    let task_tool = state.tool_registry.get(crate::subagent::TOOL_NAME);
+    let logger_for_thread = logger_handle.clone();
+    let cache_for_thread = if cache.is_empty() { None } else { Some(cache) };
+    // Tier 3 polish: pass the chat broadcast sender into the
+    // spawn_blocking thread so each thclaws.subagent host call can emit
+    // ToolCallStart/Result events, rendering worker progression in the
+    // chat tab as one-line `▸ … ✓` bubbles.
+    let events_tx_for_thread = events_tx.clone();
+    // Stop-button: clone the worker cancel token so the workflow runtime
+    // can observe `shared.cancel.cancel()` (fired by `shell_cancel` IPC)
+    // mid-worker via `tokio::select!`. Reset after the run so the next
+    // turn isn't pre-cancelled.
+    let cancel_for_thread = state.cancel.clone();
+    let include_base_for_thread = cwd_for_persist.clone();
+
+    type WfBlockingOut = (
+        std::result::Result<String, String>,
+        Vec<crate::providers::Usage>,
+        usize,
+    );
+    let started = std::time::Instant::now();
+    let outcome: std::result::Result<WfBlockingOut, tokio::task::JoinError> =
+        tokio::task::spawn_blocking(move || {
+            crate::workflow::set_task_tool(task_tool);
+            crate::workflow::set_logger(logger_for_thread);
+            crate::workflow::set_usage_sink(true);
+            crate::workflow::set_replay_cache(cache_for_thread);
+            crate::workflow::set_events_tx(Some(events_tx_for_thread));
+            crate::workflow::set_cancel(Some(cancel_for_thread));
+            crate::workflow::set_include_base(include_base_for_thread);
+            let res = (|| -> std::result::Result<String, String> {
+                let mut sandbox =
+                    crate::workflow::WorkflowSandbox::new().map_err(|e| e.to_string())?;
+                sandbox.run(&script).map_err(|e| e.to_string())
+            })();
+            let usages = crate::workflow::take_all_usages();
+            let remaining = crate::workflow::replay_remaining();
+            crate::workflow::set_task_tool(None);
+            crate::workflow::set_logger(None);
+            crate::workflow::set_usage_sink(false);
+            crate::workflow::set_replay_cache(None);
+            crate::workflow::set_events_tx(None);
+            crate::workflow::set_cancel(None);
+            crate::workflow::set_include_base(None);
+            (res, usages, remaining)
+        })
+        .await;
+
+    let (result, usages, remaining) = match outcome {
+        Ok(t) => t,
+        Err(e) => {
+            emit(
+                events_tx,
+                format!("/workflow run: worker thread panicked: {e}"),
+            );
+            return;
+        }
+    };
+
+    // Stop-button: detect a cancel triggered mid-run. Either the JS
+    // script unwound cleanly with the sentinel error, or it caught the
+    // throw and ran to completion — in the latter case the token is
+    // still set, so we treat it as cancelled regardless. Reset the
+    // shared token afterwards so the next user turn starts clean.
+    let was_cancelled = state.cancel.is_cancelled()
+        || matches!(&result, Err(e) if e.contains(crate::workflow::WORKFLOW_CANCELLED_MSG));
+    if was_cancelled {
+        state.cancel.reset();
+    }
+
+    if let Some(handle) = &logger_handle {
+        if let Ok(mut l) = handle.lock() {
+            let _ = match (&result, was_cancelled) {
+                (_, true) => l.error(crate::workflow::WORKFLOW_CANCELLED_MSG),
+                (Ok(text), _) => l.done(text),
+                (Err(e), _) => l.error(e),
+            };
+        }
+    }
+
+    let elapsed = crate::tool_display::format_duration(started.elapsed());
+    let total_in: u64 = usages.iter().map(|u| u.input_tokens as u64).sum();
+    let total_out: u64 = usages.iter().map(|u| u.output_tokens as u64).sum();
+    let diverged = if remaining > 0 {
+        format!(" — {remaining} cache unused (diverged)")
+    } else {
+        String::new()
+    };
+    let status_word = if was_cancelled { "stopped" } else { "done" };
+    emit(
+        events_tx,
+        format!(
+            "workflow {status_word} — {} workers, {elapsed}, {total_in}in / {total_out}out{diverged}",
+            usages.len()
+        ),
+    );
+
+    match (result, was_cancelled) {
+        (_, true) => emit(events_tx, "/workflow run: stopped by user".to_string()),
+        (Ok(text), _) => emit(events_tx, text),
+        (Err(e), _) => emit(events_tx, format!("/workflow run: script failed: {e}")),
+    }
+}
+
+fn dispatch_workflow_list(events_tx: &broadcast::Sender<ViewEvent>) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow list: can't read cwd: {e}"));
+            return;
+        }
+    };
+    match crate::workflow::list_workflows(&cwd) {
+        Ok(workflows) if workflows.is_empty() => {
+            emit(
+                events_tx,
+                "no workflows under .thclaws/workflows/".to_string(),
+            );
+        }
+        Ok(workflows) => {
+            let mut lines = Vec::new();
+            for wf in &workflows {
+                let preview = if wf.prompt.chars().count() > 60 {
+                    let head: String = wf.prompt.chars().take(60).collect();
+                    format!("{head}…")
+                } else {
+                    wf.prompt.clone()
+                };
+                let id_short: String = wf.id.chars().take(20).collect();
+                let err_suffix = if wf.workers_error > 0 {
+                    format!(" ({} err)", wf.workers_error)
+                } else {
+                    String::new()
+                };
+                lines.push(format!(
+                    "  {id_short}  {icon} {done}/{started}w{err_suffix}  {preview}",
+                    icon = wf.status.icon(),
+                    done = wf.workers_done,
+                    started = wf.workers_started,
+                ));
+            }
+            emit(events_tx, lines.join("\n"));
+        }
+        Err(e) => {
+            emit(events_tx, format!("/workflow list: {e}"));
+        }
+    }
+}
+
+fn dispatch_workflow_inspect(prefix: String, events_tx: &broadcast::Sender<ViewEvent>) {
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: can't read cwd: {e}"));
+            return;
+        }
+    };
+    let id = match crate::workflow::resolve_id_prefix(&cwd, &prefix) {
+        Ok(id) => id,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: {e}"));
+            return;
+        }
+    };
+    let events = match crate::workflow::read_events(&cwd, &id) {
+        Ok(e) => e,
+        Err(e) => {
+            emit(events_tx, format!("/workflow inspect: {e}"));
+            return;
+        }
+    };
+    let take_preview = |s: &str, cap: usize| -> String {
+        if s.chars().count() > cap {
+            let head: String = s.chars().take(cap).collect();
+            format!("{head}…")
+        } else {
+            s.to_string()
+        }
+    };
+    let mut lines = vec![format!("workflow {id}")];
+    for ev in &events {
+        let kind = ev.get("kind").and_then(|k| k.as_str()).unwrap_or("?");
+        let ts = ev.get("ts").and_then(|t| t.as_str()).unwrap_or("?");
+        match kind {
+            "start" => {
+                let prompt = ev.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  start    {prompt}"));
+            }
+            "worker_start" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let prompt = ev.get("prompt").and_then(|p| p.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} →   {}", take_preview(prompt, 80)));
+            }
+            "worker_done" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let output = ev.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} ✓   {}", take_preview(output, 80)));
+            }
+            "worker_error" => {
+                let worker = ev.get("worker").and_then(|w| w.as_str()).unwrap_or("?");
+                let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  {worker} ✗   {}", take_preview(err, 80)));
+            }
+            "done" => {
+                let result = ev.get("result").and_then(|r| r.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  done     {}", take_preview(result, 80)));
+            }
+            "error" => {
+                let err = ev.get("error").and_then(|e| e.as_str()).unwrap_or("");
+                lines.push(format!("  {ts}  error    {err}"));
+            }
+            other => {
+                lines.push(format!("  {ts}  {other}"));
+            }
+        }
+    }
+    emit(events_tx, lines.join("\n"));
 }
 
 /// When LINE is currently bridged and the user just chose `auto` or
@@ -3823,25 +4928,56 @@ pub(crate) fn compose_kms_reconcile_prompt(name: &str, focus: Option<&str>, appl
     )
 }
 
+/// Compose the brief for the `kms-maintain` umbrella agent: the
+/// structural lint report + stale-marker list (the same inputs the
+/// linker gets) plus the apply/dry-run mode. The agent's own manual
+/// carries the five-stage procedure; this just feeds it the data and
+/// the mode.
+pub(crate) fn compose_kms_maintain_prompt(
+    name: &str,
+    lint: &crate::kms::LintReport,
+    stale: &[crate::kms::StaleEntry],
+    apply: bool,
+) -> String {
+    let mode_clause = if apply {
+        "**Apply mode** — execute fixes across all stages. Preserve history (never silently drop a claim) and never delete a page — the most you remove is a dead reference inside a page."
+    } else {
+        "**Dry-run mode** — make NO `KmsWrite`/`KmsAppend` calls. Report what you *would* change across every stage, then stop. The user re-runs with `--apply` to execute."
+    };
+    let mut out = format!(
+        "You are maintaining the KMS named `{name}`. Pass `kms: \"{name}\"` to every KMS tool call.\n\n{mode_clause}\n\n"
+    );
+    out.push_str("## Structural report (lint)\n\n");
+    out.push_str(&crate::kms::format_lint_report(name, lint));
+    out.push_str("\n\n## Stale markers\n\n");
+    if stale.is_empty() {
+        out.push_str("- none\n");
+    } else {
+        for entry in stale {
+            out.push_str(&format!(
+                "- `{}`: source `{}` re-ingested on {}\n",
+                entry.page_stem, entry.source_alias, entry.date
+            ));
+        }
+    }
+    out.push_str(
+        "\nWork your five-stage operating procedure in order (structural fixes → \
+         source reconciliation against live sessions → stale refresh → contradiction \
+         reconciliation → orphans). Use TodoWrite to track stages, and finish with the \
+         staged final report.\n",
+    );
+    out
+}
+
 // `format_schedule_preset_list` and `format_migration_report` moved to
 // their data-owning modules (schedule_presets / kms) in M6.38.3. See
 // the comment above `format_lint_report`'s removal for rationale.
 
-/// M6.25 BUG #4: alias-sanitizer used by /kms file-answer. Same rules
-/// as `kms::sanitize_alias` (which is private to that module).
+/// M6.25 BUG #4: alias-sanitizer used by /kms file-answer. Delegates to
+/// the canonical `kms::sanitize_alias` so Thai/non-Latin titles survive
+/// here too (they used to fold to empty).
 fn sanitize_alias_for_dispatch(raw: &str) -> String {
-    let cleaned: String = raw
-        .trim()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    cleaned.trim_matches('_').to_string()
+    crate::kms::sanitize_alias(raw)
 }
 
 /// Same shape as [`broadcast_kms_update`], for the MCP-server list. Read
@@ -3888,6 +5024,15 @@ async fn persist_and_register_mcp(
                     state.tool_registry.register(std::sync::Arc::new(tool));
                 }
                 state.mcp_clients.push(client);
+                // Refresh the system prompt FIRST so the new server's
+                // InitializeResult.instructions land in the
+                // `# MCP server instructions` section and the factory
+                // snapshot picks up the new tools — matches the
+                // McpReady path in shared_session.rs. Pre-fix this
+                // path only called rebuild_agent, so the new tools
+                // reached the parent but the system prompt's MCP
+                // section stayed stale until the next /reload.
+                state.rebuild_system_prompt();
                 if let Err(e) = state.rebuild_agent(true) {
                     emit(events_tx, format!("rebuild failed: {e}"));
                     return;

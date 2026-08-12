@@ -1,21 +1,41 @@
-//! On-disk binding config at `~/.config/thclaws/line.json`.
+//! On-disk binding config at `./.thclaws/line.json` (dev-plan/33
+//! Tier 2 — project-scoped, mirrors the Telegram per-project move).
 //!
 //! Written once when the user redeems a pairing code via the GUI
 //! Line Connect modal (Phase 1.3) or the `--line-pair <code>` CLI
-//! flag. Subsequent thClaws launches read it to find the binding
-//! JWT and the relay URL, then auto-reconnect the WebSocket.
+//! flag. Subsequent thClaws launches in the same project read it to
+//! find the binding JWT and the relay URL, then auto-reconnect the
+//! WebSocket.
 //!
 //! Schema is intentionally minimal — anything else (machine
 //! label, cwd, last-active timestamp) lives inside the JWT's
 //! claims, which the server is the source of truth for.
+//!
+//! Legacy `~/.config/thclaws/line.json` is consulted as a fallback
+//! only when the env var `THCLAWS_LINE_USER_CONFIG=1` is set, so
+//! pre-Tier 2 installs keep working until the user migrates by
+//! moving the file into a project's `.thclaws/`.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::bridge::BridgeConfig;
+
 /// Default server when `server_url` isn't set explicitly. Override
 /// in dev via `THCLAWS_LINE_SERVER`.
 pub const DEFAULT_SERVER_URL: &str = "https://line.thclaws.ai";
+
+/// Env opt-in for the legacy `~/.config/thclaws/line.json` fallback
+/// path. Without this, only `./.thclaws/line.json` is consulted —
+/// each project owns its own LINE binding.
+pub const USER_FALLBACK_ENV: &str = "THCLAWS_LINE_USER_CONFIG";
+
+fn user_fallback_enabled() -> bool {
+    std::env::var(USER_FALLBACK_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false)
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LineConfigError {
@@ -54,29 +74,66 @@ pub struct LineConfig {
 }
 
 impl LineConfig {
-    /// Canonical on-disk path. `None` only when no home directory
-    /// can be resolved (unusual; mostly headless/CI environments).
+    /// Project-scoped path: `./.thclaws/line.json` — resolved against
+    /// the current working directory at call time. dev-plan/33 Tier 2
+    /// moved this off the user-level path so each project owns its own
+    /// LINE binding.
     pub fn path() -> Result<PathBuf, LineConfigError> {
+        let cwd = std::env::current_dir().map_err(|source| LineConfigError::Io {
+            path: PathBuf::from("."),
+            source,
+        })?;
+        Ok(cwd.join(".thclaws").join("line.json"))
+    }
+
+    /// Legacy user-level path (`~/.config/thclaws/line.json`). Only
+    /// consulted as a fallback when `THCLAWS_LINE_USER_CONFIG=1` is
+    /// set — pre-Tier 2 installs had their binding here.
+    pub fn legacy_user_path() -> Result<PathBuf, LineConfigError> {
         let home = crate::util::home_dir().ok_or(LineConfigError::NoHome)?;
         Ok(home.join(".config").join("thclaws").join("line.json"))
     }
 
-    /// Read from disk. `Ok(None)` when the file is absent — the
-    /// caller treats this as "LINE bridge not configured", which
-    /// is the default state for a fresh install.
+    /// Read from disk. Project path first; legacy user path as
+    /// opt-in fallback. `Ok(None)` when both are absent (the
+    /// default state for a fresh install).
     pub fn load() -> Result<Option<Self>, LineConfigError> {
-        let path = Self::path()?;
-        match std::fs::read_to_string(&path) {
+        let project_path = Self::path()?;
+        match std::fs::read_to_string(&project_path) {
+            Ok(body) => {
+                return serde_json::from_str(&body).map(Some).map_err(|source| {
+                    LineConfigError::Json {
+                        path: project_path,
+                        source,
+                    }
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(LineConfigError::Io {
+                    path: project_path,
+                    source,
+                });
+            }
+        }
+        if !user_fallback_enabled() {
+            return Ok(None);
+        }
+        let user_path = Self::legacy_user_path()?;
+        match std::fs::read_to_string(&user_path) {
             Ok(body) => {
                 serde_json::from_str(&body)
                     .map(Some)
                     .map_err(|source| LineConfigError::Json {
-                        path: path.clone(),
+                        path: user_path,
                         source,
                     })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(source) => Err(LineConfigError::Io { path, source }),
+            Err(source) => Err(LineConfigError::Io {
+                path: user_path,
+                source,
+            }),
         }
     }
 
@@ -119,59 +176,10 @@ impl LineConfig {
         }
     }
 
-    /// Resolve the relay URL for this binding. Precedence: explicit
-    /// `server_url` in the saved config → `THCLAWS_LINE_SERVER` env
-    /// → `DEFAULT_SERVER_URL`.
-    pub fn resolved_server_url(&self) -> String {
-        if let Some(url) = self.server_url.as_deref() {
-            return url.trim_end_matches('/').to_string();
-        }
-        if let Ok(url) = std::env::var("THCLAWS_LINE_SERVER") {
-            if !url.trim().is_empty() {
-                return url.trim_end_matches('/').to_string();
-            }
-        }
-        DEFAULT_SERVER_URL.to_string()
-    }
-
-    /// Build the `wss://…/ws?token=<jwt>` URL the WS client opens.
-    pub fn ws_url(&self) -> String {
-        let base = self.resolved_server_url();
-        let scheme = if base.starts_with("http://") {
-            "ws://"
-        } else {
-            "wss://"
-        };
-        let host = base
-            .trim_start_matches("https://")
-            .trim_start_matches("http://");
-        format!(
-            "{scheme}{host}/ws?token={}",
-            urlencoding::encode(&self.binding_token)
-        )
-    }
-
-    /// Build the absolute `POST /reply/<request_id>` URL.
-    pub fn reply_url(&self, request_id: &str) -> String {
-        format!(
-            "{}/reply/{}",
-            self.resolved_server_url(),
-            urlencoding::encode(request_id)
-        )
-    }
-
-    /// Build the absolute `POST /unpair` URL.
-    pub fn unpair_url(&self) -> String {
-        format!("{}/unpair", self.resolved_server_url())
-    }
-
-    /// Build the absolute `POST /push` URL. Used for unsolicited
-    /// messages from thClaws — approval prompts, timeout notices.
-    /// `/reply/:id` is the wrong primitive for these because there's
-    /// no inbound webhook event to provide a `replyToken`.
-    pub fn push_url(&self) -> String {
-        format!("{}/push", self.resolved_server_url())
-    }
+    // `resolved_server_url` / `ws_url` / `reply_url` / `push_url` /
+    // `unpair_url` now come from the shared `BridgeConfig` trait
+    // (dev-plan/44 Tier 0) — see the `impl BridgeConfig for LineConfig`
+    // below. LINE-only routes (chat-bridge) stay here.
 
     /// Build the absolute `POST /chat-bridge/event` URL. Used to
     /// fan out per-turn `ViewEvent`s (assistant text deltas, tool
@@ -190,9 +198,27 @@ impl LineConfig {
     }
 }
 
+impl BridgeConfig for LineConfig {
+    fn binding_token(&self) -> &str {
+        &self.binding_token
+    }
+    fn server_url_override(&self) -> Option<&str> {
+        self.server_url.as_deref()
+    }
+    fn server_env_var(&self) -> &'static str {
+        "THCLAWS_LINE_SERVER"
+    }
+    fn default_server(&self) -> &'static str {
+        DEFAULT_SERVER_URL
+    }
+    // route_prefix defaults to "" — LINE's outbound routes are
+    // `/reply`, `/push` (no channel namespace).
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge::BridgeConfig;
 
     #[test]
     fn server_url_precedence_config_over_env_over_default() {

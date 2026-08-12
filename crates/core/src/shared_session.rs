@@ -12,16 +12,15 @@
 
 use crate::agent::{Agent, AgentEvent};
 use crate::config::AppConfig;
-use crate::context::ProjectContext;
 use crate::error::{Error, Result as CoreResult};
-use crate::memory::MemoryStore;
 use crate::providers::{EventStream, Provider, StreamRequest};
 use crate::repl::{build_provider, build_provider_with_fallback};
 use crate::session::{Session, SessionStore};
 use crate::tools::ToolRegistry;
 use crate::types::{ContentBlock, Message, Role};
 use async_trait::async_trait;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -79,6 +78,15 @@ pub enum ShellInput {
     /// Raw line submitted by the user. Slash-prefix → dispatched as
     /// command, anything else → fed to the agent as a prompt.
     Line(String),
+    /// Like `Line`, but run on a throwaway child agent whose history
+    /// starts empty and is discarded when the turn ends — the shared
+    /// session and its running context are never touched. Lets a
+    /// GUI-shell agent (e.g. tutorial-studio) fire many independent
+    /// one-shot generations without the shared history — and per-turn
+    /// input tokens — growing without bound. Streams the same
+    /// text/tool_call/tool_result/done events as `Line`. Slash commands
+    /// aren't supported here (there's no persistent session to act on).
+    IsolatedLine(String),
     /// Like `Line` but with one or more inline image attachments
     /// (paste / drag-drop into the chat composer). Each attachment is
     /// `(media_type, base64_data)`. Slash commands aren't expected
@@ -122,6 +130,23 @@ pub enum ShellInput {
     /// etc.). Surface as a `ViewEvent::ErrorText` so the user sees
     /// *why* a configured MCP server never came online.
     McpFailed { server_name: String, error: String },
+    /// Connect ONE newly-configured MCP server into the running
+    /// session — the Connectors surface writes `mcp.json` and sends
+    /// this, so a connector added mid-conversation is usable on the
+    /// very next turn instead of after a restart. Same spawn →
+    /// `McpReady` fan-out the startup and `ChangeCwd` paths use.
+    McpConnect(Box<crate::mcp::McpServerConfig>),
+    /// Re-discover skills and rebuild around them. Sent after a skill
+    /// is installed from a surface that isn't the slash command (the
+    /// GUI-Shell skills panel), so the new skill is listed in
+    /// `# Available skills` for the very next turn instead of after a
+    /// restart.
+    SkillsRefresh,
+    /// Detach a server that was just removed from `mcp.json`: drop its
+    /// tools from the live registry and its client, then rebuild. The
+    /// config write alone would leave the tools advertised to the model
+    /// (and callable) for the rest of the session.
+    McpDisconnect { server_name: String },
     /// Reload `AppConfig` from disk and rebuild the agent's provider in
     /// place. Sent by the GUI after `api_key_set` / `api_key_clear` so
     /// the running session picks up the new key (and any auto-fallback
@@ -137,6 +162,12 @@ pub enum ShellInput {
     /// Lighter than [`Self::ReloadConfig`] (no provider rebuild) — only
     /// touches `state.system_prompt`.
     InstructionsChanged,
+    /// The user just saved an agent def via the GUI's `/agent new` /
+    /// `/agent edit` editor. Reload `state.agent_defs` from disk so a
+    /// newly-created agent is immediately spawnable via `/agent <name>`
+    /// in the same session. The model-driven Task tool keeps the def
+    /// snapshot it captured at init (refreshes on next session).
+    AgentDefsChanged,
     /// Widget-initiated tool call from an embedded MCP App. The
     /// originating widget called `app.callServerTool({name, arguments})`;
     /// we look up the qualified tool in the registry, run it, and
@@ -185,6 +216,22 @@ pub enum ShellInput {
         text: String,
         respond: tokio::sync::oneshot::Sender<String>,
     },
+    /// dev-plan/44 Tier 1: connect the phone-home tunnel from a saved
+    /// `PhoneHomeConfig` (boot auto-reconnect, or the GUI "Phone home"
+    /// toggle). The worker spawns the bridge session and stashes the
+    /// `PhoneHomeHandle`. Unlike LINE/Messenger it does NOT swap the
+    /// permission posture — approvals stay local (the cloud drives the
+    /// agent, so local approval prompts are the safety gate).
+    PhoneHomeConnect(crate::phone_home::PhoneHomeConfig),
+    /// dev-plan/44: IPC `phone_home_disconnect`. Worker cancels the
+    /// session, drops the handle, and deletes the on-disk config.
+    PhoneHomeDisconnect,
+    /// dev-plan/44: IPC `phone_home_pair`. Worker exchanges the stored
+    /// thClaws.cloud CLI token for a binding via the relay's `/ph/pair`,
+    /// saves `.thclaws/phone-home.json`, then connects. Carried out in a
+    /// spawned task (it does a network round-trip) that emits a
+    /// `PhoneHomeConnect` on success.
+    PhoneHomePair,
     /// dev-plan/29 Tier 1: connect the Telegram bridge from a saved
     /// `TelegramConfig` (GUI Connect modal, or boot auto-reconnect). The
     /// worker validates the token via `getMe`, spawns the polling
@@ -201,6 +248,10 @@ pub enum ShellInput {
     /// then chunks + sends it back via `sendMessage`.
     TelegramMessage {
         text: String,
+        /// Attachments as `(media_type, base64)` — a Telegram photo
+        /// (public issue #187). Empty for a plain text message, which
+        /// keeps that path on `handle_line` exactly as before.
+        images: Vec<(String, String)>,
         respond: tokio::sync::oneshot::Sender<String>,
     },
     /// dev-plan/29: owner approved a pairing code in the GUI. Worker
@@ -269,7 +320,33 @@ pub enum ViewEvent {
         ui_resource: Option<crate::tools::UiResource>,
     },
     SlashOutput(String),
+    /// dev-plan/32 Tier 3 GUI approval. Fired by `/workflow run`
+    /// from the chat surface — the frontend renders a review bubble
+    /// with the script + Approve / Cancel / Re-author buttons. Each
+    /// button click posts back a `workflow_decision` IPC message
+    /// carrying this `id`, which the IPC handler routes to the
+    /// `WorkflowApprover` waiting on the matching oneshot.
+    WorkflowReviewRequest {
+        id: String,
+        prompt: String,
+        script: String,
+        model: String,
+        revision: u32,
+    },
     TurnDone,
+    /// Per-turn token/cost footer (GUI parity with the CLI REPL's
+    /// `[tokens: …in/…out · …s · $… session]` line). Carries the plain
+    /// text; the chat surface renders it as a dim footer line and the
+    /// terminal surface prints it dim. Emitted just before `TurnDone`.
+    TurnUsage(String),
+    /// The process-wide agent_activity busy state transitioned. The
+    /// event-translator turns this into a `gui_busy_changed` IPC
+    /// envelope carrying the current `busy_meta()` so the workspace
+    /// UI's running chip + the cloud-dashboard pill can update
+    /// without polling. Fired at user-facing turn boundaries (start
+    /// + end). Side-channel turns (auto-learn ingest/reconcile) do
+    /// not fire this — they don't change the surface meta.
+    BusyChanged,
     HistoryReplaced(Vec<DisplayMessage>),
     SessionListRefresh(String),
     /// Sidebar provider/model update — carries a pre-built JSON
@@ -278,6 +355,15 @@ pub enum ViewEvent {
     /// active model (e.g. auto-switch during `/load`) so the sidebar
     /// reflects the new state without waiting for the 5 s config-poll.
     ProviderUpdate(String),
+    /// Settings-derived UI flags (shellTabEnabled, teamEnabled, …) may
+    /// have changed. Carries a pre-built `{"type":"settings_changed"}`
+    /// envelope. Emitted after a `ShellInput::ReloadConfig` completes —
+    /// either from the manual `settings_reload` IPC or from the file
+    /// watcher on `.thclaws/settings.json`. App.tsx subscribes and
+    /// re-fetches per-flag IPCs (shell_tab_enabled_get,
+    /// team_enabled_get) so tab visibility refreshes without a page
+    /// reload.
+    SettingsChanged(String),
     /// Sidebar KMS list refresh — pre-built JSON payload shaped like
     /// `{type: "kms_update", kmss: [{name, scope, active}, ...]}`.
     /// Emitted after `/kms new | use | off` so the sidebar reflects
@@ -330,6 +416,21 @@ pub enum ViewEvent {
     /// CLI renderer ignores this; the REPL handler prints help text
     /// instead since a multi-field form doesn't fit a terminal line.
     ScheduleAddOpen(String),
+    /// Open the agent-editor modal — pre-built JSON payload shaped
+    /// `{type: "agent_editor_open", mode: "new"|"edit", name, body}`
+    /// where `body` is the full `.md` (YAML frontmatter + system
+    /// prompt). Emitted by `/agent new` / `/agent edit` from a GUI
+    /// surface; the CLI renderer ignores it (the REPL handler prints a
+    /// GUI-only hint). Save round-trips via the `agent_save` IPC.
+    AgentEditorOpen(String),
+    /// Open the unified marketplace browser modal — pre-built JSON
+    /// payload `{type:"marketplace_open", source, cacheAge, catalog:{
+    /// skills,mcp_servers,plugins,subagents}, installed:{skills,subagents}}`.
+    /// Emitted by `/marketplace` from a GUI surface. Install + refresh
+    /// happen by injecting slash commands through the `shell_input` IPC,
+    /// so there's no dedicated install channel. CLI renderer ignores it
+    /// (the REPL `/marketplace` prints a combined text summary instead).
+    MarketplaceOpen(String),
     /// The session's on-disk JSONL has crossed the fork threshold.
     /// Frontend renders a dismissible banner with a "Fork into new
     /// session with summary" action. Fired once per session.
@@ -356,6 +457,10 @@ pub enum ViewEvent {
     /// `UserEvent::QuitRequested` so the tao loop runs the same
     /// save-and-exit path as the window-close button. Issue #52.
     QuitRequested,
+    /// Worker → event-loop signal: GUI `/reload`. The loop persists the
+    /// current window size (the re-exec otherwise restores the size from
+    /// the last normal close, not the live one) then re-execs.
+    ReloadRequested,
     /// Active plan changed. `Some(plan)` for submit / update_step,
     /// `None` for clear. The translator forwards this as a
     /// `chat_plan_update` IPC envelope to the right-side
@@ -442,9 +547,51 @@ pub enum ViewEvent {
 pub struct DisplayMessage {
     pub role: String,
     pub content: String,
+    /// The model's reasoning for this turn, when it produced any. Kept
+    /// out of `content` so the surface can render it the way it renders
+    /// live reasoning — a collapsed block above the answer — rather
+    /// than inlining it into the reply text.
+    pub thinking: Option<String>,
 }
 
 impl DisplayMessage {
+    /// Same as [`from_messages`], plus the session's stored per-turn
+    /// usage footers dropped back in as `system` rows at the message
+    /// counts they were recorded at. This is what a reload should
+    /// render: the live view shows those footers, so history that
+    /// silently omits them is a different conversation.
+    pub fn from_session(session: &crate::session::Session) -> Vec<Self> {
+        let usage = &session.turn_usage;
+        if usage.is_empty() {
+            return Self::from_messages(&session.messages);
+        }
+        let mut out: Vec<Self> = Vec::new();
+        let mut next = 0usize;
+        for (i, _) in session.messages.iter().enumerate() {
+            // Rebuild one message at a time so a footer recorded at
+            // `after = N` lands after exactly N messages' worth of rows.
+            out.extend(Self::from_messages(&session.messages[i..=i]));
+            while next < usage.len() && usage[next].after == i + 1 {
+                out.push(DisplayMessage {
+                    role: "system".into(),
+                    content: usage[next].text.clone(),
+                    thinking: None,
+                });
+                next += 1;
+            }
+        }
+        // Footers recorded past the end (history trimmed by a compaction
+        // since) still belong at the bottom rather than being dropped.
+        for u in &usage[next..] {
+            out.push(DisplayMessage {
+                role: "system".into(),
+                content: u.text.clone(),
+                thinking: None,
+            });
+        }
+        out
+    }
+
     pub fn from_messages(messages: &[Message]) -> Vec<Self> {
         let mut out: Vec<DisplayMessage> = Vec::new();
         // Map tool_use_id → tool name so when we later see a
@@ -470,6 +617,7 @@ impl DisplayMessage {
             // the Terminal tab) — except AskUserQuestion's, which IS
             // the user's typed reply and renders as a user bubble.
             let mut text_parts: Vec<String> = Vec::new();
+            let mut thinking_parts: Vec<String> = Vec::new();
             let mut deferred_tools: Vec<DisplayMessage> = Vec::new();
             let mut deferred_user_replies: Vec<DisplayMessage> = Vec::new();
             for b in &m.content {
@@ -479,12 +627,13 @@ impl DisplayMessage {
                     // it in the chat-list display. When the GUI gets a
                     // dedicated "show thinking" toggle, surface this
                     // there instead of the main bubble.
-                    ContentBlock::Thinking { .. } => {}
+                    ContentBlock::Thinking { content, .. } => thinking_parts.push(content.clone()),
                     ContentBlock::ToolUse { id, name, .. } => {
                         tool_use_names.insert(id.clone(), name.clone());
                         deferred_tools.push(DisplayMessage {
                             role: "tool".into(),
                             content: name.clone(),
+                            thinking: None,
                         });
                     }
                     ContentBlock::ToolResult {
@@ -508,6 +657,7 @@ impl DisplayMessage {
                                 deferred_user_replies.push(DisplayMessage {
                                     role: "user".into(),
                                     content: trimmed.to_string(),
+                                    thinking: None,
                                 });
                             }
                         }
@@ -527,10 +677,16 @@ impl DisplayMessage {
             // user message so the prior assistant question reads
             // before the answer in the chat list.
             let text = text_parts.join("\n");
-            if !text.is_empty() {
+            let thinking = if thinking_parts.is_empty() {
+                None
+            } else {
+                Some(thinking_parts.join("\n"))
+            };
+            if !text.is_empty() || thinking.is_some() {
                 out.push(DisplayMessage {
                     role: role.to_string(),
                     content: text,
+                    thinking,
                 });
             }
             out.extend(deferred_tools);
@@ -560,6 +716,26 @@ pub struct SharedSessionHandle {
     /// construction so a queue submission survives a session reload
     /// or cwd change.
     pub injection_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    /// dev-plan/32 Tier 3 workflow approver, shared between the
+    /// shared-session worker (`WorkerState.workflow_approver`) and
+    /// the IPC dispatch (`IpcContext.workflow_approver`) so both
+    /// reach the same pending-request map.
+    pub workflow_approver: std::sync::Arc<crate::workflow::WorkflowApprover>,
+    /// dev-plan/35 Tier 1 multi-tenant override: when `Some`,
+    /// session JSONLs, gui-shell storage, and usage metering for
+    /// this handle write to per-user roots instead of the cwd /
+    /// HOME-relative defaults. `None` for single-tenant `--serve`,
+    /// desktop GUI, and CLI — those use the legacy paths unchanged.
+    pub session_roots: Option<crate::multi_tenant::SessionRoots>,
+    /// docs/browser Phase 1: the engine-managed Playwright MCP client
+    /// (server name `browser`), once connected. Lets the IPC layer
+    /// drive UI-initiated, read-only calls (the Browser tab's
+    /// screenshot capture) directly on the client without routing
+    /// through the agent loop or the worker's input queue (which only
+    /// drains between turns). `None` until `McpReady` for `browser`
+    /// fires, and always `None` when `browserEnabled` is off.
+    pub browser_mcp:
+        std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<crate::mcp::McpClient>>>>,
 }
 
 impl SharedSessionHandle {
@@ -583,6 +759,13 @@ pub struct WorkerState {
     pub config: AppConfig,
     pub session: Session,
     pub session_store: Option<SessionStore>,
+    /// dev-plan/35 Tier 1: per-user roots when this worker belongs to
+    /// a multi-tenant pod, `None` for single-tenant. Forwarded from
+    /// [`spawn_with_roots`] and consulted at every site that would
+    /// otherwise pick up `SessionStore::default_path()` /
+    /// `UsageTracker::default_path()` — keeps the override sticky
+    /// across `/new`, `/reload`, model swaps, and session forks.
+    pub session_roots: Option<crate::multi_tenant::SessionRoots>,
     pub tool_registry: ToolRegistry,
     pub system_prompt: String,
     pub cwd: PathBuf,
@@ -592,6 +775,11 @@ pub struct WorkerState {
     /// UI (GUI modal vs REPL prompt) without silently falling back to
     /// AutoApprover.
     pub approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
+    /// dev-plan/32 Tier 3: chat-surface `/workflow run` posts a
+    /// review request and awaits the user's button click here. The
+    /// IPC handler resolves pending requests via `resolve()` when the
+    /// frontend posts back a `workflow_decision` message.
+    pub workflow_approver: std::sync::Arc<crate::workflow::WorkflowApprover>,
     /// Shared handle into the SkillTool's internal store. `/skill
     /// install` replaces the store contents through this handle so a
     /// fresh skill is callable in the same session without restart.
@@ -637,6 +825,15 @@ pub struct WorkerState {
     /// channels inherit the same provider, base tools, system prompt,
     /// and approver as the main agent.
     pub agent_factory: std::sync::Arc<dyn crate::subagent::AgentFactory>,
+    /// Live snapshot of `system_prompt` + `tool_registry` shared with
+    /// the `agent_factory` above so subagents spawned via Task pick
+    /// up `/mcp add` / `/skill install` / `/kms use` and folder-
+    /// instructions / memory edits without a `/reload`. Pre-fix the
+    /// factory captured these at worker init and never refreshed —
+    /// `rebuild_system_prompt` updated `self.system_prompt` and the
+    /// live `self.agent`, but the factory kept seeing the startup
+    /// snapshot. See [`crate::subagent::FactorySnapshot`] docs.
+    pub factory_snapshot: std::sync::Arc<std::sync::RwLock<crate::subagent::FactorySnapshot>>,
     /// Loaded agent definitions (`.thclaws/agents/*.md` + plugin agent
     /// dirs). Side-channel `/agent` validates names against this list
     /// before spawning; the factory uses it to register a Task tool
@@ -663,6 +860,11 @@ pub struct WorkerState {
     /// approver, restored on disconnect. Mirrors `line_pre_*`.
     pub telegram_pre_mode: Option<crate::permissions::PermissionMode>,
     pub telegram_pre_approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
+    /// dev-plan/44 Tier 1: active phone-home tunnel session. `Some` only
+    /// while the bridge WS task is running; `phone_home_disconnect`
+    /// cancels + clears it. No pre-mode/approver stash — phone-home keeps
+    /// approvals local (see `ShellInput::PhoneHomeConnect`).
+    pub phone_home_session: Option<crate::phone_home::PhoneHomeHandle>,
     /// dev-plan/31: active Facebook Page Messenger bridge session. `Some`
     /// only while the relay WS task is running; `messenger_disconnect`
     /// cancels + clears it. Mirrors `line_session`.
@@ -681,6 +883,14 @@ pub struct WorkerState {
     /// `/cost` slash command and pushed to the Cardputer display via
     /// `cost_bridge`. Zeroed by `/cost reset` or by a buddy-side reset.
     pub session_cost_usd: f64,
+    /// SHA-fingerprint of the last `.thclaws/settings.json` bytes that
+    /// drove a successful `ReloadConfig`. Used to dedup back-to-back
+    /// reloads from the slash command that wrote the file plus the
+    /// debounced file-watcher that picked the same write up 500ms
+    /// later — both fire `ReloadConfig`, both did the work, the user
+    /// saw "(provider reloaded: …)" twice. `None` until the first
+    /// successful reload.
+    pub last_settings_fingerprint: Option<u64>,
     /// Optional BLE bridge to a thClaws-Cost Cardputer. `Some` whenever
     /// the worker spawned a bridge at startup (default for both CLI and
     /// GUI modes when the `cost_bridge` feature is on); `None` when the
@@ -716,8 +926,47 @@ impl WorkerState {
             None
         };
         let provider = build_provider(&self.config)?;
+        // Settings-gated tools must track the CURRENT config. The
+        // agent-install path flips `imageToolsEnabled` mid-session and
+        // the settings watcher lands here — pre-fix the registry was a
+        // boot-time snapshot, so TextToImage answered "unknown tool"
+        // until a full engine restart.
+        if self.config.image_tools_enabled {
+            self.tool_registry
+                .register(std::sync::Arc::new(crate::tools::TextToImageTool));
+            self.tool_registry
+                .register(std::sync::Arc::new(crate::tools::ImageToImageTool));
+            self.tool_registry
+                .register(std::sync::Arc::new(crate::tools::TextToSpeechTool));
+            self.tool_registry
+                .register(std::sync::Arc::new(crate::tools::RenderSlidesTool));
+            self.tool_registry
+                .register(std::sync::Arc::new(crate::tools::TextToVideoTool));
+            self.tool_registry
+                .register(std::sync::Arc::new(crate::tools::ImageToVideoTool));
+            self.tool_registry
+                .register(std::sync::Arc::new(crate::tools::MediaJobStatusTool));
+        } else {
+            self.tool_registry.remove("TextToImage");
+            self.tool_registry.remove("ImageToImage");
+            self.tool_registry.remove("TextToVideo");
+            self.tool_registry.remove("ImageToVideo");
+            self.tool_registry.remove("MediaJobStatus");
+        }
+
+        if self.config.hal_enabled {
+            self.tool_registry.register(std::sync::Arc::new(
+                crate::tools::YouTubeTranscriptTool::new(),
+            ));
+            self.tool_registry
+                .register(std::sync::Arc::new(crate::tools::WebScrapeTool::new()));
+        } else {
+            self.tool_registry.remove("YouTubeTranscript");
+            self.tool_registry.remove("WebScrape");
+        }
         let prev_perm = self.agent.permission_mode;
         let prev_thinking = self.agent.thinking_budget;
+        let prev_ask_tools = self.agent.ask_tools.clone();
         let new_agent = Agent::new(
             provider,
             self.tool_registry.clone(),
@@ -734,6 +983,7 @@ impl WorkerState {
         self.agent = new_agent;
         self.agent.permission_mode = prev_perm;
         self.agent.thinking_budget = prev_thinking;
+        self.agent.ask_tools = prev_ask_tools;
         // Re-wire the externally-held injection queue (#106) so
         // anything queued during the rebuild doesn't get orphaned on
         // the old agent's Vec.
@@ -741,6 +991,14 @@ impl WorkerState {
         if let Some(h) = prev_history {
             self.agent.set_history(h);
         }
+        // L5: `rebuild_agent` mutates `tool_registry` directly (the
+        // image/video tool toggle above). Keep the subagent factory's
+        // snapshot in step so a Task spawned after a settings-driven
+        // rebuild (e.g. `imageToolsEnabled` flip via the settings
+        // watcher) sees the same tool set the parent does. Callers that
+        // also rebuild the prompt sync again — `sync_factory_snapshot`
+        // is idempotent.
+        self.sync_factory_snapshot();
         Ok(())
     }
 
@@ -753,8 +1011,46 @@ impl WorkerState {
     /// the Settings menu emitted "system prompt rebuilt" but the new
     /// content didn't actually reach the model until a restart.
     pub fn rebuild_system_prompt(&mut self) {
-        self.system_prompt = build_system_prompt(&self.config, &self.cwd, &self.skill_store);
+        let mcp_instructions = crate::mcp::collect_mcp_instructions(&self.mcp_clients);
+        self.system_prompt = build_system_prompt(
+            &self.config,
+            &self.cwd,
+            &self.skill_store,
+            &mcp_instructions,
+        );
         self.agent.set_system(self.system_prompt.clone());
+        // Propagate to the subagent factory's live snapshot so a
+        // subagent spawned after this sees the same system the parent
+        // agent does. Pre-fix the factory captured system + base_tools
+        // at worker init and never refreshed.
+        self.sync_factory_snapshot();
+    }
+
+    /// Push the worker's current `system_prompt` + `tool_registry`
+    /// into the factory's shared snapshot. Call after any path that
+    /// mutates `tool_registry` (`/mcp add` register, `/mcp` disconnect
+    /// remove, KMS tool shape-shift) so subagents see the live set
+    /// of tools — Production AgentFactory's `base_tools` field used
+    /// to be a one-shot snapshot at worker init.
+    ///
+    /// Cheap: ToolRegistry clone is just cloning a HashMap of Arc'd
+    /// tools (refcount bumps, no tool work). The RwLock is held for
+    /// a few field writes and nothing else.
+    pub fn sync_factory_snapshot(&self) {
+        // L2: recover from a poisoned lock rather than panicking.
+        let mut snap = self
+            .factory_snapshot
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        snap.system = self.system_prompt.clone();
+        snap.tools = self.tool_registry.clone();
+        // Model + provider too: `rebuild_agent` runs on ReloadConfig
+        // (settings watcher / `/model`), so after a mid-session model
+        // switch unpinned subagents must inherit the NEW model. Pre-fix
+        // the factory kept the worker-init pair for the whole session —
+        // grok main agent kept spawning deepseek workers.
+        snap.model = self.config.model.clone();
+        snap.provider = self.agent.provider().clone();
     }
 }
 
@@ -766,262 +1062,20 @@ pub fn build_system_prompt(
     config: &AppConfig,
     cwd: &std::path::Path,
     skill_store: &std::sync::Arc<std::sync::Mutex<crate::skills::SkillStore>>,
+    mcp_instructions: &[(String, String)],
 ) -> String {
-    let ctx = ProjectContext::discover(cwd).unwrap_or(ProjectContext {
-        cwd: cwd.to_path_buf(),
-        git: None,
-        project_instructions: None,
-    });
-    let system_fallback = if config.system_prompt.is_empty() {
-        crate::prompts::defaults::SYSTEM
-    } else {
-        config.system_prompt.as_str()
-    };
-    let base_prompt = crate::prompts::load("system", system_fallback);
-    let mut system = ctx.build_system_prompt(&base_prompt);
-
-    if let Some(store) = MemoryStore::default_path().map(MemoryStore::new) {
-        if let Some(mem) = store.system_prompt_section() {
-            system.push_str("\n\n# Memory\n");
-            system.push_str(&mem);
-        }
-    }
-
-    let kms_section = crate::kms::system_prompt_section(&config.kms_active);
-    if !kms_section.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&kms_section);
-    }
-
-    let services_section = services_prompt_section();
-    if !services_section.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&services_section);
-    }
-
-    // Documents section is unconditional — its tools are always
-    // registered, so the prompt section's only job is to nudge the
-    // model away from Bash + Python libraries toward the native
-    // bundled tools. Sits after Services so all "capabilities"
-    // sections cluster together, before Team (collaboration) and
-    // Skills (workflows).
-    let documents_section = documents_prompt_section();
-    if !documents_section.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&documents_section);
-    }
-
-    let team_enabled = crate::config::ProjectConfig::load()
-        .and_then(|c| c.team_enabled)
-        .unwrap_or(false);
-    let team_section = team_grounding_prompt(&config.model, team_enabled);
-    if !team_section.is_empty() {
-        system.push_str("\n\n");
-        system.push_str(&team_section);
-    }
-
+    // dev-plan/35 followup: delegate to the always-on unified builder
+    // in `prompts::build_full_system_prompt` so GUI + REPL + print +
+    // agent_runtime emit byte-identical text modulo the surface-tagged
+    // priming. Pre-fix, four inline assemblies had drifted apart.
     let guard = skill_store.lock().ok();
-    if let Some(store) = guard.as_ref() {
-        if !store.skills.is_empty() {
-            // dev-plan/06 P2: branch on the user's chosen strategy.
-            // - "full" preserves the original behavior (every skill
-            //   listed with name + description + trigger)
-            // - "names-only" lists names only, refers the model to
-            //   the SkillSearch / SkillList / Skill tools for detail
-            // - "discover-tool-only" lists no skills at all; just
-            //   names the discovery tools
-            let strategy = config.skills_listing_strategy.as_str();
-            append_skills_section(&mut system, store, strategy);
-        }
-    }
-
-    system
-}
-
-/// Build the "External services" section of the system prompt. Only
-/// surfaces services whose API key is currently in the process env
-/// (so a key paste mid-session lights up on the next
-/// `rebuild_system_prompt`). Returns an empty string when nothing is
-/// configured — caller skips the section entirely in that case.
-///
-/// Motivation: `ToolRegistry::tool_defs` already hides
-/// `WebScrape` / `YouTubeTranscript` when `HAL_API_KEY` is absent,
-/// and surfaces them when present — but the model has to *notice*
-/// the presence of an unfamiliar tool name in a long tools-param
-/// list. Pre-fix the model defaulted to `WebFetch` for everything
-/// (the name it recognised from training data) and never reached for
-/// the HAL-backed tools, even though they were technically visible.
-/// This section names them explicitly with a one-line "when to pick"
-/// hint so the model has the discovery shortcut it was missing.
-fn services_prompt_section() -> String {
-    let mut bullets: Vec<String> = Vec::new();
-
-    let hal_ok = std::env::var("HAL_API_KEY")
-        .ok()
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
-    if hal_ok {
-        bullets.push(
-            "**HAL Public API** (key set). \
-             `WebFetch` now runs **both** a HAL headless-browser scrape **and** \
-             a plain HTTP GET in parallel on every call, returning a single \
-             combined response with each section clearly labelled (`[via HAL …]` \
-             then `[via plain HTTP GET …]`). Pick the slice that answers your \
-             question — HAL for SPA / JS-rendered / docs / blog content; plain \
-             GET for JSON APIs / sitemaps / robots.txt / anything where the raw \
-             body matters. Set `prefer_raw: true` on `WebFetch` to skip HAL \
-             entirely when you know the URL is a JSON endpoint or similar \
-             (saves wall-clock + tokens). Reach directly for `WebScrape` only \
-             when you need advanced HAL parameters (`wait_for` CSS selector, \
-             `scroll_to_bottom`, `remove_selectors`, `output_format`). Use \
-             `YouTubeTranscript` for video captions (en/th preference by default)."
-                .to_string(),
-        );
-    }
-
-    // `WebSearch` is always registered — it auto-selects Tavily →
-    // Brave → DuckDuckGo at call time, with DuckDuckGo as the always-
-    // available no-key fallback. Surface it here so the model reaches
-    // for the structured tool instead of shelling out via `Bash` +
-    // `curl 'https://duckduckgo.com/html/...'` (a recurring failure
-    // mode pre-fix: descriptions in the API tools-param weren't
-    // enough to dislodge the model's `curl` habit).
-    let tavily_ok = std::env::var("TAVILY_API_KEY")
-        .ok()
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
-    let brave_ok = std::env::var("BRAVE_SEARCH_API_KEY")
-        .ok()
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
-    let backend_hint = match (tavily_ok, brave_ok) {
-        (true, _) => "currently Tavily (best quality)",
-        (false, true) => "currently Brave",
-        (false, false) => "currently DuckDuckGo (no key set — paste a Tavily or Brave key in Settings for better results)",
-    };
-    bullets.push(format!(
-        "**Web search**. `WebSearch` returns titles, URLs, and snippets \
-         from the live web — {backend_hint}. Auto-picks the best \
-         available backend at call time: Tavily → Brave → DuckDuckGo. \
-         Each result starts with a `Source: <engine>` line — mention \
-         the engine when summarising so the user knows result quality. \
-         Reach for this instead of `Bash` + `curl` for any web lookup."
-    ));
-
-    if bullets.is_empty() {
-        return String::new();
-    }
-
-    let mut out = String::from("# External services\n\n");
-    for b in bullets {
-        out.push_str("- ");
-        out.push_str(&b);
-        out.push('\n');
-    }
-    out
-}
-
-/// Document- and spreadsheet-generation tool surface. Always rendered
-/// — these tools are unconditionally registered in
-/// `ToolRegistry::with_builtins`, so the prompt section's job is
-/// purely discoverability: the model otherwise defaults to
-/// `Bash` + `python-docx` / `openpyxl` / `python-pptx` / `reportlab`
-/// (often broken on the user's machine, slow, and produces inconsistent
-/// output). Mentioning the native tools dislodges that habit.
-///
-/// Critical motivation: pre-fix the only place these tools appeared
-/// was the API tools-param schema list — a 25+ entry list where the
-/// model's eye glides past unfamiliar names like `DocxCreate`. Users
-/// reported "make a PDF" requests resolving to bash scripts that
-/// failed three times before the model considered the native tool.
-fn documents_prompt_section() -> String {
-    String::from(
-        "# Document & spreadsheet generation\n\n\
-         When the user asks to create or read Word docs, Excel sheets, \
-         PowerPoint decks, or PDFs, reach for these native tools instead \
-         of shelling out to Python libraries. They are bundled (no setup \
-         on the user's machine), embed Noto Sans Thai (mixed Thai/Latin \
-         renders correctly), and produce predictable output.\n\n\
-         - **DocxCreate** / **DocxRead** — Word `.docx`. Markdown in, \
-         supports tables, inline images, H1–H4. Read extracts to text.\n\
-         - **XlsxCreate** / **XlsxRead** — Excel `.xlsx`. Accepts CSV \
-         string, JSON 2D array, or `[{sheet, rows}]` for multi-sheet \
-         workbooks. Numeric cells stay numeric.\n\
-         - **PptxCreate** / **PptxRead** — PowerPoint `.pptx`. Markdown \
-         outline: `# Heading` starts a new slide, bullets become body. \
-         Read extracts slide text.\n\
-         - **PdfCreate** / **PdfRead** — PDF. Markdown in, supports \
-         tables, inline images, embedded fonts. A4 / Letter / Legal.\n\n\
-         Use these for the matching format every time. Do NOT call \
-         generic `Read` on `.docx` / `.xlsx` / `.pptx` / `.pdf` — it \
-         returns raw bytes the model can't parse; the dedicated `*Read` \
-         tool extracts to model-readable text.\n",
+    crate::prompts::build_full_system_prompt(
+        config,
+        cwd,
+        guard.as_deref(),
+        mcp_instructions,
+        crate::prompts::SurfaceHints::Gui,
     )
-}
-
-/// dev-plan/06 P2 helper. Renders the Available-skills section of the
-/// system prompt according to the configured strategy.
-fn append_skills_section(system: &mut String, store: &crate::skills::SkillStore, strategy: &str) {
-    let mut entries: Vec<&crate::skills::SkillDef> = store.skills.values().collect();
-    entries.sort_by(|a, b| a.name.cmp(&b.name));
-
-    match strategy {
-        "discover-tool-only" => {
-            system.push_str("\n\n# Available skills (MANDATORY usage)\n");
-            system.push_str(
-                "Bundled skills are available but not listed inline (you have \
-                 a large catalog). Discover them via `SkillList()` for the full \
-                 catalog or `SkillSearch(query: \"...\")` for a substring \
-                 lookup. When a user request sounds like it might match a \
-                 bundled workflow (\"make a PDF\", \"scaffold a skill\", \
-                 \"extract data from xlsx\", etc.), you MUST call SkillList \
-                 or SkillSearch FIRST before implementing the task manually. \
-                 Once you find a relevant skill, call `Skill(name: \"<name>\")` \
-                 to load its expert instructions and follow them.\n",
-            );
-        }
-        "names-only" => {
-            system.push_str("\n\n# Available skills (MANDATORY usage)\n");
-            system.push_str(
-                "The `Skill` tool loads expert instructions for a bundled \
-                 workflow. Skill names are listed below; for descriptions and \
-                 trigger criteria call `SkillSearch(query: \"...\")` or \
-                 `SkillList()`. If a user request might match any of these \
-                 skills, you MUST call Skill (or SkillSearch first) FIRST — \
-                 before any Bash, Write, Edit, or other tool calls for that \
-                 task. Announce the skill at the start of your reply.\n\n",
-            );
-            let names: Vec<&str> = entries.iter().map(|s| s.name.as_str()).collect();
-            // Render as a comma-separated list to keep token cost minimal
-            // — one line per N skills, ~30 chars per name.
-            system.push_str(&names.join(", "));
-            system.push('\n');
-        }
-        _ => {
-            // "full" (default) — preserves the original behavior.
-            system.push_str("\n\n# Available skills (MANDATORY usage)\n");
-            system.push_str(
-                "The `Skill` tool loads expert instructions for a bundled workflow. \
-                 If a user request matches the trigger criteria of any skill below, \
-                 you MUST:\n\
-                 1. Call `Skill(name: \"<skill-name>\")` FIRST — before any Bash, \
-                    Write, Edit, or other tool calls for that task.\n\
-                 2. Follow the instructions returned by that skill for the rest of \
-                    the task. They override your default approach.\n\
-                 3. Announce the skill at the start of your reply, e.g. \
-                    \"Using the `pdf` skill to …\".\n\
-                 Do NOT implement the task yourself when a matching skill exists — \
-                 the skill encodes conventions and scripts you don't have built in.\n\n",
-            );
-            for skill in entries {
-                system.push_str(&format!("- **{}** — {}", skill.name, skill.description));
-                if !skill.when_to_use.is_empty() {
-                    system.push_str(&format!("\n  Trigger: {}", skill.when_to_use));
-                }
-                system.push('\n');
-            }
-        }
-    }
 }
 
 /// True when two paths refer to the same on-disk directory. Prefers
@@ -1052,20 +1106,58 @@ pub fn spawn() -> SharedSessionHandle {
 pub fn spawn_with_approver(
     approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
 ) -> SharedSessionHandle {
+    spawn_with_roots(approver, None)
+}
+
+/// dev-plan/35 Tier 1 multi-tenant entry point. Same as
+/// [`spawn_with_approver`] but threads a [`SessionRoots`] override
+/// into the worker so session JSONLs, gui-shell storage, and usage
+/// metering land under per-user prefixes instead of the cwd /
+/// HOME-relative defaults. `None` → identical behaviour to
+/// `spawn_with_approver` (single-tenant defaults).
+pub fn spawn_with_roots(
+    approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
+    session_roots: Option<crate::multi_tenant::SessionRoots>,
+) -> SharedSessionHandle {
     let (input_tx, input_rx) = mpsc::channel::<ShellInput>();
-    let (events_tx, _) = broadcast::channel::<ViewEvent>(256);
+
+    // File watcher on .thclaws/settings.json — any edit (Files tab
+    // save, external editor, programmatic write) triggers an
+    // automatic ReloadConfig. Closes the "I enabled
+    // shellTabEnabled but the tab didn't appear" gap without a
+    // manual restart. The `settings_reload` IPC arm is the explicit
+    // fallback for users who want to force a reload.
+    spawn_settings_watcher(input_tx.clone());
+
+    // Capacity sized for fast multi-subscriber streaming. Team mode adds
+    // collectors (LINE/Telegram bridges, web WS) alongside the GUI, and a
+    // burst of small AssistantTextDelta tokens can outrun a slow consumer.
+    // At 256 the laggy subscriber silently dropped text deltas (issue #163
+    // Bug 1: thinking rendered, response text vanished); 2048 absorbs the
+    // bursts. Lagged events are now also logged in the forwarders.
+    let (events_tx, _) = broadcast::channel::<ViewEvent>(2048);
     let cancel = crate::cancel::CancelToken::new();
     let ready_gate = Arc::new(ReadyGate::new());
     // Mid-turn injection queue (issue #106) — shared between the IPC
     // layer (push) and the agent inside the worker (drain).
     let injection_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    let workflow_approver = crate::workflow::WorkflowApprover::new();
+    // docs/browser Phase 1: slot the worker fills when the engine-
+    // managed `browser` MCP server connects, read by the IPC layer
+    // for UI-initiated screenshot captures.
+    let browser_mcp: std::sync::Arc<
+        std::sync::RwLock<Option<std::sync::Arc<crate::mcp::McpClient>>>,
+    > = std::sync::Arc::new(std::sync::RwLock::new(None));
 
     let events_tx_for_thread = events_tx.clone();
     let cancel_for_thread = cancel.clone();
     let input_tx_for_poller = input_tx.clone();
     let gate_for_thread = ready_gate.clone();
     let injection_queue_for_worker = injection_queue.clone();
+    let workflow_approver_for_worker = workflow_approver.clone();
+    let session_roots_for_worker = session_roots.clone();
+    let browser_mcp_for_worker = browser_mcp.clone();
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -1077,6 +1169,9 @@ pub fn spawn_with_approver(
                 approver,
                 gate_for_thread,
                 injection_queue_for_worker,
+                workflow_approver_for_worker,
+                session_roots_for_worker,
+                browser_mcp_for_worker,
             ));
         }));
         if let Err(payload) = result {
@@ -1098,7 +1193,96 @@ pub fn spawn_with_approver(
         cancel,
         ready_gate,
         injection_queue,
+        workflow_approver,
+        session_roots,
+        browser_mcp,
     }
+}
+
+/// Spawn a debounced filesystem watcher on `.thclaws/settings.json`.
+/// Any modify event fires a `ShellInput::ReloadConfig` so the engine
+/// re-reads project settings without a process restart. Paired with
+/// the manual `settings_reload` IPC arm and the SettingsChanged
+/// broadcast — the user can edit settings.json in any editor and
+/// see the change take effect (tab visibility, model, …) within ~1 s.
+///
+/// The watcher leaks for the process lifetime — there's exactly one
+/// worker per engine, and it should watch as long as the engine runs.
+/// Re-firing ReloadConfig when a write was triggered by our own code
+/// (e.g. sidebar model picker → `ProjectConfig::set_model`) is
+/// harmless: the handler is idempotent.
+fn spawn_settings_watcher(input_tx: mpsc::Sender<ShellInput>) {
+    use notify_debouncer_mini::new_debouncer;
+    use notify_debouncer_mini::notify::RecursiveMode;
+
+    let cwd = match std::env::current_dir() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("\x1b[33m[settings-watch] cannot read cwd: {e}\x1b[0m");
+            return;
+        }
+    };
+    let thclaws_dir = cwd.join(".thclaws");
+    // settings.json may not exist on first run; the parent dir does
+    // because the engine's initContainer (or local startup) creates
+    // it. Belt-and-braces ensure-exists so notify has a directory to
+    // attach to.
+    if let Err(e) = std::fs::create_dir_all(&thclaws_dir) {
+        eprintln!(
+            "\x1b[33m[settings-watch] mkdir {} failed: {e} (skipping watch)\x1b[0m",
+            thclaws_dir.display()
+        );
+        return;
+    }
+    let settings_path = thclaws_dir.join("settings.json");
+
+    let mut debouncer = match new_debouncer(
+        std::time::Duration::from_millis(500),
+        move |result: notify_debouncer_mini::DebounceEventResult| match result {
+            Ok(events) => {
+                for ev in events {
+                    if ev.path == settings_path {
+                        eprintln!(
+                            "\x1b[36m[settings-watch] {} changed → ReloadConfig\x1b[0m",
+                            settings_path.display()
+                        );
+                        let _ = input_tx.send(ShellInput::ReloadConfig);
+                        // One dispatch per debounced batch; the
+                        // handler is idempotent so additional events
+                        // in the same batch would just no-op.
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("\x1b[31m[settings-watch] notify error: {e}\x1b[0m");
+            }
+        },
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("\x1b[31m[settings-watch] could not start watcher: {e}\x1b[0m");
+            return;
+        }
+    };
+    if let Err(e) = debouncer
+        .watcher()
+        .watch(&thclaws_dir, RecursiveMode::NonRecursive)
+    {
+        eprintln!(
+            "\x1b[31m[settings-watch] watch({}) failed: {e}\x1b[0m",
+            thclaws_dir.display()
+        );
+        return;
+    }
+    eprintln!(
+        "\x1b[36m[settings-watch] watching {}/settings.json (500ms debounce)\x1b[0m",
+        thclaws_dir.display()
+    );
+    // Leak: the debouncer must outlive this function for the watcher
+    // thread to keep firing. The engine process owns one of these for
+    // its full lifetime so leaking is the right shape.
+    Box::leak(Box::new(debouncer));
 }
 
 /// Build the live `telegram_status` JSON for the GUI from an active
@@ -1156,14 +1340,28 @@ async fn run_worker(
     approver: std::sync::Arc<dyn crate::permissions::ApprovalSink>,
     ready_gate: Arc<ReadyGate>,
     injection_queue: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    workflow_approver: std::sync::Arc<crate::workflow::WorkflowApprover>,
+    session_roots: Option<crate::multi_tenant::SessionRoots>,
+    browser_mcp: std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<crate::mcp::McpClient>>>>,
 ) {
-    let cwd = std::env::current_dir().unwrap_or_default();
+    // dev-plan/42: when this worker belongs to a per-user workspace
+    // (multiuser `--serve`), its working directory is that user's
+    // `workspace-<id>/`, not the process cwd. Falls back to process cwd
+    // for single-tenant `--serve`, desktop, and CLI (`workspace_root`
+    // is `None`).
+    let cwd = session_roots
+        .as_ref()
+        .and_then(|r| r.workspace_root.clone())
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
     let config = AppConfig::load().unwrap_or_default();
     // Push the configured stream-chunk timeout into the global the
     // providers read on every `byte_stream.next()`. Live; subsequent
     // `/reload` paths re-apply via the same setter (see lines ~1877,
     // ~1965 where AppConfig::load is re-invoked).
-    crate::providers::set_stream_chunk_timeout_secs(config.stream_chunk_timeout_secs);
+    // Re-applied by the settings watcher below, so a Settings-menu toggle
+    // lands without a restart.
+    config.apply_process_globals();
 
     // Shared SkillTool store — we keep a handle in WorkerState so
     // `/skill install` can repopulate it without restarting.
@@ -1171,6 +1369,14 @@ async fn run_worker(
         std::sync::Arc::new(std::sync::Mutex::new(crate::skills::SkillStore::discover()));
 
     let mut tools = ToolRegistry::with_builtins();
+
+    // issue #182: re-register a cancel-aware Bash over the default so Stop /
+    // Esc / Cmd+. kills an in-flight command (build, test, long sleep) instead
+    // of letting it run to `timeout_ms`. `register()` overwrites by tool name,
+    // and the token is the same session cancel the agent's main loop races.
+    tools.register(std::sync::Arc::new(crate::tools::BashTool::with_cancel(
+        cancel.clone(),
+    )));
 
     // Plan-state → ViewEvent bridge + JSONL persistence (M1). Every
     // time a plan tool calls `submit` / `update_step` / `clear`, the
@@ -1294,6 +1500,7 @@ async fn run_worker(
     // M6.25 BUG #1: KmsWrite + KmsAppend make the LLM an active
     // wiki maintainer (not just a passive reader).
     tools.register(std::sync::Arc::new(crate::tools::KmsWriteTool));
+    tools.register(std::sync::Arc::new(crate::tools::KmsWriteSourceTool));
     tools.register(std::sync::Arc::new(crate::tools::KmsAppendTool));
     tools.register(std::sync::Arc::new(crate::tools::KmsDeleteTool));
     // KmsCreate bootstraps the dedicated `dreams` KMS used by
@@ -1310,6 +1517,40 @@ async fn run_worker(
     tools.register(std::sync::Arc::new(crate::tools::MemoryAppendTool));
     // M6.46: SessionRename — for dream + power-user manual rename.
     tools.register(std::sync::Arc::new(crate::tools::SessionRenameTool));
+
+    // Opt-in native Gemini image-gen tools (TextToImage,
+    // ImageToImage). Gated on `imageToolsEnabled: true` in
+    // settings.json AND a GEMINI_API_KEY (or GOOGLE_API_KEY) in
+    // env — the tool's own `requires_env()` hides them if the key
+    // is missing, but we don't even register them without the
+    // settings opt-in so the model never sees them in the catalogue
+    // unless the user actively asked for the surface.
+    if config.image_tools_enabled {
+        tools.register(std::sync::Arc::new(crate::tools::TextToImageTool));
+        tools.register(std::sync::Arc::new(crate::tools::ImageToImageTool));
+        tools.register(std::sync::Arc::new(crate::tools::TextToSpeechTool));
+        tools.register(std::sync::Arc::new(crate::tools::RenderSlidesTool));
+        tools.register(std::sync::Arc::new(crate::tools::TextToVideoTool));
+        tools.register(std::sync::Arc::new(crate::tools::ImageToVideoTool));
+        tools.register(std::sync::Arc::new(crate::tools::MediaJobStatusTool));
+    }
+
+    if config.hal_enabled {
+        tools.register(std::sync::Arc::new(
+            crate::tools::YouTubeTranscriptTool::new(),
+        ));
+        tools.register(std::sync::Arc::new(crate::tools::WebScrapeTool::new()));
+    }
+
+    // Tool-parity audit fix: respect `searchEngine` config override
+    // (REPL had this; GUI/serve fell back to "auto" silently).
+    // `HashMap::insert` in `ToolRegistry::register` overwrites the
+    // default `WebSearchTool` from `with_builtins` by name.
+    if config.search_engine != "auto" {
+        tools.register(std::sync::Arc::new(crate::tools::WebSearchTool::new(
+            &config.search_engine,
+        )));
+    }
 
     // M6.11 (H1): daily auto-refresh of the marketplace catalog. No-op
     // when the cache is < 24h old; otherwise spawns a fail-silent
@@ -1331,12 +1572,11 @@ async fn run_worker(
     // teammate process that happened to share this code path.
     let is_teammate = std::env::var("THCLAWS_TEAM_AGENT").is_ok();
     crate::team::set_is_team_lead(team_enabled && !is_teammate);
-    // M6.34 TEAM3: capture team_dir so the GUI's lead-process exit
-    // can scope the kill to its own teammates only. Even though the
-    // GUI doesn't currently call kill_my_teammates() at shutdown
-    // (the OS reclaims child processes when the GUI quits), recording
-    // the dir keeps parity with the CLI lead and unblocks future
-    // explicit "Stop all teammates" UI affordances.
+    // M6.34 TEAM3: capture team_dir so the GUI's lead-process exit can
+    // scope the kill to its own teammates only. The GUI DOES call
+    // kill_my_teammates() at shutdown (gui.rs) — teammates run in
+    // tmux-server-owned panes, not GUI child processes, so they are NOT
+    // reclaimed when the GUI quits; the explicit scoped kill is required.
     if team_enabled && !is_teammate {
         let td = std::env::var("THCLAWS_TEAM_DIR")
             .map(std::path::PathBuf::from)
@@ -1344,6 +1584,10 @@ async fn run_worker(
         crate::team::set_lead_team_dir(&td);
     }
     let skill_tool = crate::skills::SkillTool::new_from_handle(skill_store.clone());
+    // Capture the isolated-execution slot before the tool moves into the
+    // registry; wired to the factory once it's built (below) so `isolated:
+    // true` job skills run in a sub-agent.
+    let skill_factory_slot = skill_tool.factory_slot();
     tools.register(std::sync::Arc::new(skill_tool));
     // dev-plan/06 P2: SkillList + SkillSearch are always registered
     // (regardless of skills_listing_strategy) so any strategy can use
@@ -1406,10 +1650,51 @@ async fn run_worker(
             let _ = crate::model_catalogue::refresh_from_remote().await;
         }
     });
-    for server_cfg in config.mcp_servers.clone() {
+    // Tool-parity audit fix: merge plugin-contributed MCPs with
+    // config.mcp_servers (config wins on name clash). REPL + HTTP
+    // both did this; GUI/serve silently dropped plugin MCPs —
+    // installing a plugin that ships an MCP server only worked in
+    // CLI mode, the GUI never saw it.
+    let mut merged_mcp = config.mcp_servers.clone();
+    for p_mcp in crate::plugins::plugin_mcp_servers() {
+        if !merged_mcp.iter().any(|s| s.name == p_mcp.name) {
+            merged_mcp.push(p_mcp);
+        }
+    }
+    for server_cfg in merged_mcp {
         let approver_for_spawn = approver.clone();
         let input_tx_for_spawn = input_tx_self.clone();
         tokio::spawn(async move {
+            let mut server_cfg = server_cfg;
+            // docs/browser slice 3: for the engine-managed browser,
+            // launch Chromium OURSELVES (DevTools port) and attach
+            // playwright-mcp to it via --cdp-endpoint — the engine's
+            // own CDP session then drives the Browser tab's live view.
+            // Any failure falls back to MCP self-launch (current
+            // behavior); THCLAWS_BROWSER_CDP=0 is the kill switch.
+            if server_cfg.name == "browser"
+                && server_cfg.engine_managed
+                && std::env::var("THCLAWS_BROWSER_CDP").ok().as_deref() != Some("0")
+                && !server_cfg
+                    .args
+                    .iter()
+                    .any(|a| a.starts_with("--cdp-endpoint"))
+            {
+                let headless = server_cfg.args.iter().any(|a| a == "--headless");
+                // arm() reserves the endpoint without launching
+                // Chromium (lazy — first browser use launches it), but
+                // it may probe a saved endpoint for ~1s, so keep it
+                // off the async worker.
+                let endpoint =
+                    tokio::task::spawn_blocking(move || crate::browser_cdp::arm(headless))
+                        .await
+                        .ok()
+                        .flatten();
+                if let Some(endpoint) = endpoint {
+                    server_cfg.args.push("--cdp-endpoint".into());
+                    server_cfg.args.push(endpoint);
+                }
+            }
             let server_name = server_cfg.name.clone();
             match crate::mcp::McpClient::spawn_with_approver(server_cfg, Some(approver_for_spawn))
                 .await
@@ -1439,7 +1724,11 @@ async fn run_worker(
         });
     }
 
-    let system = build_system_prompt(&config, &cwd, &skill_store);
+    // Initial assembly — MCP servers are still spawning in tokio tasks
+    // above, so no instructions are available yet. Each McpReady arm
+    // calls `rebuild_system_prompt` to fold the new server's
+    // instructions in once initialize() returns.
+    let system = build_system_prompt(&config, &cwd, &skill_store, &[]);
 
     // `build_provider_with_fallback` walks the configured model first,
     // then any provider whose key is actually present, before giving
@@ -1478,7 +1767,17 @@ async fn run_worker(
     // came back "unknown tool: Task". SUB4: cancel is threaded into
     // the factory so ctrl-C in the GUI stops in-flight subagents
     // (CLI passes None — no cancel plumbing there yet).
-    let perm_mode = if config.permissions == "auto" {
+    let perm_mode = if config.permissions == "ask" {
+        // Explicit Ask is honored even when hosted — it works via the serve
+        // approval modal (delivered over the WS + re-emitted on reconnect).
+        crate::permissions::PermissionMode::Ask
+    } else if config.permissions == "auto" {
+        crate::permissions::PermissionMode::Auto
+    } else if std::env::var("THCLAWS_HOSTED").is_ok() {
+        // Hosted safety net: an unexpected non-auto/non-ask value (e.g. a
+        // settings.json parse fallback) must not leave a managed cloud
+        // sandbox stuck in Ask with no approval UI — that's the "Write hangs,
+        // no file" failure. Default hosted to Auto.
         crate::permissions::PermissionMode::Auto
     } else {
         crate::permissions::PermissionMode::Ask
@@ -1488,13 +1787,16 @@ async fn run_worker(
         crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
     agent_defs_state.apply_builtin_subagent_overrides(&config);
     let agent_defs_state = agent_defs_state;
-    let factory_state: Arc<dyn crate::subagent::AgentFactory> = {
-        let base_tools = tools.clone();
-        let factory = Arc::new(crate::subagent::ProductionAgentFactory {
-            provider: provider.clone(),
-            base_tools,
-            model: config.model.clone(),
+    let factory_snapshot_state =
+        Arc::new(std::sync::RwLock::new(crate::subagent::FactorySnapshot {
             system: system.clone(),
+            tools: tools.clone(),
+            model: config.model.clone(),
+            provider: provider.clone(),
+        }));
+    let factory_state: Arc<dyn crate::subagent::AgentFactory> = {
+        let factory = Arc::new(crate::subagent::ProductionAgentFactory {
+            snapshot: factory_snapshot_state.clone(),
             max_iterations: config.max_iterations,
             max_depth: crate::subagent::DEFAULT_MAX_DEPTH,
             max_tokens: config.max_tokens,
@@ -1506,13 +1808,34 @@ async fn run_worker(
             // hooks see Task-spawned tool calls.
             hooks: Some(hooks_arc.clone()),
         });
-        tools.register(std::sync::Arc::new(
+        let subagent_arc: std::sync::Arc<dyn crate::tools::Tool> = std::sync::Arc::new(
             crate::subagent::SubAgentTool::new(factory.clone())
                 .with_depth(0)
                 .with_agent_defs(agent_defs_state.clone()),
+        );
+        tools.register(subagent_arc.clone());
+        // WorkflowRun: model-callable wrapper around `/workflow run`.
+        // GUI / --serve get the same engine as the worker's agent
+        // (provider + model) plus the live Task tool so scripts'
+        // `thclaws.subagent(...)` calls dispatch correctly.
+        tools.register(std::sync::Arc::new(
+            crate::tools::WorkflowRunTool::new(
+                provider.clone(),
+                config.model.clone(),
+                Some(subagent_arc),
+            )
+            // stream thclaws.log / subagent progress to the chat mid-run so a
+            // multi-minute workflow (research) isn't silent between call+result
+            .with_events_tx(events_tx.clone()),
         ));
         factory
     };
+    // Wire isolated ("job") skills to the factory just built: the main
+    // SkillTool gets a Weak handle so `isolated: true` skills spawn a
+    // sub-agent instead of pasting their body + steps inline. Weak keeps
+    // the factory → snapshot → registry → SkillTool → factory reference
+    // from leaking. Until now the slot was empty ⇒ job skills ran inline.
+    let _ = skill_factory_slot.set(std::sync::Arc::downgrade(&factory_state));
     // Apply `disallowed_tools` to the main agent's registry. Until
     // this was wired, the config field was parsed (config.rs maps
     // both flat `disallowedTools` and nested `permissions.deny`)
@@ -1547,6 +1870,11 @@ async fn run_worker(
     // GUI's Ask mode flag had no effect because the Agent was built
     // with the default Auto.
     agent.permission_mode = perm_mode;
+    // `askTools`: tools that always prompt even under Auto (interactive
+    // GUI worker has a real approver, so this bites here).
+    if let Some(ask) = &config.ask_tools {
+        agent.ask_tools = ask.clone();
+    }
     // Mirror the configured mode into the process-wide global so
     // `permissions::current_mode()` (read by the agent's tool-dispatch
     // gate, M2+) starts on the right value before any EnterPlanMode /
@@ -1586,7 +1914,16 @@ async fn run_worker(
                 let Some(kind) = crate::providers::ProviderKind::detect(candidate) else {
                     continue;
                 };
-                if !kind.has_key_available() {
+                // Usable if a local key exists OR the gateway proxy can serve
+                // this (featured) candidate — so a proxy-only user gets the
+                // skill's recommended model instead of falling through.
+                let gateway_ok = {
+                    let mut cfg = crate::config::AppConfig::load().unwrap_or_default();
+                    cfg.model = candidate.clone();
+                    crate::providers::thclaws_gateway::gateway_overlay_for_model(&cfg, kind)
+                        .is_some()
+                };
+                if !kind.has_key_available() && !gateway_ok {
                     continue;
                 }
                 if let Ok(mut g) = override_handle.lock() {
@@ -1622,8 +1959,27 @@ async fn run_worker(
         });
     }
 
-    let session_store = SessionStore::default_path().map(SessionStore::new);
-    let current_session = Session::new(&config.model, cwd.to_string_lossy());
+    // dev-plan/35 Tier 1: per-user override beats `default_path()`
+    // when this worker belongs to a multi-tenant pod.
+    let session_store = session_roots
+        .as_ref()
+        .map(|r| r.sessions_dir.clone())
+        .or_else(SessionStore::default_path)
+        .map(SessionStore::new);
+    // Reuse the most-recent session when it's still EMPTY instead of
+    // minting a new one on every launch. Each mint writes a header below
+    // (so SessionStore::list sees it), so without this an empty session
+    // file would pile up every time the app starts. A non-empty latest is
+    // left untouched — desktop still lands on a clean session (e14fdf8a),
+    // just without spawning a duplicate empty one. The reused session
+    // adopts the current default model.
+    let mut current_session = Session::new(&config.model, cwd.to_string_lossy());
+    if let Some(store) = session_store.as_ref() {
+        if let Ok(Some(mut empty)) = store.reuse_empty_latest() {
+            empty.model = config.model.clone();
+            current_session = empty;
+        }
+    }
     // Point the plan-persistence arc at the initial session's JSONL
     // path so any SubmitPlan / UpdatePlanStep call before the first
     // /load gets persisted. Subsequent session swaps reassign this
@@ -1670,10 +2026,12 @@ async fn run_worker(
         config,
         session: current_session,
         session_store,
+        session_roots: session_roots.clone(),
         tool_registry: tools,
         system_prompt: system,
         cwd,
         approver,
+        workflow_approver,
         skill_store,
         mcp_clients,
         warned_file_size: false,
@@ -1686,10 +2044,12 @@ async fn run_worker(
         // would otherwise gate the loop forever on iteration 0.
         last_turn_made_tool_calls: true,
         agent_factory: factory_state,
+        factory_snapshot: factory_snapshot_state,
         agent_defs: agent_defs_state,
         line_session: None,
         line_pre_mode: None,
         line_pre_approver: None,
+        phone_home_session: None,
         telegram_session: None,
         telegram_pre_mode: None,
         telegram_pre_approver: None,
@@ -1697,6 +2057,7 @@ async fn run_worker(
         messenger_pre_mode: None,
         messenger_pre_approver: None,
         session_cost_usd: 0.0,
+        last_settings_fingerprint: None,
         #[cfg(feature = "cost_bridge")]
         cost_bridge: Some(crate::cost_bridge::spawn()),
     };
@@ -1745,14 +2106,28 @@ async fn run_worker(
         Err(e) => eprintln!("[messenger] failed to load on-disk config: {e}"),
     }
 
+    // dev-plan/44 Tier 1: auto-reconnect the phone-home tunnel on boot
+    // when a binding is on disk. Mirrors the blocks above.
+    match crate::phone_home::PhoneHomeConfig::load() {
+        Ok(Some(cfg)) if !cfg.binding_token.trim().is_empty() => {
+            let _ = input_tx_self.send(ShellInput::PhoneHomeConnect(cfg));
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[phone-home] failed to load on-disk config: {e}"),
+    }
+
     // Lead inbox poller — parity with repl.rs:1524. Without this, teammates
     // message the lead, messages pile up in `.thclaws/team/inboxes/lead.json`
     // unread, and the team stalls waiting for the lead to react.
     if team_enabled {
         let poller_tx = input_tx_self.clone();
         tokio::spawn(async move {
-            let mailbox = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+            // Absolute team dir (not the relative default) so a mid-session
+            // cwd change doesn't desync this poller from the teammates.
+            let mailbox = crate::team::Mailbox::new(crate::team::resolved_team_dir());
             loop {
+                // Lead heartbeat for liveness/staleness checks.
+                let _ = mailbox.write_status("lead", "active", None);
                 let unread = mailbox.read_unread("lead").unwrap_or_default();
                 if !unread.is_empty() {
                     let ids: Vec<String> = unread.iter().map(|m| m.id.clone()).collect();
@@ -1782,10 +2157,16 @@ async fn run_worker(
         match input {
             ShellInput::Line(text) => {
                 cancel.reset();
+                maybe_reset_session_per_turn(&mut state, &events_tx, &plan_persist_path);
                 handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
+            }
+            ShellInput::IsolatedLine(text) => {
+                cancel.reset();
+                handle_isolated_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
             }
             ShellInput::LineWithImages { text, images } => {
                 cancel.reset();
+                maybe_reset_session_per_turn(&mut state, &events_tx, &plan_persist_path);
                 handle_line_with_images(
                     text,
                     images,
@@ -1834,6 +2215,9 @@ async fn run_worker(
                 )));
             }
             ShellInput::LoadSession(id) => {
+                // Capture the outgoing session id BEFORE the load so we can
+                // tell a real session switch from a same-id reload below.
+                let prev_session_id = state.session.id.clone();
                 let Some(ref store) = state.session_store else {
                     continue;
                 };
@@ -1859,7 +2243,20 @@ async fn run_worker(
                     let Some(target_kind) = loaded_kind else {
                         continue;
                     };
-                    if !kind_has_credentials(target_kind) {
+                    // Credentials are OK if the provider has a local key OR the
+                    // gateway proxy can serve the session's (featured) model —
+                    // mirror build_provider so a proxy-only user can load a
+                    // session recorded against a featured model with no BYOK key.
+                    let gateway_ok = {
+                        let mut probe = state.config.clone();
+                        probe.model = loaded.model.clone();
+                        crate::providers::thclaws_gateway::gateway_overlay_for_model(
+                            &probe,
+                            target_kind,
+                        )
+                        .is_some()
+                    };
+                    if !kind_has_credentials(target_kind) && !gateway_ok {
                         let provider_name = target_kind.name();
                         let env_hint = target_kind
                             .api_key_env()
@@ -1955,10 +2352,22 @@ async fn run_worker(
                 // user's "allow for session" decision from session A
                 // continued to auto-approve in session B, and a Plan
                 // mode set in A leaked into B with no plan to submit.
-                state.approver.reset_session_flag();
-                let _ = crate::permissions::take_pre_plan_mode();
-                crate::permissions::set_current_mode_and_broadcast(state.agent.permission_mode);
-                let display = DisplayMessage::from_messages(&state.session.messages);
+                //
+                // Guard on a REAL switch (id != prev): a same-id reload —
+                // e.g. the frontend's startup auto-load firing right after
+                // the user entered plan mode + submitted a plan — must NOT
+                // clobber the current session's ephemeral yolo / plan mode.
+                // That race reset the mode to Auto and dropped the sidebar
+                // Approve button the first time /plan was used in a fresh
+                // workspace (plan_state survives via restore_from_session
+                // above, so "type approve" still worked — mode was the only
+                // casualty).
+                if id != prev_session_id {
+                    state.approver.reset_session_flag();
+                    let _ = crate::permissions::take_pre_plan_mode();
+                    crate::permissions::set_current_mode_and_broadcast(state.agent.permission_mode);
+                }
+                let display = DisplayMessage::from_session(&state.session);
                 let _ = events_tx.send(ViewEvent::HistoryReplaced(display));
                 // Refresh so the sidebar's "current session" highlight
                 // moves to the freshly-loaded id.
@@ -1985,29 +2394,155 @@ async fn run_worker(
                     let tool = crate::mcp::McpTool::new(client.clone(), info);
                     state.tool_registry.register(std::sync::Arc::new(tool));
                 }
+                // docs/browser Phase 1: expose the engine-managed
+                // browser client to the IPC layer (Browser-tab
+                // screenshot capture bypasses the agent loop).
+                if server_name == "browser" {
+                    *browser_mcp.write().unwrap() = Some(client.clone());
+                }
                 state.mcp_clients.push(client);
+                // Re-assemble the system prompt FIRST so the new
+                // server's `# MCP server instructions` section (if it
+                // returned one via InitializeResult.instructions)
+                // lands in the system text before `rebuild_agent`
+                // captures it. rebuild_agent reuses self.system_prompt;
+                // skipping rebuild_system_prompt here would leave the
+                // instructions stranded until the next /reload.
+                state.rebuild_system_prompt();
                 // Rebuild so the agent actually sees the newly-registered
                 // MCP tools on its next turn.
                 if let Err(e) = state.rebuild_agent(true) {
+                    // The MCP server is fine — its tools are already in the
+                    // registry. rebuild_agent failed because the *current
+                    // model's* provider couldn't be built (usually a missing
+                    // key / unroutable model), which blocks normal turns too,
+                    // not just MCP. Attribute it to the model, not the server,
+                    // so the user fixes the right thing. Tools attach on the
+                    // next successful rebuild (/reload after resolving).
+                    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                        "[mcp] '{server_name}' connected ({tool_count} tools)"
+                    )));
                     let _ = events_tx.send(ViewEvent::ErrorText(format!(
-                        "[mcp] '{server_name}' tools registered but rebuild failed: {e}"
+                        "Current model '{}' isn't ready — {e}. Set a key or switch model with /model, then /reload.",
+                        state.config.model
                     )));
                 } else {
                     let _ = events_tx.send(ViewEvent::SlashOutput(format!(
-                        "[mcp] '{server_name}' connected"
+                        "[mcp] '{server_name}' connected ({tool_count} tools)"
                     )));
                 }
                 // Update sidebar with real tool count now that the server is live.
                 // (No `cfg(feature = "gui")` — the whole module is already
                 // gated at file scope; the inner cfg block was redundant.)
                 crate::gui::update_mcp_tool_count(&server_name, tool_count);
+                crate::gui::clear_mcp_failure(&server_name);
                 let payload = crate::gui::build_mcp_update_payload();
                 let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
             }
             ShellInput::McpFailed { server_name, error } => {
+                crate::gui::record_mcp_failure(&server_name, &error);
                 let _ = events_tx.send(ViewEvent::ErrorText(format!(
                     "[mcp] '{server_name}' failed to start: {error}"
                 )));
+                let payload = crate::gui::build_mcp_update_payload();
+                let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
+            }
+            ShellInput::McpConnect(server_cfg) => {
+                let approver_for_spawn = state.approver.clone();
+                let input_tx_for_spawn = input_tx_self.clone();
+                let server_cfg = *server_cfg;
+                crate::gui::clear_mcp_failure(&server_cfg.name);
+                tokio::spawn(async move {
+                    let server_name = server_cfg.name.clone();
+                    match crate::mcp::McpClient::spawn_with_approver(
+                        server_cfg,
+                        Some(approver_for_spawn),
+                    )
+                    .await
+                    {
+                        Ok(client) => match client.list_tools().await {
+                            Ok(tools) => {
+                                let _ = input_tx_for_spawn.send(ShellInput::McpReady {
+                                    server_name,
+                                    client,
+                                    tools,
+                                });
+                            }
+                            Err(e) => {
+                                let _ = input_tx_for_spawn.send(ShellInput::McpFailed {
+                                    server_name,
+                                    error: format!("list_tools failed: {e}"),
+                                });
+                            }
+                        },
+                        Err(e) => {
+                            let _ = input_tx_for_spawn.send(ShellInput::McpFailed {
+                                server_name,
+                                error: e.to_string(),
+                            });
+                        }
+                    }
+                });
+            }
+            ShellInput::SkillsRefresh => {
+                // Same live-refresh the `/skill install` slash arm does:
+                // swap the SkillTool's store contents, then recompute
+                // the system prompt so the new skill is advertised.
+                let refreshed = crate::skills::SkillStore::discover();
+                let count = refreshed.skills.len();
+                if let Ok(mut store) = state.skill_store.lock() {
+                    *store = refreshed;
+                }
+                state.rebuild_system_prompt();
+                if let Err(e) = state.rebuild_agent(true) {
+                    let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                        "[skills] refresh failed: {e}"
+                    )));
+                } else {
+                    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                        "[skills] reloaded ({count} available)"
+                    )));
+                }
+            }
+            ShellInput::McpDisconnect { server_name } => {
+                // Tool names are `<sanitized-server>__<tool>`, so the
+                // prefix is what identifies this server's tools —
+                // sanitize the same way the registration did or a
+                // server named `my.server` never matches.
+                let prefix = format!(
+                    "{}{}",
+                    crate::mcp::sanitize_tool_name_segment(&server_name),
+                    crate::mcp::MCP_NAME_SEPARATOR
+                );
+                let doomed: Vec<String> = state
+                    .tool_registry
+                    .names()
+                    .iter()
+                    .filter(|n| n.starts_with(&prefix))
+                    .map(|n| n.to_string())
+                    .collect();
+                for name in &doomed {
+                    state.tool_registry.remove(name);
+                }
+                state.mcp_clients.retain(|c| c.name() != server_name);
+                crate::gui::clear_mcp_failure(&server_name);
+                crate::gui::update_mcp_tool_count(&server_name, 0);
+                state.sync_factory_snapshot();
+                // Drop the server's `# MCP server instructions` section
+                // before the agent is rebuilt around the trimmed registry.
+                state.rebuild_system_prompt();
+                if let Err(e) = state.rebuild_agent(true) {
+                    let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                        "[mcp] '{server_name}' detached but rebuild failed: {e}"
+                    )));
+                } else {
+                    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                        "[mcp] '{server_name}' disconnected ({} tool(s) removed)",
+                        doomed.len()
+                    )));
+                }
+                let payload = crate::gui::build_mcp_update_payload();
+                let _ = events_tx.send(ViewEvent::McpUpdate(payload.to_string()));
             }
             ShellInput::LineConnect(line_cfg) => {
                 // If a session is already running, cancel it
@@ -2352,7 +2887,11 @@ async fn run_worker(
                     "[telegram] bridge disconnected".into(),
                 ));
             }
-            ShellInput::TelegramMessage { text, respond } => {
+            ShellInput::TelegramMessage {
+                text,
+                images,
+                respond,
+            } => {
                 // Drive the live agent for an inbound Telegram message.
                 // Subscribe before the turn, accumulate the FINAL
                 // assistant text (cleared on each ToolCallStart so only
@@ -2384,7 +2923,19 @@ async fn run_worker(
                 // "please ask in your reply" text instead of a GUI modal
                 // the Telegram user can't see (reuses the LINE flag).
                 crate::tools::ask::set_line_driven_turn(true);
-                handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
+                if images.is_empty() {
+                    handle_line(text, &mut state, &events_tx, &cancel, &input_tx_self).await;
+                } else {
+                    handle_line_with_images(
+                        text,
+                        images,
+                        &mut state,
+                        &events_tx,
+                        &cancel,
+                        &input_tx_self,
+                    )
+                    .await;
+                }
                 crate::tools::ask::set_line_driven_turn(false);
                 let final_text = collector.await.unwrap_or_default();
                 let _ = respond.send(final_text);
@@ -2446,6 +2997,128 @@ async fn run_worker(
                     None => telegram_disconnected_payload(),
                 };
                 let _ = events_tx.send(ViewEvent::TelegramStatus(payload.to_string()));
+            }
+            ShellInput::PhoneHomeConnect(ph_cfg) => {
+                // Last connect wins — cancel any prior tunnel.
+                if let Some(prev) = state.phone_home_session.take() {
+                    prev.cancel.cancel();
+                }
+                let handle = crate::phone_home::spawn(ph_cfg, input_tx_self.clone());
+                let server_url = handle.server_url.clone();
+
+                // dev-plan/44 streaming: fan every ViewEvent up the tunnel
+                // so a connected dashboard (/talk) mirrors the live
+                // conversation — local turns included. A dedicated
+                // sequencer keeps pushes ordered (same fix as the LINE
+                // chat-bridge). Lives until the tunnel's cancel fires.
+                {
+                    let fan_client = handle.client.clone();
+                    let fan_cancel = handle.cancel.clone();
+                    let mut event_rx = events_tx.subscribe();
+                    tokio::spawn(async move {
+                        let (tx, mut rx) =
+                            tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+                        let push_client = fan_client.clone();
+                        tokio::spawn(async move {
+                            while let Some(env) = rx.recv().await {
+                                if let Err(e) = push_client.push_event(env).await {
+                                    eprintln!("[phone-home] event push failed: {e}");
+                                }
+                            }
+                        });
+                        loop {
+                            tokio::select! {
+                                _ = fan_cancel.cancelled() => break,
+                                ev = event_rx.recv() => match ev {
+                                    Ok(ev) => {
+                                        if let Some(env) = view_event_to_chat_envelope(&ev) {
+                                            let _ = tx.send(env);
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                                        continue
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    });
+                }
+
+                state.phone_home_session = Some(handle);
+                // No permission-posture swap: approvals stay on the local
+                // Ask/Auto/Plan posture so a cloud-driven turn still hits
+                // the user's local approval prompts (dev-plan/44 security
+                // note). A status pill / approval-over-bridge is follow-up;
+                // for now a SlashOutput notice is enough.
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                    "[thClaws Remote] connected → {server_url} (approvals stay local)"
+                )));
+            }
+            ShellInput::PhoneHomeDisconnect => {
+                if let Some(handle) = state.phone_home_session.take() {
+                    handle.cancel.cancel();
+                }
+                // Best-effort unpair so the relay drops the binding, then
+                // delete the on-disk config so the next boot doesn't
+                // auto-reconnect.
+                if let Ok(Some(cfg)) = crate::phone_home::PhoneHomeConfig::load() {
+                    let client = std::sync::Arc::new(crate::phone_home::build_client(
+                        cfg,
+                        crate::cancel::CancelToken::new(),
+                    ));
+                    tokio::spawn(async move {
+                        if let Err(e) = client.unpair().await {
+                            eprintln!("[phone-home] /unpair failed (continuing): {e}");
+                        }
+                    });
+                }
+                if let Err(e) = crate::phone_home::PhoneHomeConfig::delete() {
+                    eprintln!("[phone-home] delete on-disk config: {e}");
+                }
+                let _ = events_tx.send(ViewEvent::SlashOutput(
+                    "[thClaws Remote] disconnected".into(),
+                ));
+            }
+            ShellInput::PhoneHomePair => {
+                match crate::cloud::token() {
+                    None => {
+                        let _ = events_tx.send(ViewEvent::SlashOutput(
+                            "[thClaws Remote] not enabled: log in to thClaws.cloud first (Settings → thClaws.cloud)".into(),
+                        ));
+                    }
+                    Some(token) => {
+                        let relay_base = std::env::var("THCLAWS_PHONE_HOME_SERVER")
+                            .ok()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or_else(|| {
+                                crate::phone_home::config::DEFAULT_SERVER_URL.to_string()
+                            });
+                        let machine_label =
+                            std::env::var("HOSTNAME").unwrap_or_else(|_| "thclaws".to_string());
+                        let tx = input_tx_self.clone();
+                        let events = events_tx.clone();
+                        // Network round-trip — spawn so the worker loop
+                        // keeps draining input. On success, connect.
+                        tokio::spawn(async move {
+                            match crate::phone_home::pair(&relay_base, &token, Some(machine_label))
+                                .await
+                            {
+                                Ok(cfg) => {
+                                    let _ = events.send(ViewEvent::SlashOutput(
+                                        "[thClaws Remote] enabled — connecting…".into(),
+                                    ));
+                                    let _ = tx.send(ShellInput::PhoneHomeConnect(cfg));
+                                }
+                                Err(e) => {
+                                    let _ = events.send(ViewEvent::SlashOutput(format!(
+                                        "[thClaws Remote] enable failed: {e}"
+                                    )));
+                                }
+                            }
+                        });
+                    }
+                }
             }
             ShellInput::MessengerConnect(msgr_cfg) => {
                 // New connect always wins — cancel any prior session.
@@ -2669,33 +3342,58 @@ async fn run_worker(
                 // stale state. No-op if the deleted id wasn't
                 // current.
                 if state.session.id == id {
-                    save_history(&state.agent, &mut state.session, &state.session_store);
+                    // Drop the deleted session's in-memory history first so
+                    // neither the fallback load nor the fresh mint can
+                    // resurrect the just-deleted file via `save_history`
+                    // (which no-ops on empty history).
                     state.agent.clear_history();
-                    state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
-                    state.warned_file_size = false;
-                    if let (Some(store), Ok(mut g)) =
-                        (state.session_store.as_ref(), plan_persist_path.lock())
-                    {
-                        let path = store.path_for(&state.session.id);
-                        let _ = state.session.write_header_if_missing(&path);
-                        *g = Some(path);
+                    // Prefer activating the most recent *remaining* session
+                    // over minting a blank one — deleting a session and
+                    // landing on a surprise empty session is poor UX. The
+                    // store's `list()` is sorted newest-first and the
+                    // deleted id is already gone from disk.
+                    let latest_id = state
+                        .session_store
+                        .as_ref()
+                        .and_then(|s| s.list().ok())
+                        .and_then(|metas| metas.into_iter().next().map(|m| m.id));
+                    if let Some(next_id) = latest_id {
+                        // Reuse the full LoadSession path (provider auto-
+                        // switch, history rehydrate, plan/goal restore,
+                        // HistoryReplaced + sidebar refresh). Re-queued so
+                        // the current handler returns first.
+                        let _ = input_tx_self.send(ShellInput::LoadSession(next_id));
+                    } else {
+                        // Nothing left to fall back to — mint a fresh one.
+                        state.session =
+                            Session::new(&state.config.model, state.cwd.to_string_lossy());
+                        state.warned_file_size = false;
+                        if let (Some(store), Ok(mut g)) =
+                            (state.session_store.as_ref(), plan_persist_path.lock())
+                        {
+                            let path = store.path_for(&state.session.id);
+                            let _ = state.session.write_header_if_missing(&path);
+                            *g = Some(path);
+                        }
+                        crate::tools::plan_state::clear();
+                        // M6.20 BUG M2 + M3: same reset on external delete
+                        // of the active session (sidebar trash icon while
+                        // in yolo mode would otherwise carry the flag into
+                        // the freshly-minted replacement).
+                        state.approver.reset_session_flag();
+                        let _ = crate::permissions::take_pre_plan_mode();
+                        crate::permissions::set_current_mode_and_broadcast(
+                            state.agent.permission_mode,
+                        );
+                        let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
+                        let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+                            &state.session_store,
+                            &state.session.id,
+                        )));
+                        let _ = events_tx.send(ViewEvent::SlashOutput(
+                            "(deleted the last session; minted a fresh one)".into(),
+                        ));
                     }
-                    crate::tools::plan_state::clear();
-                    // M6.20 BUG M2 + M3: same reset on external delete
-                    // of the active session (sidebar trash icon while
-                    // in yolo mode would otherwise carry the flag into
-                    // the freshly-minted replacement).
-                    state.approver.reset_session_flag();
-                    let _ = crate::permissions::take_pre_plan_mode();
-                    crate::permissions::set_current_mode_and_broadcast(state.agent.permission_mode);
-                    let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
-                    let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
-                        &state.session_store,
-                        &state.session.id,
-                    )));
-                    let _ = events_tx.send(ViewEvent::SlashOutput(
-                        "(active session was deleted; minted a fresh session)".into(),
-                    ));
                 }
             }
             ShellInput::SessionRenamedExternal { id, title } => {
@@ -2718,12 +3416,31 @@ async fn run_worker(
                 // this, the worker keeps holding whatever provider it
                 // built at startup — usually the placeholder NoopProvider
                 // when the user launched without any keys configured.
+
+                // Dedup: `/model` and `/provider` slash commands write
+                // settings.json and dispatch ReloadConfig synchronously;
+                // the file-watcher then debounces the same write and
+                // dispatches a second ReloadConfig 500 ms later. Both
+                // events read identical bytes, do identical work, and —
+                // critically — emit two "(provider reloaded: …)" lines.
+                // Fingerprint the file content and skip a reload whose
+                // bytes match the previous successful reload. Manual
+                // edits to settings.json still go through (different
+                // bytes → different fingerprint).
+                let bytes = std::fs::read(crate::config::ProjectConfig::path()).ok();
+                let fp = bytes.as_ref().map(|b| {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    b.hash(&mut h);
+                    h.finish()
+                });
+                if fp.is_some() && fp == state.last_settings_fingerprint {
+                    continue;
+                }
                 let prev_model = state.config.model.clone();
                 match crate::config::AppConfig::load() {
                     Ok(new_config) => {
-                        crate::providers::set_stream_chunk_timeout_secs(
-                            new_config.stream_chunk_timeout_secs,
-                        );
+                        new_config.apply_process_globals();
                         state.config = new_config;
                     }
                     Err(e) => {
@@ -2734,32 +3451,34 @@ async fn run_worker(
                     }
                 }
                 let model_changed = state.config.model != prev_model;
-                // Preserve history when only the auth changed under the
-                // same model — wire format is unchanged. Drop history
-                // when the model itself flipped, since the new
-                // provider's message schema may not replay cleanly.
-                match state.rebuild_agent(!model_changed) {
+                // Always preserve history across config reloads, including
+                // when the model itself changed. The JSONL log is the
+                // canonical conversation; each provider's stream() builds
+                // its own wire payload from ContentBlocks per turn, so
+                // mid-conversation provider swaps replay cleanly. Blocks
+                // that don't map across providers (Anthropic Thinking on a
+                // non-reasoning OpenAI model, etc.) are silently dropped
+                // per provider. See thClaws/thClaws#142 — pre-fix this
+                // path minted a fresh session on every model change.
+                match state.rebuild_agent(true) {
                     Ok(()) => {
                         state.rebuild_system_prompt();
                         if model_changed {
-                            // Mint a fresh session so its stored
-                            // `model` field matches the active
-                            // provider — same logic as ChangeCwd.
-                            state.session = crate::session::Session::new(
-                                &state.config.model,
-                                state.cwd.to_string_lossy(),
-                            );
-                            state.warned_file_size = false;
-                            if let (Some(store), Ok(mut g)) =
-                                (state.session_store.as_ref(), plan_persist_path.lock())
-                            {
+                            // Keep the same session id + JSONL file; append a
+                            // `model` event so the switch persists immediately
+                            // (not only on the next assistant line) and a
+                            // restore recovers it. Updates the label too.
+                            if let Some(store) = state.session_store.as_ref() {
                                 let path = store.path_for(&state.session.id);
-                                let _ = state.session.write_header_if_missing(&path);
-                                *g = Some(path);
+                                let model = state.config.model.clone();
+                                let _ = state.session.record_model_to(&path, &model);
+                            } else {
+                                state.session.model = state.config.model.clone();
                             }
-                            crate::tools::plan_state::clear();
-                            let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
                         }
+                        // Record the fingerprint so the watcher's
+                        // follow-up dispatch is recognised as a dup.
+                        state.last_settings_fingerprint = fp;
                         let provider_name = state.config.detect_provider().unwrap_or("unknown");
                         let payload = serde_json::json!({
                             "type": "provider_update",
@@ -2772,6 +3491,17 @@ async fn run_worker(
                             "(provider reloaded: {})",
                             format_provider_model(provider_name, &state.config.model)
                         )));
+                        // Tell the frontend that settings-derived flags
+                        // (shellTabEnabled, teamEnabled, …) may have
+                        // moved. App.tsx subscribes to this and re-
+                        // fetches the per-flag IPCs so tab visibility
+                        // and similar UI bits update without a page
+                        // reload. Driven by the file watcher in
+                        // shared_session::spawn_settings_watcher and by
+                        // the manual `settings_reload` IPC.
+                        let _ = events_tx.send(ViewEvent::SettingsChanged(
+                            r#"{"type":"settings_changed"}"#.to_string(),
+                        ));
                     }
                     Err(e) => {
                         let _ = events_tx.send(ViewEvent::ErrorText(format!(
@@ -2796,6 +3526,17 @@ async fn run_worker(
                     "[instructions] system prompt rebuilt — new content applies on next turn"
                         .into(),
                 ));
+            }
+            ShellInput::AgentDefsChanged => {
+                // The agent editor saved `.thclaws/agents/<name>.md`.
+                // Reload the worker's def snapshot (cheap, no agent
+                // rebuild) so side-channel `/agent <name>` spawns see
+                // the new/edited def right away.
+                let plugin_agent_dirs = crate::plugins::plugin_agent_dirs();
+                let mut reloaded =
+                    crate::agent_defs::AgentDefsConfig::load_with_extra(&plugin_agent_dirs);
+                reloaded.apply_builtin_subagent_overrides(&state.config);
+                state.agent_defs = reloaded;
             }
             ShellInput::ChangeCwd(new_cwd) => {
                 // No-op short-circuit: the StartupModal's "Start"
@@ -2824,6 +3565,13 @@ async fn run_worker(
 
                 state.cwd = new_cwd.clone();
 
+                // Opening a project in the GUI: migrate its `.thclaws/`
+                // layout (v1 flat → v2 `state/`) before the config reload
+                // resolves any project paths. Process cwd was already
+                // switched by the dispatcher, so this acts on the NEW
+                // workspace. No-op once migrated / in multiuser.
+                crate::config::ProjectConfig::migrate_workspace_if_needed();
+
                 // Reload config — `AppConfig::load` reads project settings
                 // via `ProjectConfig::project_dir()`, which honors
                 // $THCLAWS_PROJECT_ROOT first and otherwise current_dir
@@ -2831,9 +3579,7 @@ async fn run_worker(
                 // from the NEW workspace win.
                 match crate::config::AppConfig::load() {
                     Ok(new_config) => {
-                        crate::providers::set_stream_chunk_timeout_secs(
-                            new_config.stream_chunk_timeout_secs,
-                        );
+                        new_config.apply_process_globals();
                         state.config = new_config;
                     }
                     Err(e) => {
@@ -2848,8 +3594,43 @@ async fn run_worker(
                 // pinned to the previous workspace's `.thclaws/sessions/`,
                 // so saves land in the wrong project and the sidebar
                 // never reflects the new project's sessions.
-                state.session_store =
-                    crate::session::SessionStore::default_path().map(SessionStore::new);
+                //
+                // dev-plan/35 Tier 1: the per-user override (multi-
+                // tenant pod) is sticky across cwd changes — a user's
+                // session JSONL must keep landing in their own
+                // <project>/.thclaws/users/<id>/sessions/ regardless
+                // of any `/cd` inside the worker. The single-tenant
+                // `None` path keeps the old cwd-relative default.
+                state.session_store = state
+                    .session_roots
+                    .as_ref()
+                    .map(|r| r.sessions_dir.clone())
+                    .or_else(crate::session::SessionStore::default_path)
+                    .map(SessionStore::new);
+
+                // Re-discover skills against the NEW cwd. Without this,
+                // project-scoped `<cwd>/.thclaws/skills/<name>/` is
+                // pinned to whichever cwd the worker was spawned with
+                // (typically the launcher cwd, NOT the project the
+                // StartupModal selected). Symptom: `/<skill-name>` in
+                // chat fails the `skill_store.contains_key` check at
+                // line ~3613 and gets emitted as "unknown command",
+                // even though the skill file is on disk in the new
+                // project. CLI never hit this because `run_repl`
+                // discovers AFTER the user has `cd`'d in their shell
+                // and there's no in-session project switch.
+                //
+                // Skill discovery walks a handful of directories and is
+                // cheap; safe to redo on every cwd change. Pre-existing
+                // refresh helper at `shell_dispatch::refresh_skill_store
+                // _and_rebuild` does the same thing for `/skill install`
+                // / `/plugin install`; this mirrors it but skips the
+                // separate `rebuild_agent` call because the unconditional
+                // hygiene block + `rebuild_system_prompt` below already
+                // rebuilds the agent's view via `set_system`.
+                if let Ok(mut store) = state.skill_store.lock() {
+                    *store = crate::skills::SkillStore::discover();
+                }
 
                 // If the model changed, rebuild the agent without history
                 // — the new provider's message schema may not match the
@@ -2948,6 +3729,11 @@ async fn run_worker(
                 // exit shortly after as their stdio is closed.
                 state.mcp_clients.clear();
                 crate::gui::clear_mcp_tool_counts();
+                // Push the now-trimmed registry into the factory
+                // snapshot so a subagent spawned between this remove
+                // and the first McpReady doesn't briefly see the
+                // old project's MCP tools.
+                state.sync_factory_snapshot();
 
                 // Spawn each MCP server in the new project — same
                 // `tokio::spawn` + ShellInput::McpReady fan-out as
@@ -3118,7 +3904,7 @@ async fn run_auto_learn_pipeline(
     let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
     let _ = lead_mb.write_status("lead", "working", None);
     let stream = Box::pin(state.agent.run_turn(ingest_prompt));
-    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx, None).await;
     crate::auto_learn::mark_ingest_done();
     crate::auto_learn::log_event(&format!(
         "ingest ok: session={} kms={kms_name} page={page}",
@@ -3141,11 +3927,105 @@ async fn run_auto_learn_pipeline(
         "[auto-learn] reconciling `{kms_name}`…"
     )));
     let stream2 = Box::pin(state.agent.run_turn(reconcile_prompt));
-    drive_turn_stream(stream2, state, events_tx, cancel, &lead_mb, input_tx).await;
+    drive_turn_stream(stream2, state, events_tx, cancel, &lead_mb, input_tx, None).await;
     crate::auto_learn::mark_reconcile_done();
     crate::auto_learn::log_event(&format!(
         "reconcile ok: kms={kms_name} (next due in {hours}h)"
     ));
+}
+
+/// Job-runner mode (`config.session_reset_per_turn`): archive the current
+/// session and start a fresh one BEFORE a user turn so repeated runs don't
+/// accumulate (and re-send) each other's context. Archive-first ⇒ the old
+/// session stays on disk, so the audit trail is complete (this is a reset,
+/// not a delete). No-op when the mode is off or history is empty. Unlike
+/// `NewSession` it deliberately skips the auto-learn pipeline — this fires
+/// on every turn, so it must stay cheap.
+/// Run one turn on a fresh throwaway child agent (empty history), then
+/// discard it — the shared `state.agent`/`state.session` are set aside
+/// untouched for the duration, so nothing accumulates. The child is
+/// swapped in as the active agent so the shared `drive_turn_stream` path
+/// runs verbatim (multi-tenant working-dir scope, gateway member billing
+/// attribution, streaming, cancellation), then the real agent + session
+/// are restored and the throwaway session is deleted so it never shows up
+/// in `/sessions`.
+async fn handle_isolated_line(
+    text: String,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    cancel: &crate::cancel::CancelToken,
+    input_tx: &mpsc::Sender<ShellInput>,
+) {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        let _ = events_tx.send(ViewEvent::TurnDone);
+        return;
+    }
+    // Fresh child from the live factory snapshot — same provider / model /
+    // tools / system prompt as the main agent, but no history.
+    let mut child = match state.agent_factory.build(&text, None, 1).await {
+        Ok(a) => a,
+        Err(e) => {
+            let _ = events_tx.send(ViewEvent::ErrorText(format!(
+                "isolated turn could not start: {e}"
+            )));
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        }
+    };
+    child.permission_mode = state.agent.permission_mode;
+
+    let saved_agent = std::mem::replace(&mut state.agent, child);
+    let saved_session = std::mem::replace(
+        &mut state.session,
+        Session::new(&state.config.model, state.cwd.to_string_lossy()),
+    );
+    let throwaway_id = state.session.id.clone();
+
+    let stream = Box::pin(state.agent.run_turn(text));
+    let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+    drive_turn_stream(
+        stream,
+        state,
+        events_tx,
+        cancel,
+        &lead_mb,
+        input_tx,
+        Some(throwaway_id.clone()),
+    )
+    .await;
+
+    // Restore the real agent + session; drop the throwaway.
+    state.agent = saved_agent;
+    state.session = saved_session;
+    if let Some(store) = state.session_store.as_ref() {
+        let _ = store.delete(&throwaway_id);
+    }
+    let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+        &state.session_store,
+        &state.session.id,
+    )));
+}
+
+fn maybe_reset_session_per_turn(
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    plan_persist_path: &std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+) {
+    if !state.config.session_reset_per_turn || state.agent.history_snapshot().is_empty() {
+        return;
+    }
+    save_history(&state.agent, &mut state.session, &state.session_store);
+    state.agent.clear_history();
+    state.session = Session::new(&state.config.model, state.cwd.to_string_lossy());
+    if let (Some(store), Ok(mut g)) = (state.session_store.as_ref(), plan_persist_path.lock()) {
+        let path = store.path_for(&state.session.id);
+        let _ = state.session.write_header_if_missing(&path);
+        *g = Some(path);
+    }
+    crate::tools::plan_state::clear();
+    state.approver.reset_session_flag();
+    let _ = events_tx.send(ViewEvent::HistoryReplaced(Vec::new()));
 }
 
 pub(crate) fn save_history(agent: &Agent, session: &mut Session, store: &Option<SessionStore>) {
@@ -3217,6 +4097,34 @@ async fn handle_line(
         return;
     }
 
+    // dev-plan/32 Tier 3 Terminal-tab text approval. When a workflow
+    // review is open and the user typed an approval response, resolve
+    // it without forwarding to the agent. Non-matching text emits a
+    // hint so users on the Terminal tab don't accidentally lose their
+    // chat input to the void while the review is blocking.
+    {
+        let pending = state.workflow_approver.pending_ids();
+        if !pending.is_empty() {
+            match crate::workflow::parse_chat_decision(trimmed) {
+                Some(decision) => {
+                    // Resolve the most-recently-registered review.
+                    // Typically there's only one open at a time.
+                    let id = pending.into_iter().next_back().unwrap();
+                    state.workflow_approver.resolve(&id, decision);
+                    return;
+                }
+                None => {
+                    let _ = events_tx.send(ViewEvent::SlashOutput(
+                        "workflow review pending — type `approve`, `cancel`, or \
+                         `rework: <note>` (or click in the Chat tab)"
+                            .to_string(),
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+
     let _ = events_tx.send(ViewEvent::UserPrompt(trimmed.to_string()));
     write_lead_log(
         &state.lead_log,
@@ -3281,6 +4189,26 @@ async fn handle_line(
                 return;
             }
             Some(g) => {
+                // Gap 1 — hard backstop. Past the iteration cap or a budget
+                // overrun (1.5× grace beyond the soft GOAL_BUDGET_LIMIT
+                // prompt), force the goal Blocked + abort the loop regardless
+                // of the model, so an unattended /goal continue loop can't
+                // burn unbounded cost.
+                if let Some(reason) = g.hard_limit_reached() {
+                    crate::goal_state::apply(|gg| {
+                        gg.status = crate::goal_state::GoalStatus::Blocked;
+                        gg.last_audit = Some(format!("auto-blocked (hard limit): {reason}"));
+                        true
+                    });
+                    let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                        "/goal continue — hard limit: {reason}. Auto-blocking goal + stopping loop."
+                    )));
+                    if let Some(loop_state) = state.active_loop.take() {
+                        loop_state.abort.abort();
+                    }
+                    let _ = events_tx.send(ViewEvent::TurnDone);
+                    return;
+                }
                 // Phase B2: anti-loop guard mirroring codex's runtime
                 // continuation suppression. If a /loop is wrapping us
                 // AND the previous turn produced zero tool calls (model
@@ -3310,7 +4238,16 @@ async fn handle_line(
                 let stream = Box::pin(state.agent.run_turn(prompt));
                 let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
                 let _ = lead_mb.write_status("lead", "working", None);
-                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+                drive_turn_stream(
+                    stream,
+                    state,
+                    events_tx,
+                    cancel,
+                    &lead_mb,
+                    input_tx,
+                    Some(state.session.id.clone()),
+                )
+                .await;
                 // Post-turn: if the model called MarkGoalComplete /
                 // MarkGoalBlocked (or any path that mutated status to
                 // terminal), stop the loop so the next firing doesn't run.
@@ -3378,8 +4315,83 @@ async fn handle_line(
         let stream = Box::pin(state.agent.run_turn(rewritten));
         let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
         let _ = lead_mb.write_status("lead", "working", None);
-        drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+        drive_turn_stream(
+            stream,
+            state,
+            events_tx,
+            cancel,
+            &lead_mb,
+            input_tx,
+            Some(state.session.id.clone()),
+        )
+        .await;
         return;
+    }
+
+    // `/kms ingest <name> <file.pdf> --vision` intercept — the text layer is
+    // garbled (e.g. a broken Thai ToUnicode font that swaps า/ำ), which no
+    // text post-processing can repair. Route through the agent: PdfRead with
+    // `vision` renders the glyphs, the model transcribes, KmsWrite stores it.
+    if let Some(crate::repl::SlashCommand::KmsIngestPdf {
+        name,
+        file,
+        alias,
+        vision,
+        ..
+    }) = crate::repl::parse_slash(trimmed)
+    {
+        if vision {
+            if crate::kms::resolve(&name).is_none() {
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!("no KMS named '{name}'")));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            // KmsWrite registers only when a KMS is attached (kms_active).
+            if state.config.kms_active.is_empty() {
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                    "/kms ingest {name} --vision: no KMS attached to this session. Run `/kms use {name}` first."
+                )));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+                return;
+            }
+            let page = alias.unwrap_or_else(|| {
+                std::path::Path::new(&file)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("pdf-page")
+                    .to_string()
+            });
+            let abs = {
+                let p = std::path::PathBuf::from(&file);
+                if p.is_absolute() {
+                    p
+                } else {
+                    state.cwd.join(&p)
+                }
+            };
+            let rewritten = crate::repl::build_kms_ingest_pdf_vision_prompt(
+                &name,
+                &page,
+                &abs.to_string_lossy(),
+            );
+            let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                "(/kms ingest {name} {file} --vision → page `{page}` — render + transcribe via PdfRead vision)"
+            )));
+            let stream = Box::pin(state.agent.run_turn(rewritten));
+            let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+            let _ = lead_mb.write_status("lead", "working", None);
+            drive_turn_stream(
+                stream,
+                state,
+                events_tx,
+                cancel,
+                &lead_mb,
+                input_tx,
+                Some(state.session.id.clone()),
+            )
+            .await;
+            return;
+        }
     }
 
     // `/kms dump <name> <text>` intercept — rewrite into a routing
@@ -3411,7 +4423,83 @@ async fn handle_line(
         let stream = Box::pin(state.agent.run_turn(rewritten));
         let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
         let _ = lead_mb.write_status("lead", "working", None);
-        drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+        drive_turn_stream(
+            stream,
+            state,
+            events_tx,
+            cancel,
+            &lead_mb,
+            input_tx,
+            Some(state.session.id.clone()),
+        )
+        .await;
+        return;
+    }
+
+    // `/kms ingest <name> <file>` intercept — do the deterministic ingest
+    // (copy source, localize images, stub page), then fire an agent turn
+    // that upgrades the stub into a curated page (summary + takeaways +
+    // wikilinks) — the same auto-summary the Files-tab "Add to KMS" gets.
+    if let Some(crate::repl::SlashCommand::KmsIngest {
+        name,
+        file,
+        alias,
+        force,
+    }) = crate::repl::parse_slash(trimmed)
+    {
+        let Some(k) = crate::kms::resolve(&name) else {
+            let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                "no KMS named '{name}' (try /kms list or /kms new {name})"
+            )));
+            let _ = events_tx.send(ViewEvent::TurnDone);
+            return;
+        };
+        let source = {
+            let p = std::path::PathBuf::from(&file);
+            if p.is_absolute() {
+                p
+            } else {
+                state.cwd.join(&p)
+            }
+        };
+        match crate::kms::ingest(&k, &source, alias.as_deref(), force) {
+            Ok(r) => {
+                let images = if r.images_copied > 0 {
+                    format!(" (+{} local image(s))", r.images_copied)
+                } else {
+                    String::new()
+                };
+                let verb = if r.overwrote { "replaced" } else { "ingested" };
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!(
+                    "{verb} → {} — {}{images} · summarizing…",
+                    r.target.display(),
+                    r.summary
+                )));
+                let src = k.root.join("sources").join(format!("{}.md", r.alias));
+                let rewritten = crate::repl::build_kms_summarize_prompt(
+                    &name,
+                    &r.alias,
+                    &src.to_string_lossy(),
+                );
+                let stream = Box::pin(state.agent.run_turn(rewritten));
+                let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
+                let _ = lead_mb.write_status("lead", "working", None);
+                drive_turn_stream(
+                    stream,
+                    state,
+                    events_tx,
+                    cancel,
+                    &lead_mb,
+                    input_tx,
+                    Some(state.session.id.clone()),
+                )
+                .await;
+            }
+            Err(e) => {
+                let _ = events_tx.send(ViewEvent::SlashOutput(format!("ingest failed: {e}")));
+                let _ = events_tx.send(ViewEvent::TurnDone);
+            }
+        }
         return;
     }
 
@@ -3448,7 +4536,16 @@ async fn handle_line(
         let stream = Box::pin(state.agent.run_turn(rewritten));
         let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
         let _ = lead_mb.write_status("lead", "working", None);
-        drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+        drive_turn_stream(
+            stream,
+            state,
+            events_tx,
+            cancel,
+            &lead_mb,
+            input_tx,
+            Some(state.session.id.clone()),
+        )
+        .await;
         return;
     }
 
@@ -3479,7 +4576,16 @@ async fn handle_line(
         let stream = Box::pin(state.agent.run_turn(rewritten));
         let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
         let _ = lead_mb.write_status("lead", "working", None);
-        drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+        drive_turn_stream(
+            stream,
+            state,
+            events_tx,
+            cancel,
+            &lead_mb,
+            input_tx,
+            Some(state.session.id.clone()),
+        )
+        .await;
         return;
     }
 
@@ -3500,27 +4606,50 @@ async fn handle_line(
             let body = trimmed.strip_prefix('/').unwrap_or("").trim_start();
             let args = body.strip_prefix(&word).unwrap_or("").trim();
 
-            // (1) Skill lookup.
-            let skill_present = state
+            // (1) Skill lookup. `state.skill_store` is snapshotted at
+            // worker spawn (run_worker line 1144) and refreshed on
+            // cwd-change + `/skill install`. But cloud workspaces can
+            // install agents into a RUNNING engine via the API's
+            // install_agent path (kubectl exec untar), which writes
+            // .thclaws/skills/ without touching cwd — the snapshot
+            // goes stale and `/foo` dispatch incorrectly returns
+            // "unknown command". On cache miss, do one fresh
+            // discover-and-retry (cheap: ~5ms FS walk) so install +
+            // immediate invocation works without a pod restart. The
+            // refreshed snapshot is saved back into state so the next
+            // popup / autocomplete sees the same view.
+            let mut skill_present = state
                 .skill_store
                 .lock()
                 .ok()
                 .map(|s| s.skills.contains_key(&word))
                 .unwrap_or(false);
+            if !skill_present {
+                if let Ok(mut store) = state.skill_store.lock() {
+                    *store = crate::skills::SkillStore::discover();
+                    skill_present = store.skills.contains_key(&word);
+                }
+            }
             if skill_present {
-                let args_note = if args.is_empty() {
-                    String::new()
-                } else {
-                    format!(" The user's task for this skill: {args}")
-                };
-                let rewritten = format!(
-                    "The user ran the `/{word}` slash command. Call `Skill(name: \"{word}\")` right away and follow the instructions it returns.{args_note}"
-                );
+                // Shared rewrite-text helper (`repl::make_skill_rewrite_prompt`)
+                // so CLI and GUI / --serve send byte-identical
+                // instructions to the model. Pre-extract, two parallel
+                // copies of this format string could drift silently.
+                let rewritten = crate::repl::make_skill_rewrite_prompt(&word, args);
                 emit_skill_resolution_hint(events_tx, &word);
                 let stream = Box::pin(state.agent.run_turn(rewritten));
                 let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
                 let _ = lead_mb.write_status("lead", "working", None);
-                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+                drive_turn_stream(
+                    stream,
+                    state,
+                    events_tx,
+                    cancel,
+                    &lead_mb,
+                    input_tx,
+                    Some(state.session.id.clone()),
+                )
+                .await;
                 return;
             }
 
@@ -3539,7 +4668,16 @@ async fn handle_line(
                 let stream = Box::pin(state.agent.run_turn(rewritten));
                 let lead_mb = crate::team::Mailbox::new(crate::team::Mailbox::default_dir());
                 let _ = lead_mb.write_status("lead", "working", None);
-                drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+                drive_turn_stream(
+                    stream,
+                    state,
+                    events_tx,
+                    cancel,
+                    &lead_mb,
+                    input_tx,
+                    Some(state.session.id.clone()),
+                )
+                .await;
                 return;
             }
         }
@@ -3561,7 +4699,16 @@ async fn handle_line(
     let _ = lead_mb.write_status("lead", "working", None);
 
     let stream = Box::pin(state.agent.run_turn(trimmed.to_string()));
-    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+    drive_turn_stream(
+        stream,
+        state,
+        events_tx,
+        cancel,
+        &lead_mb,
+        input_tx,
+        Some(state.session.id.clone()),
+    )
+    .await;
 }
 
 /// Multipart variant of `handle_line` — used when the chat composer
@@ -3625,13 +4772,139 @@ async fn handle_line_with_images(
     }
 
     let stream = Box::pin(state.agent.run_turn_multipart(user_content));
-    drive_turn_stream(stream, state, events_tx, cancel, &lead_mb, input_tx).await;
+    drive_turn_stream(
+        stream,
+        state,
+        events_tx,
+        cancel,
+        &lead_mb,
+        input_tx,
+        Some(state.session.id.clone()),
+    )
+    .await;
 }
 
 /// Drive an agent run_turn stream to completion, emitting ViewEvents
 /// to both the chat and terminal tabs. Extracted so handle_line and
 /// handle_line_with_images share the streaming loop unchanged.
+/// Regex matching the `[i/N] subject — done|cached|failed` lines the
+/// image-generator / brand-presentation / research agent shells emit.
+/// Compiled once on first use; matches are cheap (~µs each).
+static PROGRESS_LINE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\[(\d+)/(\d+)\]\s+[^—\n]+?\s*—\s*(?:done|cached|failed[^\n]*)")
+        .expect("PROGRESS_LINE_RE compiles")
+});
+
+/// Pull a human-readable `&str` out of a `Box<dyn Any + Send>` panic
+/// payload. Falls back to a generic string for non-string payloads.
+/// Used by `drive_turn_stream`'s `catch_unwind` arm so the user sees
+/// why the turn died (and the lead-log records it for the post-mortem).
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "internal error: agent turn panicked".to_string()
+    }
+}
+
+/// Public turn driver — wraps `drive_turn_stream_inner` in
+/// `catch_unwind` so a panic mid-stream still flushes the session
+/// (otherwise `save_history` in the `Done` arm never runs and the
+/// in-progress turn — sometimes the whole session — disappears on
+/// restart, per issue #148).
+///
+/// On panic: log the cause, surface it to the user, flush the session
+/// JSONL, refresh the sidebar, clear the busy spinner, release the lead
+/// agent, then re-raise so the process is still free to unwind cleanly.
+/// The inner helper's RAII guards (`_busy`, `_broadcast_on_drop`) drop
+/// normally on the unwind path — `catch_unwind` returns normally from
+/// the future's perspective.
 async fn drive_turn_stream(
+    stream: std::pin::Pin<
+        Box<dyn futures::Stream<Item = Result<AgentEvent, crate::error::Error>> + Send>,
+    >,
+    state: &mut WorkerState,
+    events_tx: &broadcast::Sender<ViewEvent>,
+    cancel: &crate::cancel::CancelToken,
+    lead_mb: &crate::team::Mailbox,
+    input_tx: &mpsc::Sender<ShellInput>,
+    surface_session: Option<String>,
+) {
+    // dev-plan/42: in a multiuser pod, run the whole turn under this
+    // session's task-local working dir (`workspace-<id>/`) so every tool
+    // — bash, write, kms, pdf/epub, workflow — resolves paths against the
+    // user's own folder, never the process cwd / shared SANDBOX_ROOT.
+    // dev-plan/45 A2: also under the member scope, so outbound gateway
+    // calls carry `X-Thclaws-Member` for billing attribution.
+    // Single-tenant leaves both scopes unset (process cwd, unchanged).
+    let root = state.cwd.clone();
+    let member = state
+        .session_roots
+        .as_ref()
+        .and_then(|r| r.member_id.clone());
+    let inner = drive_turn_stream_inner(
+        stream,
+        state,
+        events_tx,
+        cancel,
+        lead_mb,
+        input_tx,
+        surface_session,
+    );
+    let turn_result = if crate::workdir::is_multiuser() {
+        match member {
+            Some(id) => {
+                AssertUnwindSafe(crate::workdir::scope_workdir(
+                    root,
+                    crate::multi_tenant::scope_member(id, inner),
+                ))
+                .catch_unwind()
+                .await
+            }
+            None => {
+                AssertUnwindSafe(crate::workdir::scope_workdir(root, inner))
+                    .catch_unwind()
+                    .await
+            }
+        }
+    } else {
+        AssertUnwindSafe(inner).catch_unwind().await
+    };
+
+    if let Err(payload) = turn_result {
+        let msg = panic_message(&payload);
+        write_lead_log(
+            &state.lead_log,
+            &format!("\n\x1b[31m[panic]\x1b[0m {msg}\n"),
+        );
+        let _ = events_tx.send(ViewEvent::ErrorText(msg.clone()));
+        save_history(&state.agent, &mut state.session, &state.session_store);
+        let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
+            &state.session_store,
+            &state.session.id,
+        )));
+        let _ = events_tx.send(ViewEvent::TurnDone);
+        let _ = lead_mb.write_status("lead", "idle", Some(&msg));
+        std::panic::resume_unwind(payload);
+    }
+
+    // After a turn that ran tools, push a fresh KMS snapshot so the sidebar
+    // reflects any KMS an agent/workflow just created or wrote — e.g. the
+    // research agent's synthesizer/fetcher write pages via `Write` into
+    // `.thclaws/kms/**`, which no KMS-tool hook catches. `build_kms_update_payload`
+    // re-scans disk, so plain-Write pages show up without a `/reload`. The native
+    // `/research` job manager already pushes this on Done (see set_broadcaster
+    // above); this covers the catalog-agent path that runs via WorkflowRun.
+    if state.last_turn_made_tool_calls {
+        let _ = events_tx.send(ViewEvent::KmsUpdate(
+            crate::gui::build_kms_update_payload().to_string(),
+        ));
+    }
+}
+
+async fn drive_turn_stream_inner(
     mut stream: std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<AgentEvent, crate::error::Error>> + Send>,
     >,
@@ -3640,7 +4913,63 @@ async fn drive_turn_stream(
     cancel: &crate::cancel::CancelToken,
     lead_mb: &crate::team::Mailbox,
     input_tx: &mpsc::Sender<ShellInput>,
+    surface_session: Option<String>,
 ) {
+    // Process-wide busy counter — the cloud heartbeat (server.rs) uses
+    // this so a closed-browser batch keeps pinging `/keepalive` and the
+    // cloud reaper doesn't pause the pod mid-turn. RAII drop covers
+    // every return path below (cancel, end-of-stream, panic unwind).
+    //
+    // Surface vs side-channel: user-facing turns (handle_line +
+    // handle_line_with_images) pass `Some(session.id)` so the UI's
+    // running chip + cloud dashboard pill point at the user's
+    // session. Auto-learn ingest/reconcile pass `None` — they count
+    // toward the heartbeat's busy signal but don't overwrite the
+    // surface meta (the user keeps landing in their own session on
+    // reconnect, not the autonomous background work).
+    // Drop-broadcast pair. Field-declaration order matters: `_busy`
+    // drops FIRST (decrements counter + clears meta) so by the time
+    // `_broadcast_on_drop` fires, subscribers re-querying
+    // `busy_meta()` see `None`. Side-channel turns construct an
+    // empty `BroadcastOnDrop` so their guard drop is silent — the
+    // counter changes (heartbeat sees it) but the UI doesn't blink.
+    struct BroadcastOnDrop(Option<tokio::sync::broadcast::Sender<ViewEvent>>);
+    impl Drop for BroadcastOnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(ViewEvent::BusyChanged);
+            }
+        }
+    }
+    struct BusyBroadcast {
+        _busy: crate::agent_activity::BusyGuard,
+        _broadcast_on_drop: BroadcastOnDrop,
+    }
+    let _busy = match surface_session {
+        Some(id) => {
+            let guard = crate::agent_activity::BusyGuard::for_session(id);
+            let _ = events_tx.send(ViewEvent::BusyChanged);
+            BusyBroadcast {
+                _busy: guard,
+                _broadcast_on_drop: BroadcastOnDrop(Some(events_tx.clone())),
+            }
+        }
+        None => BusyBroadcast {
+            _busy: crate::agent_activity::BusyGuard::for_side_channel(),
+            _broadcast_on_drop: BroadcastOnDrop(None),
+        },
+    };
+
+    // Wall-clock start so the per-turn usage footer (emitted on Done)
+    // can report elapsed time, matching the CLI REPL's token line.
+    let turn_start = std::time::Instant::now();
+
+    // Rolling buffer for progress-line extraction. Bounded so the
+    // regex doesn't scan unbounded text on long turns; we only care
+    // about the LATEST `[i/N]` line, so a small window is enough.
+    let mut progress_buf = String::with_capacity(1024);
+    const PROGRESS_BUF_CAP: usize = 4096;
+
     // Phase B2: reset the empty-turn flag at the start of every turn.
     // Flipped to true on the first ToolCallStart below; if the model
     // produces zero tool calls during this turn, the next /loop /goal
@@ -3672,6 +5001,29 @@ async fn drive_turn_stream(
         match ev {
             Ok(AgentEvent::Text(s)) => {
                 write_lead_log(&state.lead_log, &s);
+                // Cheap progress-line extraction for the UI chip /
+                // dashboard pill. One regex pass per chunk; buffer
+                // capped so long turns don't slow down. Only the
+                // LATEST match is kept — the chip shows "what's
+                // happening right now," not history.
+                progress_buf.push_str(&s);
+                if progress_buf.len() > PROGRESS_BUF_CAP {
+                    // Issue #148: the naive `len() - cap/2` byte offset
+                    // could land mid-codepoint when the model streams
+                    // multi-byte UTF-8 (Thai / CJK / emoji), tripping
+                    // `String::drain`'s `is_char_boundary(end)` assertion
+                    // and panicking the whole turn (which then lost the
+                    // session because `save_history` runs in the `Done`
+                    // arm we never reached). `str::floor_char_boundary`
+                    // (stable since 1.79) snaps the offset to the
+                    // largest boundary ≤ target, so drain is always safe.
+                    let target = progress_buf.len() - PROGRESS_BUF_CAP / 2;
+                    let safe = progress_buf.floor_char_boundary(target.min(progress_buf.len()));
+                    progress_buf.drain(..safe);
+                }
+                if let Some(m) = PROGRESS_LINE_RE.find_iter(&progress_buf).last() {
+                    crate::agent_activity::update_progress(m.as_str());
+                }
                 let _ = events_tx.send(ViewEvent::AssistantTextDelta(s));
             }
             Ok(AgentEvent::Thinking(s)) => {
@@ -3716,9 +5068,23 @@ async fn drive_turn_stream(
                 // GUI shell silently dropped every turn's usage
                 // regardless of provider).
                 let provider_name = state.config.detect_provider().unwrap_or("unknown");
-                let tracker =
-                    crate::usage::UsageTracker::new(crate::usage::UsageTracker::default_path());
+                let tracker = crate::usage::UsageTracker::new(
+                    state
+                        .session_roots
+                        .as_ref()
+                        .map(|r| r.usage_dir.clone())
+                        .unwrap_or_else(crate::usage::UsageTracker::default_path),
+                );
                 tracker.record(provider_name, &state.config.model, &usage);
+                if let Ok(cwd) = std::env::current_dir() {
+                    crate::usage::append_usage_ledger(
+                        &cwd,
+                        "main",
+                        provider_name,
+                        &state.config.model,
+                        &usage,
+                    );
+                }
 
                 // Cost accounting (GUI parity with the CLI REPL). Drain
                 // any pending buddy resets first so a mid-turn Backspace
@@ -3765,6 +5131,37 @@ async fn drive_turn_stream(
                     &state.session_store,
                     &state.session.id,
                 )));
+
+                // Per-turn usage footer (GUI parity with the CLI REPL).
+                let cache_info = match (
+                    usage.cache_creation_input_tokens,
+                    usage.cache_read_input_tokens,
+                ) {
+                    (Some(c), Some(r)) if c > 0 || r > 0 => format!(" · cache: +{c}w/{r}r"),
+                    _ => String::new(),
+                };
+                let cost_str = if state.session_cost_usd > 0.0 {
+                    format!(" · ${:.4} session", state.session_cost_usd)
+                } else {
+                    String::new()
+                };
+                let usage_line = format!(
+                    "[tokens: {}in/{}out{} · {}{}]",
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    cache_info,
+                    crate::tool_display::format_duration(turn_start.elapsed()),
+                    cost_str
+                );
+                // Persist alongside the turn so reopening the session
+                // shows what each turn cost, instead of a conversation
+                // with every cost line stripped out.
+                if let Some(store) = &state.session_store {
+                    let path = store.path_for(&state.session.id);
+                    let _ = state.session.append_turn_usage_to(&path, &usage_line);
+                }
+                let _ = events_tx.send(ViewEvent::TurnUsage(usage_line));
+
                 let _ = events_tx.send(ViewEvent::TurnDone);
             }
             Err(e) => {
@@ -4114,9 +5511,23 @@ async fn handle_team_messages(
                 write_lead_log(&state.lead_log, "\x1b[0m\n");
                 let _ = lead_mb.write_status("lead", "active", None);
                 let provider_name = state.config.detect_provider().unwrap_or("unknown");
-                let tracker =
-                    crate::usage::UsageTracker::new(crate::usage::UsageTracker::default_path());
+                let tracker = crate::usage::UsageTracker::new(
+                    state
+                        .session_roots
+                        .as_ref()
+                        .map(|r| r.usage_dir.clone())
+                        .unwrap_or_else(crate::usage::UsageTracker::default_path),
+                );
                 tracker.record(provider_name, &state.config.model, &usage);
+                if let Ok(cwd) = std::env::current_dir() {
+                    crate::usage::append_usage_ledger(
+                        &cwd,
+                        "main",
+                        provider_name,
+                        &state.config.model,
+                        &usage,
+                    );
+                }
                 save_history(&state.agent, &mut state.session, &state.session_store);
                 let _ = events_tx.send(ViewEvent::SessionListRefresh(build_session_list(
                     &state.session_store,
@@ -4136,166 +5547,6 @@ async fn handle_team_messages(
             _ => {}
         }
     }
-}
-
-/// System-prompt addendum that grounds the model in thClaws's team
-/// feature and pushes back against Claude Code training-data bias.
-fn team_grounding_prompt(model: &str, team_enabled: bool) -> String {
-    let kind = crate::providers::ProviderKind::detect(model);
-    let on_claude_sdk = matches!(kind, Some(crate::providers::ProviderKind::AgentSdk));
-
-    if !team_enabled && !on_claude_sdk {
-        return String::new();
-    }
-
-    // Special case: teamEnabled is on, but the user picked agent/* —
-    // which shells to the local `claude` CLI subprocess. That
-    // subprocess uses Claude Code's own built-in toolset and does NOT
-    // see thClaws's tool registry. So our `TeamCreate` /
-    // `SpawnTeammate` / etc. are registered in our registry but are
-    // unreachable by the model. Telling the model to use them would
-    // be telling it to call tools it cannot see.
-    if team_enabled && on_claude_sdk {
-        return String::from(
-            "# Agent Teams — UNREACHABLE on this provider\n\n\
-             The user has enabled thClaws's team feature \
-             (`teamEnabled: true`), but they are also running on the \
-             `agent/*` provider — which shells to the local `claude` \
-             CLI as a subprocess. That subprocess uses Claude Code's \
-             own built-in toolset (`Agent`, `Bash`, `Edit`, `Read`, \
-             `ScheduleWakeup`, `Skill`, `ToolSearch`, `Write`) and \
-             does NOT see thClaws's tool registry.\n\n\
-             This means thClaws's `TeamCreate`, `SpawnTeammate`, \
-             `SendMessage`, `CheckInbox`, `TeamStatus`, \
-             `TeamTaskCreate`/`List`/`Claim`/`Complete`, and \
-             `TeamMerge` tools are REGISTERED in thClaws but are \
-             unreachable from your current toolset. You literally \
-             cannot call them.\n\n\
-             Claude Code's own `TeamCreate` / `Agent` / `TodoWrite` / \
-             `AskUserQuestion` / `ToolSearch` / `SendMessage` \
-             built-ins are available to you, but they write state \
-             under `~/.claude/teams/` and `~/.claude/tasks/` which is \
-             invisible to the thClaws Team tab. Calling them produces \
-             a fabricated success — the user sees an empty Team tab.\n\n\
-             If the user asks you to \"create a team\" / \"spawn agents\":\n\
-             - Explain that thClaws's team tools are unreachable from \
-             the `agent/*` provider (their tool registry doesn't \
-             cross the CLI subprocess boundary).\n\
-             - Tell them to switch to a non-`agent/*` provider — e.g. \
-             `claude-sonnet-4-6`, `claude-opus-4-7`, `gpt-4o`, etc. — \
-             via `/model` or `/provider`. Once switched, thClaws's \
-             team tools are directly callable.\n\
-             - Offer to proceed sequentially without a team if they \
-             prefer to stay on the `agent/*` model.\n\n\
-             Do NOT pretend a team has been created. Do NOT call \
-             Claude Code's built-in `TeamCreate` etc. as a substitute. \
-             The honest answer is the only useful one.\n",
-        );
-    }
-
-    if !team_enabled {
-        return String::from(
-            "# Agent Teams — DISABLED in this workspace\n\n\
-             The user has NOT enabled thClaws's team feature \
-             (`teamEnabled: true` is missing from `.thclaws/settings.json`). \
-             thClaws's team tools (`TeamCreate`, `SpawnTeammate`, `SendMessage`, \
-             `CheckInbox`, `TeamStatus`, `TeamTaskCreate/List/Claim/Complete`, \
-             `TeamMerge`) are NOT registered in this session and you cannot \
-             call them.\n\n\
-             You are running under the local `claude` CLI subprocess \
-             (Anthropic Agent SDK), which DOES ship its own `TeamCreate`, \
-             `Agent`, `TodoWrite`, `AskUserQuestion`, `ToolSearch`, \
-             `SendMessage` built-ins backed by `~/.claude/teams/` and \
-             `~/.claude/tasks/`. DO NOT CALL THEM. Their state is invisible \
-             to thClaws — the Team tab polls `.thclaws/team/agents/` locally \
-             and will never see an SDK-created team, so the user gets a \
-             fabricated success story with nothing behind it.\n\n\
-             If the user asks you to \"create a team\" / \"spawn agents\" / \
-             \"set up a team of subagents\", respond in plain text:\n\
-             - Explain that thClaws's team feature is off in this workspace.\n\
-             - Tell them to set `teamEnabled: true` in `.thclaws/settings.json` \
-             (or globally in `~/.config/thclaws/settings.json`) and restart \
-             the app.\n\
-             - Offer to proceed WITHOUT a team by handling the task yourself \
-             sequentially.\n\n\
-             Do NOT claim to have created a team, spawned teammates, written \
-             config, or stored state. Do NOT reference `~/.claude/teams/` or \
-             `~/.claude/tasks/` paths. The only honest response is \"teams are \
-             disabled\" — anything else is a hallucination.\n",
-        );
-    }
-
-    let mut out = String::from(
-        "# Agent Teams (thClaws native)\n\n\
-         This workspace has thClaws's team feature ENABLED. When the user asks for \
-         parallel work via a team, use ONLY these thClaws tools — they are the \
-         canonical implementation and their state is visible in the Team tab:\n\n\
-         - `TeamCreate` — define a team (name + member agents with roles/prompts). \
-         Writes `.thclaws/team/config.json` in the current project root.\n\
-         - `SpawnTeammate` — start one named teammate. Spawns a thClaws subprocess \
-         that polls its inbox in a tmux pane (or background).\n\
-         - `SendMessage` — deliver a message to a teammate's inbox.\n\
-         - `CheckInbox` — read your own inbox.\n\
-         - `TeamStatus` — summarise the team.\n\
-         - `TeamTaskCreate` / `TeamTaskList` / `TeamTaskClaim` / `TeamTaskComplete` — \
-         a shared task queue teammates can claim from.\n\
-         - `TeamMerge` — (lead only) merge each teammate's git worktree back into \
-         the main branch.\n\n\
-         Team state lives under `.thclaws/team/` **in the current project root** — \
-         NOT under `~/.claude/teams/`, NOT under `~/.claude/tasks/`. Do not reference \
-         those paths; they are from a different product.\n\n\
-         You are the team **lead**. After `TeamCreate`:\n\
-         1. Do NOT use `Bash`/`Write`/`Edit` to build code — delegate via `SendMessage`.\n\
-         2. Use `TeamTaskCreate` to queue work; teammates claim via `TeamTaskClaim`.\n\
-         3. Use `Read`/`Glob`/`Grep` only for review and verification.\n\
-         4. Watch `CheckInbox` / `TeamStatus` between coordination rounds.\n\
-         \n\
-         **Worktree isolation is declarative.** If a teammate should work on \
-         an isolated branch, set `isolation: \"worktree\"` on that member when \
-         you call `TeamCreate`. `SpawnTeammate` then creates \
-         `.worktrees/{name}` on branch `team/{name}` automatically and \
-         launches the teammate there. DO NOT write `git worktree add …` or \
-         `cd ../{name}` into teammate prompts — the teammate will execute them \
-         as shell and the worktree will land somewhere wrong (project root, a \
-         sibling dir) and be invisible to `TeamMerge`.\n\
-         \n\
-         # CRITICAL: do NOT call Claude Code's Agent SDK team tools\n\n\
-         Your training data contains references to an Anthropic Managed Agents \
-         SDK server-side toolset (`agent_toolset_20260401`) that ships its own \
-         `TeamCreate`, `Agent`, `AskUserQuestion`, `TodoWrite`, `ToolSearch`, \
-         `SendMessage` tools backed by `~/.claude/teams/` and `~/.claude/tasks/`. \
-         Those are a DIFFERENT SYSTEM, invisible to thClaws — if you call them \
-         (or claim to have called them in your text output), the user will see \
-         an empty Team tab and think nothing happened.\n\n\
-         Rules that apply regardless of which provider you are running on:\n\
-         - When the user asks about \"teams\" / \"agents\" / \"task queue\", use \
-         the thClaws tools listed above. `TeamCreate` and `SendMessage` in this \
-         workspace mean the thClaws versions — never the SDK's.\n\
-         - Never reference `~/.claude/teams/`, `~/.claude/tasks/`, or \
-         `~/.config/thclaws/teams/` paths in your replies. Teams live in \
-         `.thclaws/team/`.\n\
-         - Do not call `AskUserQuestion`, `TodoWrite`, `ToolSearch`, or a bare \
-         `Agent` tool. Those belong to Claude Code's interactive flow and do \
-         not exist in thClaws. If you need a task list, use `TeamTaskCreate`. \
-         If you need to ask the user, just ask them in plain text.\n\
-         - Do not claim to have created a team, spawned agents, or stored \
-         config unless you actually called the corresponding thClaws tool and \
-         got a success response back.\n",
-    );
-
-    if on_claude_sdk {
-        out.push_str(
-            "\n# Additional note for the Claude Agent SDK provider\n\n\
-             You ARE running under the local `claude` CLI subprocess right now, \
-             which ships its own `TeamCreate`, `Agent`, `AskUserQuestion`, \
-             `TodoWrite`, and `ToolSearch` built-ins. Calling them will appear \
-             to succeed inside Claude Code's own world, but the thClaws Team \
-             tab polls `.thclaws/team/agents/` and will never see a team \
-             created that way. Treat any impulse to call those tools as a bug.\n",
-        );
-    }
-
-    out
 }
 
 /// Squash any control char (newline, carriage return, tab, ESC, etc.)
@@ -4327,6 +5578,14 @@ fn format_provider_model(provider: &str, model: &str) -> String {
 fn view_event_to_chat_envelope(ev: &ViewEvent) -> Option<serde_json::Value> {
     use serde_json::json;
     match ev {
+        // The user's own message — so a connected surface (phone-home
+        // /talk) mirrors what was typed locally. The LINE browser SPA has
+        // no `user_message` case so it ignores this; the phone-home /talk
+        // page renders it as a user bubble. (dev-plan/44 streaming)
+        ViewEvent::UserPrompt(text) => Some(json!({
+            "type": "user_message",
+            "text": text,
+        })),
         ViewEvent::AssistantTextDelta(text) => {
             // Apply the same ANSI + tool-narration strip the LINE
             // OA path uses, otherwise the model's echoed
@@ -4476,12 +5735,14 @@ mod tests {
 
     /// Serialises tests that mutate `HAL_API_KEY` so they don't race
     /// each other or any other test reading the env var in parallel.
+    // Alias for the crate-wide env lock. These tests mutate
+    // HAL_API_KEY / TAVILY_API_KEY / BRAVE_SEARCH_API_KEY, which the
+    // prompt-builder reads via `services_prompt_section()` — racing
+    // against the prompt test in repl::tests would flip the section
+    // size mid-build. The HAL bullet is ~1700 chars, which is exactly
+    // the size mismatch we saw before this was unified.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+        crate::kms::test_env_lock()
     }
 
     #[test]
@@ -4498,7 +5759,7 @@ mod tests {
         std::env::remove_var("HAL_API_KEY");
         std::env::remove_var("TAVILY_API_KEY");
         std::env::remove_var("BRAVE_SEARCH_API_KEY");
-        let section = services_prompt_section();
+        let section = crate::prompts::services_prompt_section(false);
         assert!(
             section.contains("WebSearch"),
             "section must always mention WebSearch (DuckDuckGo fallback is always available): {section}"
@@ -4530,7 +5791,7 @@ mod tests {
         let _g = env_lock();
         let prev = std::env::var("TAVILY_API_KEY").ok();
         std::env::set_var("TAVILY_API_KEY", "test-key");
-        let section = services_prompt_section();
+        let section = crate::prompts::services_prompt_section(false);
         assert!(
             section.contains("Tavily (best quality)"),
             "should highlight Tavily as active backend when key set: {section}"
@@ -4546,7 +5807,7 @@ mod tests {
         let _g = env_lock();
         let prev = std::env::var("HAL_API_KEY").ok();
         std::env::set_var("HAL_API_KEY", "test-key");
-        let section = services_prompt_section();
+        let section = crate::prompts::services_prompt_section(false);
         assert!(
             section.contains("# External services"),
             "missing header: {section}"
@@ -4586,7 +5847,7 @@ mod tests {
         let _g = env_lock();
         let prev = std::env::var("HAL_API_KEY").ok();
         std::env::set_var("HAL_API_KEY", "   ");
-        let section = services_prompt_section();
+        let section = crate::prompts::services_prompt_section(false);
         // Section is no longer empty (WebSearch always mentioned),
         // but the HAL-specific bullet should NOT appear with a
         // whitespace-only key.
@@ -4612,7 +5873,7 @@ mod tests {
         // mentioned with both Create and Read variants — the model
         // looks for "DocxCreate" specifically when the user asks for
         // a .docx, and for "DocxRead" when given one to parse.
-        let section = documents_prompt_section();
+        let section = crate::prompts::documents_prompt_section();
         assert!(
             section.contains("# Document & spreadsheet generation"),
             "missing header: {section}"
@@ -4671,7 +5932,7 @@ mod tests {
         // behavior — every skill listed with description + trigger.
         let mut out = String::new();
         let store = store_with_two();
-        append_skills_section(&mut out, &store, "full");
+        crate::prompts::append_skills_section(&mut out, &store, "full");
         assert!(out.contains("# Available skills (MANDATORY usage)"));
         assert!(out.contains("**pdf**"), "name not bolded: {out}");
         assert!(out.contains("Render PDFs"), "description missing: {out}");
@@ -4689,7 +5950,7 @@ mod tests {
         // savings for users with many skills.
         let mut out = String::new();
         let store = store_with_two();
-        append_skills_section(&mut out, &store, "names-only");
+        crate::prompts::append_skills_section(&mut out, &store, "names-only");
         assert!(out.contains("# Available skills (MANDATORY usage)"));
         // Names ARE listed.
         assert!(out.contains("pdf"), "name missing: {out}");
@@ -4717,7 +5978,7 @@ mod tests {
         // skill name on a line), not raw substring absence.
         let mut out = String::new();
         let store = store_with_two();
-        append_skills_section(&mut out, &store, "discover-tool-only");
+        crate::prompts::append_skills_section(&mut out, &store, "discover-tool-only");
         assert!(out.contains("# Available skills (MANDATORY usage)"));
         // No skill listing — bullet markers + bolded names + comma
         // joins shouldn't appear.
@@ -4739,7 +6000,7 @@ mod tests {
         // "full" silently, but defense-in-depth.
         let mut out = String::new();
         let store = store_with_two();
-        append_skills_section(&mut out, &store, "totally-bogus-strategy");
+        crate::prompts::append_skills_section(&mut out, &store, "totally-bogus-strategy");
         // Should look like the full-strategy output.
         assert!(out.contains("**pdf**"));
         assert!(out.contains("Render PDFs"));
@@ -4899,5 +6160,137 @@ mod tests {
         assert_eq!(display.len(), 1);
         assert_eq!(display[0].role, "tool");
         assert_eq!(display[0].content, "AskUserQuestion");
+    }
+    /// A reloaded conversation has to look like the live one: the
+    /// model's reasoning comes back as a collapsed block, and each
+    /// turn's cost footer lands under the turn it belongs to.
+    #[test]
+    fn from_session_restores_thinking_and_usage_footers() {
+        use crate::types::{ContentBlock, Message, Role};
+        let mut session = crate::session::Session::new("m", "/tmp");
+        session.messages = vec![
+            Message::user("first"),
+            Message {
+                role: Role::Assistant,
+                content: vec![
+                    ContentBlock::Thinking {
+                        content: "weighing it up".into(),
+                        signature: None,
+                    },
+                    ContentBlock::Text { text: "one".into() },
+                ],
+            },
+            Message::user("second"),
+            Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Text { text: "two".into() }],
+            },
+        ];
+        session.turn_usage = vec![
+            crate::session::TurnUsage {
+                after: 2,
+                text: "[tokens: 10in/2out · 1s]".into(),
+            },
+            crate::session::TurnUsage {
+                after: 4,
+                text: "[tokens: 20in/4out · 2s]".into(),
+            },
+        ];
+
+        let display = DisplayMessage::from_session(&session);
+        let shape: Vec<(&str, &str)> = display
+            .iter()
+            .map(|d| (d.role.as_str(), d.content.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("user", "first"),
+                ("assistant", "one"),
+                ("system", "[tokens: 10in/2out · 1s]"),
+                ("user", "second"),
+                ("assistant", "two"),
+                ("system", "[tokens: 20in/4out · 2s]"),
+            ],
+            "each footer belongs under its own turn"
+        );
+        assert_eq!(
+            display[1].thinking.as_deref(),
+            Some("weighing it up"),
+            "reasoning survives the reload"
+        );
+        assert!(display[4].thinking.is_none());
+    }
+
+    /// A footer recorded past the end — history trimmed by a compaction
+    /// after the fact — still renders rather than disappearing.
+    #[test]
+    fn from_session_keeps_footers_recorded_past_the_end() {
+        let mut session = crate::session::Session::new("m", "/tmp");
+        session.messages = vec![crate::types::Message::user("only")];
+        session.turn_usage = vec![crate::session::TurnUsage {
+            after: 9,
+            text: "[tokens: 1in/1out · 0s]".into(),
+        }];
+        let display = DisplayMessage::from_session(&session);
+        assert_eq!(display.len(), 2);
+        assert_eq!(display[1].role, "system");
+    }
+
+    // Regression test for issue #148: `progress_buf.drain(..drain)` in
+    // drive_turn_stream_inner panicked with `is_char_boundary` failure
+    // when the byte offset fell inside a multi-byte UTF-8 codepoint
+    // (Thai/CJK/emoji from the model). Fix uses `floor_char_boundary`
+    // to snap the offset down to a safe boundary first. This test
+    // exercises the exact drain pattern the production code uses.
+    #[test]
+    fn progress_buf_drain_handles_multibyte_text() {
+        const PROGRESS_BUF_CAP: usize = 256;
+        let mut progress_buf = String::with_capacity(1024);
+        // 2000 crab emojis = 8000 bytes, all 4-byte UTF-8 — the
+        // worst case for the old naive `len() - cap/2` math.
+        progress_buf.push_str(&"🦀".repeat(2000));
+        let original_chars = progress_buf.chars().count();
+
+        // Mirror the production idiom (post-fix):
+        if progress_buf.len() > PROGRESS_BUF_CAP {
+            let target = progress_buf.len() - PROGRESS_BUF_CAP / 2;
+            let safe = progress_buf.floor_char_boundary(target.min(progress_buf.len()));
+            progress_buf.drain(..safe);
+        }
+        // After drain, len() must be well under the cap and every
+        // remaining char must still be a complete codepoint.
+        assert!(progress_buf.len() <= PROGRESS_BUF_CAP);
+        assert!(progress_buf.chars().count() < original_chars);
+        // `is_char_boundary` on the drain point is the exact
+        // assertion Vec::drain uses internally — catches a future
+        // regression to the un-snapped offset.
+        assert!(progress_buf.is_char_boundary(progress_buf.len()));
+    }
+
+    #[test]
+    fn floor_char_boundary_snap_is_safe_for_mid_codepoint_offset() {
+        // 4-byte emoji repeated. Char boundaries are at 0, 4, 8, ... —
+        // `floor_char_boundary` snaps to the largest boundary ≤ target.
+        let s = "🦀".repeat(2000);
+
+        // A target inside a codepoint must snap to the previous
+        // boundary (byte 1 or 2 inside the first 4-byte emoji → 0).
+        let mid_target = 1;
+        let safe = s.floor_char_boundary(mid_target);
+        assert!(s.is_char_boundary(safe));
+        assert_eq!(safe, 0, "must snap to previous char boundary");
+        assert!(safe < mid_target);
+
+        // A target already on a boundary stays put.
+        let on_boundary = 4000; // 1000th emoji, byte offset
+        let safe = s.floor_char_boundary(on_boundary);
+        assert!(s.is_char_boundary(safe));
+        assert_eq!(safe, on_boundary);
+
+        // Target past end clamps to len() (still a valid boundary).
+        let past_end = s.len() + 100;
+        let safe = s.floor_char_boundary(past_end);
+        assert_eq!(safe, s.len());
     }
 }

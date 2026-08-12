@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { X, ArrowLeft, Loader2, Pencil, Save } from "lucide-react";
 import { marked } from "marked";
 import { send, subscribe } from "../hooks/useIPC";
+import { assetUrl } from "../lib/assetUrl";
 import { MarkdownEditor } from "./MarkdownEditor";
 import type { ViewerTarget } from "./KmsBrowserSidebar";
 
@@ -36,6 +37,10 @@ interface Props {
 export function KmsViewerOverlay({ initial, onClose }: Props) {
   const [stack, setStack] = useState<ViewerTarget[]>([initial]);
   const [content, setContent] = useState<string | null>(null);
+  // Absolute dir of the current file, from `kms_file_content`. Used to
+  // resolve relative markdown image links to `/file-asset` URLs so KMS
+  // source images render here the same way they do in the Files tab.
+  const [assetBase, setAssetBase] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   // Edit mode (pages only): YAML frontmatter edited in a modal, the
@@ -76,6 +81,7 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
       ) {
         if (msg.ok) {
           setContent(msg.content as string);
+          setAssetBase(String(msg.asset_base ?? ""));
         } else {
           setError((msg.error as string) ?? "read failed");
         }
@@ -156,8 +162,8 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
 
   const html = useMemo(() => {
     if (content === null) return "";
-    return renderMarkdownToHtml(content);
-  }, [content]);
+    return rewriteImageSrcs(renderMarkdownToHtml(content), assetBase);
+  }, [content, assetBase]);
 
   // Intercept clicks on rendered anchors. Resolve KMS-internal
   // targets (wikilinks, relative paths) into back-stack pushes;
@@ -325,7 +331,7 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
         className="flex-1 overflow-auto kms-viewer-prose"
         style={{ color: "var(--text-primary)" }}
       >
-        <div className="max-w-4xl mx-auto px-8 py-6">
+        <div className="max-w-4xl mx-auto px-4 sm:px-8 py-6">
           {error && (
             <div
               className="px-3 py-2 rounded"
@@ -362,7 +368,7 @@ export function KmsViewerOverlay({ initial, onClose }: Props) {
                   {saveError}
                 </div>
               )}
-              <MarkdownEditor source={editBody} onChange={setEditBody} />
+              <MarkdownEditor source={editBody} onChange={setEditBody} baseDir={assetBase} />
             </>
           )}
         </div>
@@ -449,6 +455,29 @@ function renderMarkdownToHtml(markdown: string): string {
   let body = stripFrontmatter(markdown);
   body = rewriteWikilinks(body);
   return marked.parse(body) as string;
+}
+
+/// Rewrite relative `<img src>` in rendered KMS HTML to `/file-asset`
+/// URLs rooted at the file's directory (`assetBase`), so images ingested
+/// alongside a markdown source (`sources/<alias>-assets/…`) load in the
+/// viewer. Remote (`http(s):`/`data:`/`blob:`), already-absolute, and
+/// already-resolved (`thclaws:`) srcs are left alone. Runs on the
+/// rendered HTML only — the underlying `content` stays pristine so edit +
+/// save never persist these display URLs back into the source.
+function rewriteImageSrcs(html: string, assetBase: string): string {
+  if (!assetBase) return html;
+  const base = assetBase.replace(/\/+$/, "");
+  return html.replace(
+    /(<img\b[^>]*?\ssrc=)("|')(.*?)\2/gi,
+    (match, pre: string, quote: string, src: string) => {
+      const s = src.trim();
+      if (!s || /^(https?:|data:|blob:|thclaws:|\/\/)/i.test(s) || s.startsWith("/")) {
+        return match;
+      }
+      const rel = s.replace(/^\.\//, "");
+      return `${pre}${quote}${assetUrl(`${base}/${rel}`)}${quote}`;
+    },
+  );
 }
 
 function stripFrontmatter(s: string): string {

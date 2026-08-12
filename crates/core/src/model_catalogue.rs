@@ -141,7 +141,51 @@ pub struct ModelEntry {
     /// returns `None` for these.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier_billed: Option<bool>,
+    /// Per-image price in USD for image-generation models billed PER
+    /// IMAGE rather than per token (e.g. Qwen-Image-2.0 $0.035/image,
+    /// -pro $0.075). The `*_per_mtok` fields don't apply to these; this
+    /// is the SSOT figure for per-image gateway metering (dev-plan/40).
+    /// Desktop users with their own provider key are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price_per_image_usd: Option<f64>,
 }
+
+impl ModelEntry {
+    /// True when this row has a published price (input OR output rate),
+    /// is free, or is subscription-tier-billed. Cheap-to-call helper
+    /// for surfaces that want to badge unpriced rows or sort priced
+    /// rows first — does NOT gate listing. Listing every model the
+    /// engine knows is the policy: missing pricing should be filled
+    /// (via `scripts/refresh-model-catalogue.py` or manual edits to
+    /// `resources/model_catalogue.json`), not used to hide the row.
+    #[allow(dead_code)]
+    pub fn has_published_pricing(&self) -> bool {
+        if self.free == Some(true) || self.tier_billed == Some(true) {
+            return true;
+        }
+        self.input_per_mtok.is_some() || self.output_per_mtok.is_some()
+    }
+
+    /// True when this row's `context` is the provider block's blanket
+    /// default rather than a figure anyone published.
+    ///
+    /// Both catalogue writers stamp [`CONTEXT_UNVERIFIED_MARK`] when they
+    /// have to guess, and the marker is the only reliable signal — a guess
+    /// can coincide with a real window, so the number can't tell you. Model
+    /// pickers use this to render `200k?` instead of presenting a floor as
+    /// a specification (dev-plan/57).
+    pub fn context_unverified(&self) -> bool {
+        self.source
+            .as_deref()
+            .is_some_and(|s| s.contains(CONTEXT_UNVERIFIED_MARK))
+    }
+}
+
+/// Stamped into a row's `source` by both catalogue writers
+/// (`scripts/refresh-model-catalogue.py` and `bin/catalogue_seed.rs`)
+/// whenever the context window falls back to the provider default.
+/// Changing this string means changing it in all three places.
+pub const CONTEXT_UNVERIFIED_MARK: &str = "(context unverified)";
 
 /// Per-token-type usage counts for one agent run. Fed into
 /// [`Catalogue::compute_cost_usd`]. All fields default to 0 so callers
@@ -312,8 +356,15 @@ impl Catalogue {
         if entry.free == Some(true) {
             return Some(0.0);
         }
+        // A per-mtok rate is only usable if it's finite and non-negative.
+        // A sentinel/garbage value (e.g. the -1_000_000 placeholder used
+        // for a variable-priced router like `openrouter/fusion`) is
+        // treated as "unpriced" so cost reports as unknown (None) rather
+        // than a nonsensical negative.
+        let usable =
+            |rate: Option<f64>| -> Option<f64> { rate.filter(|r| r.is_finite() && *r >= 0.0) };
         let per_m = |count: u32, rate: Option<f64>| -> f64 {
-            rate.map_or(0.0, |r| (count as f64 / 1_000_000.0) * r)
+            usable(rate).map_or(0.0, |r| (count as f64 / 1_000_000.0) * r)
         };
         // Cache math: prompt_tokens is the total (Anthropic convention).
         // Uncached input = prompt_tokens - cached_input_tokens. Saturating
@@ -336,11 +387,11 @@ impl Catalogue {
         // If nothing was priced (entry exists but every per-mtok field is
         // None), return None rather than $0 — `Some(0.0)` is reserved
         // for explicit `free: true`.
-        if entry.input_per_mtok.is_none()
-            && entry.output_per_mtok.is_none()
-            && entry.cached_input_per_mtok.is_none()
-            && entry.cache_creation_per_mtok.is_none()
-            && entry.reasoning_per_mtok.is_none()
+        if usable(entry.input_per_mtok).is_none()
+            && usable(entry.output_per_mtok).is_none()
+            && usable(entry.cached_input_per_mtok).is_none()
+            && usable(entry.cache_creation_per_mtok).is_none()
+            && usable(entry.reasoning_per_mtok).is_none()
         {
             return None;
         }
@@ -481,6 +532,24 @@ impl EffectiveCatalogue {
             }
         }
         self.baseline.compute_cost_usd(model, usage)
+    }
+
+    /// True when `model` has a priced catalogue entry (both input AND output
+    /// per-mtok present) — i.e. the thClaws Gateway can meter it. This is the
+    /// "featured / gateway-servable" test used to decide gateway-vs-BYOK
+    /// routing. Checks the user cache first, then the embedded baseline.
+    pub fn is_priced(&self, model: &str) -> bool {
+        let priced = |c: &Catalogue| {
+            c.find_entry(model)
+                .map(|e| e.input_per_mtok.is_some() && e.output_per_mtok.is_some())
+                .unwrap_or(false)
+        };
+        if let Some(c) = &self.cache {
+            if priced(c) {
+                return true;
+            }
+        }
+        priced(&self.baseline)
     }
 
     /// Look up an override for `model`, applying the same alias and
@@ -678,6 +747,9 @@ impl EffectiveCatalogue {
                                 .reasoning_per_mtok
                                 .or(baseline.reasoning_per_mtok),
                             tier_billed: e.tier_billed.or(baseline.tier_billed),
+                            price_per_image_usd: e
+                                .price_per_image_usd
+                                .or(baseline.price_per_image_usd),
                         },
                         None => e.clone(),
                     };
@@ -947,6 +1019,9 @@ pub fn provider_kind_name(k: crate::providers::ProviderKind) -> &'static str {
     use crate::providers::ProviderKind;
     match k {
         ProviderKind::Anthropic => "anthropic",
+        ProviderKind::AtlasCloud => "atlascloud",
+        ProviderKind::MetaAi => "meta",
+        ProviderKind::NineRouter => "9router",
         // Must match `ProviderKind::name()` so a round-trip via
         // `detect_provider()` → `provider_kind_name(kind)` returns
         // the same key. Pre-fix this returned `"agent-sdk"` while
@@ -960,15 +1035,17 @@ pub fn provider_kind_name(k: crate::providers::ProviderKind) -> &'static str {
         ProviderKind::OpenAIResponses => "openai-responses",
         ProviderKind::ChatGptCodex => "chatgpt-codex",
         ProviderKind::OpenRouter => "openrouter",
+        ProviderKind::TokenRouter => "tokenrouter",
         ProviderKind::Gemini => "gemini",
         ProviderKind::Ollama => "ollama",
         ProviderKind::OllamaAnthropic => "ollama-anthropic",
         ProviderKind::OllamaCloud => "ollama-cloud",
         ProviderKind::DashScope => "dashscope",
         ProviderKind::QwenCloud => "qwen-cloud",
-        ProviderKind::AgenticPress => "agentic-press",
         ProviderKind::ZAi => "zai",
         ProviderKind::LMStudio => "lmstudio",
+        ProviderKind::VLlm => "vllm",
+        ProviderKind::LlamaCpp => "llamacpp",
         ProviderKind::AzureAIFoundry => "azure",
         ProviderKind::OpenAICompat => "openai-compat",
         ProviderKind::DeepSeek => "deepseek",
@@ -976,6 +1053,9 @@ pub fn provider_kind_name(k: crate::providers::ProviderKind) -> &'static str {
         ProviderKind::Nvidia => "nvidia",
         ProviderKind::OpenCodeGo => "opencode-go",
         ProviderKind::Minimax => "minimax",
+        ProviderKind::Moonshot => "moonshot",
+        ProviderKind::XAi => "xai",
+        ProviderKind::Groq => "groq",
     }
 }
 
@@ -1201,6 +1281,55 @@ mod tests {
     use super::*;
 
     #[test]
+    /// The marker is the only signal that separates a guessed window from a
+    /// sourced one — the number can't, since a guess can coincide with a real
+    /// value. Asserted against the shipped catalogue rather than a fixture so
+    /// it fails if a writer stops stamping, which is the failure that lets a
+    /// guess ossify into an apparent fact.
+    #[test]
+    fn unverified_context_is_distinguishable_in_the_shipped_catalogue() {
+        let c = Catalogue::from_json_str(BASELINE_JSON).unwrap();
+        let mut marked = 0usize;
+        let mut sourced = 0usize;
+        for pc in c.providers.values() {
+            for e in pc.models.values() {
+                if e.context.is_none() {
+                    continue;
+                }
+                if e.context_unverified() {
+                    marked += 1;
+                } else {
+                    sourced += 1;
+                }
+            }
+        }
+        assert!(marked > 0, "no row carries {CONTEXT_UNVERIFIED_MARK}");
+        assert!(
+            sourced > 0,
+            "every row reads as a guess — marker over-applied"
+        );
+
+        // A row's own source decides it; nothing infers from the value.
+        let anth = c.providers.get("anthropic").unwrap();
+        let opus = anth.models.get("claude-opus-4-8").unwrap();
+        assert!(!opus.context_unverified(), "{:?}", opus.source);
+
+        let mut guess = ModelEntry::default();
+        guess.source = Some(format!(
+            "https://example/v1/models {CONTEXT_UNVERIFIED_MARK}"
+        ));
+        assert!(guess.context_unverified());
+        // The marker survives a pricing tag being appended after it.
+        guess.source = Some(format!(
+            "https://example/v1/models {CONTEXT_UNVERIFIED_MARK} + litellm:x"
+        ));
+        assert!(guess.context_unverified());
+        // No source at all is not a claim of verification either way, but it
+        // must not read as marked.
+        assert!(!ModelEntry::default().context_unverified());
+    }
+
+    #[test]
     fn baseline_parses() {
         let c = Catalogue::from_json_str(BASELINE_JSON).expect("baseline catalogue must parse");
         assert_eq!(c.schema, CURRENT_SCHEMA);
@@ -1218,19 +1347,32 @@ mod tests {
         }
     }
 
+    /// The model used below is a live catalogue row, so its window changes
+    /// whenever upstream does — Sonnet 4.6 went 200k → 1M when its context was
+    /// sourced properly, and a pinned literal here turned that data fix into
+    /// three red tests. What these tests own is the *layering*: which layer
+    /// answered and that the id resolved at all. The number is the
+    /// catalogue's business, so read it from the catalogue.
     #[test]
     fn lookup_finds_exact_model() {
         let c = baseline_only();
+        let want = c
+            .baseline
+            .lookup_context("claude-sonnet-4-6")
+            .expect("model must exist in the shipped catalogue");
         let (n, src) = effective_context_window_with(&c, "claude-sonnet-4-6");
-        assert_eq!(n, 200_000);
+        assert_eq!(n, want);
         assert_eq!(src, ContextSource::Catalogue);
     }
 
     #[test]
     fn lookup_strips_vendor_prefix() {
         let c = baseline_only();
+        // The property is that the prefixed id resolves to the same row as the
+        // bare one — not that either equals some particular number.
+        let (bare, _) = effective_context_window_with(&c, "claude-sonnet-4-6");
         let (n, src) = effective_context_window_with(&c, "openrouter/anthropic/claude-sonnet-4-6");
-        assert_eq!(n, 200_000);
+        assert_eq!(n, bare);
         assert_eq!(src, ContextSource::Catalogue);
     }
 
@@ -1384,10 +1526,12 @@ mod tests {
 
     #[test]
     fn override_removal_falls_back_to_catalogue() {
-        // Empty override map → catalogue layer wins as before.
+        // Empty override map → catalogue layer wins as before. As above, the
+        // catalogue owns the number; this test owns which layer answered.
         let eff = baseline_only();
+        let want = eff.baseline.lookup_context("claude-sonnet-4-6").unwrap();
         let (n, src) = effective_context_window_with(&eff, "claude-sonnet-4-6");
-        assert_eq!(n, 200_000);
+        assert_eq!(n, want);
         assert_eq!(src, ContextSource::Catalogue);
     }
 
@@ -1874,6 +2018,31 @@ mod tests {
             )
             .expect("free entry");
         assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn cost_negative_sentinel_price_is_unpriced_not_negative() {
+        // A -1_000_000 placeholder (e.g. a variable-priced router that
+        // slipped into the catalogue) must read as unpriced (None), never
+        // produce a nonsensical negative cost.
+        let c = Catalogue::from_json_str(
+            r#"{"schema":4,"providers":{"openrouter":{"models":{
+                "openrouter/fusion":{"input_per_mtok":-1000000.0,"output_per_mtok":-1000000.0}
+            }}}}"#,
+        )
+        .expect("parses");
+        let cost = c.compute_cost_usd(
+            "openrouter/fusion",
+            &TokenUsage {
+                prompt_tokens: 500_000,
+                completion_tokens: 10_000,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            cost, None,
+            "negative sentinel must be unpriced, got {cost:?}"
+        );
     }
 
     #[test]

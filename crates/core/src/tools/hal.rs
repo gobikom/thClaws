@@ -44,6 +44,12 @@ pub(crate) fn build_client() -> reqwest::Client {
 /// mid-session sees the change on the next tool invocation without
 /// needing a worker rebuild.
 pub(crate) fn hal_available() -> bool {
+    // Gateway active (desktop proxy or cloud pod): HAL is reachable via
+    // the gateway even with no local key (the gateway holds it). Direct
+    // mode: needs a local key.
+    if crate::tools::gateway_active() {
+        return true;
+    }
     std::env::var("HAL_API_KEY")
         .ok()
         .map(|k| !k.trim().is_empty())
@@ -82,18 +88,27 @@ pub(crate) async fn scrape_via_hal(client: &reqwest::Client, url: &str) -> Resul
 /// error detail on non-2xx. Network / parse errors map to
 /// `Error::Tool` with the underlying message.
 async fn hal_post(client: &reqwest::Client, path: &str, body: &Value) -> Result<Value> {
-    let key = std::env::var("HAL_API_KEY").map_err(|_| {
-        Error::Tool(
-            "HAL_API_KEY not set — paste it in Settings → Providers (HAL Public API)".into(),
-        )
-    })?;
-    if key.trim().is_empty() {
-        return Err(Error::Tool("HAL_API_KEY is empty".into()));
-    }
-    let url = format!("{HAL_BASE_URL}{path}");
-    let resp = client
-        .post(&url)
-        .header("X-API-Key", key)
+    // Gateway mode: POST to `{gateway}/hal{path}` with the gateway
+    // bearer; the gateway injects the real X-API-Key. Direct mode: hit
+    // HAL directly with the local key.
+    let req = if let Some(gw) = crate::tools::gateway_route() {
+        client
+            .post(format!("{}/hal{path}", gw.base))
+            .header("authorization", format!("Bearer {}", gw.token))
+    } else {
+        let key = std::env::var("HAL_API_KEY").map_err(|_| {
+            Error::Tool(
+                "HAL_API_KEY not set — paste it in Settings → Providers (HAL Public API)".into(),
+            )
+        })?;
+        if key.trim().is_empty() {
+            return Err(Error::Tool("HAL_API_KEY is empty".into()));
+        }
+        client
+            .post(format!("{HAL_BASE_URL}{path}"))
+            .header("X-API-Key", key)
+    };
+    let resp = req
         .header("Content-Type", "application/json")
         .json(body)
         .send()
@@ -181,6 +196,10 @@ impl Tool for YouTubeTranscriptTool {
     }
 
     fn requires_env(&self) -> &'static [&'static str] {
+        // HAL_API_KEY is in GATEWAY_SERVED_ENVS, so `tool_is_available`
+        // keeps these visible whenever the gateway is active (desktop proxy
+        // or cloud pod) even with no local key — `hal_post` then routes
+        // through the gateway. Direct mode needs the local key.
         &["HAL_API_KEY"]
     }
 
@@ -282,11 +301,18 @@ impl Tool for WebScrapeTool {
     }
 
     fn requires_env(&self) -> &'static [&'static str] {
+        // HAL_API_KEY is in GATEWAY_SERVED_ENVS, so `tool_is_available`
+        // keeps these visible whenever the gateway is active (desktop proxy
+        // or cloud pod) even with no local key — `hal_post` then routes
+        // through the gateway. Direct mode needs the local key.
         &["HAL_API_KEY"]
     }
 
     async fn call(&self, input: Value) -> Result<String> {
         let url = req_str(&input, "url")?;
+        crate::net_guard::guard(url)
+            .await
+            .map_err(|e| Error::Tool(format!("WebScrape: {e}")))?;
         let mut body = json!({"url": url});
         for field in [
             "wait_for",

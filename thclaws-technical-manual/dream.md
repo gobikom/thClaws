@@ -14,10 +14,10 @@ The feature is intentionally narrow: it composes existing primitives (side-chann
 
 Both spawn through the same `spawn_side_channel` pipeline ([side-channel.md §2](side-channel.md)). `/dream` is `/agent dream <prompt>` underneath, but reaches the user as a first-class command because the underlying agent ships with the binary and the dispatch chooses a sensible default prompt when none is given.
 
-This doc covers: the embedded AgentDef seeding flow + override semantics, the `KmsDelete` tool added for consolidation, the slash-command surface, the dream agent's four-pass operating procedure, and the testing surface.
+This doc covers: the embedded AgentDef seeding flow + override semantics, the `KmsDelete` tool added for consolidation, the slash-command surface, the dream agent's multi-pass operating procedure, and the testing surface.
 
 **Source modules:**
-- [`crates/core/src/default_prompts/dream.md`](../thclaws/crates/core/src/default_prompts/dream.md) — the embedded AgentDef. Markdown frontmatter (`name`, `description`, `model`, `tools`, `permissionMode`, `maxTurns`, `color`) plus the four-pass system prompt body. Compiled into the binary via `include_str!`.
+- [`crates/core/src/default_prompts/dream.md`](../thclaws/crates/core/src/default_prompts/dream.md) — the embedded AgentDef. Markdown frontmatter (`name`, `description`, `model`, `tools`, `permissionMode`, `maxTurns`, `color`) plus the multi-pass system prompt body. Compiled into the binary via `include_str!`.
 - [`crates/core/src/agent_defs.rs`](../thclaws/crates/core/src/agent_defs.rs) — `AgentDefsConfig::seed_builtins()` runs at the start of `load_with_extra` so disk-loaded agent defs (legacy JSON + user/project markdown dirs) override built-ins by name. `parse_agent_md_str` extracted from `parse_agent_md` so the same parser handles both file paths and embedded strings.
 - [`crates/core/src/kms.rs`](../thclaws/crates/core/src/kms.rs) — `delete_page()` helper alongside `write_page` / `append_to_page`. Validates page name via `writable_page_path` (same path-safety carve-out as the write helpers), removes the file, prunes the matching bullet from `index.md` via `remove_index_bullet()`, and appends `## [date] deleted | <stem>` to `log.md` via `append_log_header`.
 - [`crates/core/src/tools/kms.rs`](../thclaws/crates/core/src/tools/kms.rs) — `KmsDeleteTool`: `requires_approval = true`, takes `{kms, page}`, calls `kms::delete_page`. Sits alongside `KmsWriteTool` and `KmsAppendTool` as the third mutation tool.
@@ -48,7 +48,10 @@ The dream agent is shipped inside the binary as a markdown file with YAML frontm
 
 ```rust
 fn seed_builtins(&mut self) {
-    const BUILTINS: &[(&str, &str)] = &[("dream", include_str!("default_prompts/dream.md"))];
+    const BUILTINS: &[(&str, &str)] = &[
+        ("dream", include_str!("default_prompts/dream.md")),
+        // … also: translator, kms-linker, kms-reconcile, kms-maintain
+    ];
     for (fallback_name, raw) in BUILTINS {
         if let Some(agent) = Self::parse_agent_md_str(raw, fallback_name) {
             self.agents.push(agent);
@@ -87,7 +90,7 @@ The disk path is now a thin wrapper. Behaviour is identical to before for on-dis
 
 ```yaml
 name: dream
-description: Consolidate the project's KMS by mining recent sessions, deduping pages, and surfacing insights
+description: Mine recent sessions into per-session digests in the `dreams` KMS, consolidate durable insights into active KMSes, dedupe, and reconcile
 tools: KmsRead, KmsSearch, KmsWrite, KmsAppend, KmsDelete, KmsCreate, Read, Glob, Grep, TodoWrite, SessionRename
 permissionMode: auto
 maxTurns: 120
@@ -101,25 +104,28 @@ Notable choices:
 - **`permissionMode: auto`** — the agent's KMS mutations land directly. The user-facing review pattern is `git diff .thclaws/kms/`, not in-modal approval. A user who wants approval-gated dreaming can override the AgentDef.
 - **`maxTurns: 120`** — consolidation across multiple KMS + 10 sessions can take many turns. Default is 200; 120 is a comfortable ceiling that still bounds runaway behavior.
 
-### Five-pass operating procedure
+### Primary knowledge KMS
 
-Pre-fix the body was a four-pass loop. The current body is a **five-pass** loop with explicit skip-already-dreamed + auto-rename + scoped reconciliation logic:
+The current prompt resolves a **primary knowledge KMS** once at the top of the run: the first active KMS in `## Knowledge bases` whose name is not `dreams`, or — when `dreams` is the only active KMS, or none is active — **`dreams` itself**. Canonical by-topic knowledge pages (Pass 3) go there. This is the key change from the original design, which forbade *all* knowledge in `dreams`: in the common single-KMS setup the user activates `dreams` (it's where `/dream` writes), so topic pages must be allowed to live there. Topic pages and session/audit pages coexist in `dreams`, kept apart by **page name** (see invariant below).
 
-1. **Survey + skip-already-dreamed.** Read the active KMS list + each `index.md`. `KmsSearch` the dedicated `dreams` KMS for the most recent prior `dream-` summary; extract its "Sessions processed" table. Glob `.thclaws/sessions/*.jsonl` (10 most recent by default, all with `--all`). Skip sessions whose recorded `last_message_at` ≥ current file mtime — no new chat content since prior dream.
-2. **Read sessions + auto-rename.** Read each surviving session JSONL. If the session's title is missing or matches the auto-generated `sess-<8hex>` shape, propose a meaningful one-line title (≤ 70 chars) and call `SessionRename`. Skip sessions the user already gave a meaningful title to.
-3. **Consolidate (writes to ACTIVE KMSes only).** For each insight: pick the right active KMS (`auth-conventions` ↔ project-knowledge, personal preferences ↔ personal-notes, etc.); `KmsSearch(kms: "<active-kms>", pattern: "...")` first; prefer `KmsAppend` over creating a new page; merge overlapping pages via `KmsWrite` + `KmsDelete`. **The `kms:` argument MUST be one of the active KMSes from the system prompt — never `dreams`.** If no active KMS is attached, Pass 3 is skipped entirely (noted in the summary) and the agent proceeds to Pass 4. Track which pages were written/appended/deleted (all of which live in active KMSes) — Pass 3b needs that list.
-4. **Pass 3b — Targeted reconciliation (still in active KMSes).** For every page touched in Pass 3 only: `KmsRead` the full page, look for internal contradictions (two facts disagreeing, stale timestamps, "we use X" vs "we migrated away from X"), and `KmsWrite` a rewrite with a `## History` section preserving the old stance + reason for change. All Pass 3-touched pages are in active KMSes, so Pass 3b never reads or writes `dreams`. Do NOT touch unmodified pages — that's `/kms reconcile`'s job (full-vault sweep). Targeted scope keeps the diff cohesive for review.
-5. **Summarize (writes the SINGLE summary page to `dreams` ONLY).** Always end the run by writing one summary page in the **`dreams`** KMS (NOT any active project / user KMS) at `dream-YYYY-MM-DD.md`. The summary carries a Sessions-processed table (load-bearing — next dream's Pass 1 reads it), plus pages added / updated / reconciled / deleted lists, sessions renamed, insights surfaced, and skipped reasons. The summary is the ONLY page that ever lands in `dreams`; knowledge pages from Pass 3 live in active KMSes.
+### Multi-pass operating procedure
 
-### Two-way targeting invariant
+The body is a multi-pass loop (1 → 2 → 2b → 3 → 3b → 4):
 
-The prompt enforces a strict two-way invariant via repetition + an explicit anti-pattern section:
+1. **Survey + skip + source-reconcile.** `KmsRead` the primary KMS index (and any other active KMS). `KmsRead` the `dreams` index — it holds per-session digests (`sess-<id>`) and run summaries (`dream-YYYY-MM-DD`); the digests are the **resume markers** (a session with a current digest is skippable). Glob `.thclaws/sessions/*.jsonl` (10 most recent by default, all with `--all`). Skip a session when a `dreams` digest exists for it AND that digest's `last_message_at` ≥ file mtime. **Source-reconcile sweep:** glob the *full* live-session set and, for any page (topic or `sess-*`) whose `sources:` lists a `sess-<id>` with no live file (user deleted the session), drop just that dead id — **never delete the page**. (The full-vault analogue of this lives in `/kms maintain`; see [kms.md](kms.md) §15.)
+2. **Read + skip-empty + auto-rename.** Read each surviving session JSONL. **Skip empty sessions** (no `user`/`assistant` messages — only header/plan/goal/rename events): no digest, no rename. Otherwise auto-rename if the title is missing or matches the `sess-<8hex>` shape.
+3. *(Pass 2b)* **Per-session digest → `dreams`.** For every non-empty session, `KmsWrite` a **thin** digest page named by session id (`sess-<id>`) to `dreams`: 1–3 sentences on what the session was about + `folded_into: [<topic-slugs>]` + `last_message_at` (load-bearing for Pass 1's skip filter). The digest is provenance, **not** a second copy of the knowledge — that lives in the Pass 3 topic page.
+4. *(Pass 3)* **Consolidate into canonical topic pages → primary knowledge KMS.** For each topic worth curating: pick a topic-named page (`corgi`, `auth-conventions`), `KmsSearch` first, and enrich the **one canonical page** (`KmsAppend`/merge-`KmsWrite`) rather than creating parallels — merging across sessions. Full-fidelity (the page must be ≥ as useful as re-doing the research). When the primary KMS *is* `dreams`, these topic pages live in `dreams` alongside the digests, distinguished by name.
+5. *(Pass 3b)* **Targeted reconciliation.** For every **topic page** touched in Pass 3: `KmsRead`, look for internal contradictions, `KmsWrite` a rewrite with a `## History` section. Never reconciles `sess-*` digests or `dream-*` summaries even when they share the `dreams` KMS. Unmodified pages are out of scope — that's `/kms reconcile` / `/kms maintain`.
+6. *(Pass 4)* **Summarize → `dreams`.** `KmsCreate({name: "dreams"})` (idempotent), then `KmsWrite` one `dream-YYYY-MM-DD` run summary to `dreams`: scope, sessions table, pages added/updated/reconciled, **sources reconciled** (deleted sessions), sessions renamed, insights, skipped.
 
-- Pass 3 + Pass 3b: `kms:` MUST be an active KMS. NEVER `dreams`.
-- Pass 4: `kms:` MUST be `dreams`. NEVER an active KMS.
-- Pass 1 reads `dreams` (looking for prior summaries) and reads active KMSes' indices. Reads are exempt from the write-direction rule.
+### Routing invariant (content-kind + page-name, not pass)
 
-Historical failure mode (pre-fix): the prompt's Pass 3 wording said "the relevant KMS", which the agent interpreted loosely + saw `dreams` mentioned repeatedly elsewhere in the prompt → defaulted to filing knowledge pages in `dreams`. The current prompt adds explicit `kms: "<active-kms-name>"` placeholders in every Pass 3 example, a "Common mistakes to avoid" subsection enumerating the failure patterns (knowledge to `dreams`, summary to active KMS, cross-vault merge), and a Discipline rule stating the invariant in both directions.
+The original "two-way, pass-based" rule (Pass 3 → active KMS, Pass 4 → `dreams`) was replaced because `dreams` can now legitimately hold topic knowledge. The invariant is now decided by **content kind and page name**:
+
+- **Curated topic knowledge** → primary knowledge KMS, in a **topic-named** page (never `sess-*` / `dream-*`).
+- **Per-session digests** (`sess-*`) + the **run summary** (`dream-*`) → `dreams`.
+- When primary == `dreams`, all three coexist there; the **page name** is what keeps them straight. The prompt's "Common mistakes" section enumerates the failure patterns (topic knowledge in a `sess-*`/`dream-*` page, a digest in a topic page, a digest-only run that never builds topic pages).
 
 ### `--all` flag
 
@@ -129,7 +135,7 @@ The active KMS list reaches the dream agent through the same `kms::system_prompt
 
 ### Dispatch auto-creates the `dreams` KMS
 
-`shell_dispatch.rs`'s Dream arm calls `kms::create("dreams", KmsScope::Project)` before `spawn_side_channel` (idempotent). This is layer 1 of defense-in-depth — the agent itself also calls `KmsCreate({name: "dreams", scope: "project"})` as Pass 5 Step 0 (layer 2). Either layer alone is sufficient; both together survive stale binaries, filesystem races between dispatch and agent execution, etc.
+`shell_dispatch.rs`'s Dream arm calls `kms::create("dreams", KmsScope::Project)` before `spawn_side_channel` (idempotent). This is layer 1 of defense-in-depth — the agent itself also calls `KmsCreate({name: "dreams", scope: "project"})` as the Pass 4 (Summarize) Step 0 (layer 2). Either layer alone is sufficient; both together survive stale binaries, filesystem races between dispatch and agent execution, etc.
 
 ---
 
@@ -200,8 +206,9 @@ REPL dispatch prints a GUI-only hint; the CLI doesn't have a broadcast surface t
 ```rust
 SlashCommand::Dream { focus } => {
     let prompt = if focus.trim().is_empty() {
-        "Consolidate the active KMS by mining recent sessions. \
-         Follow your standard four-pass procedure.".to_string()
+        "Consolidate the project's knowledge by mining recent sessions into \
+         per-session digests and canonical topic pages. Follow your standard \
+         multi-pass procedure.".to_string()
     } else {
         focus
     };
@@ -251,7 +258,7 @@ End-to-end, what happens when a user types `/dream auth`:
    stream and final result.
 ```
 
-The four-pass dream procedure runs entirely inside step 6 — the agent uses its tool whitelist to read sessions, search KMS, write/append/delete pages, and finally write the audit-trail summary page.
+The multi-pass dream procedure runs entirely inside step 6 — the agent uses its tool whitelist to read sessions, search KMS, write/append/delete pages, and finally write the audit-trail summary page.
 
 ---
 

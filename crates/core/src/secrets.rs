@@ -2,7 +2,7 @@
 //!
 //! Backend: macOS Keychain, Windows Credential Manager, or Linux Secret
 //! Service (via the `keyring` crate). Service name is `"thclaws"`, account
-//! is the provider short name (`"agentic-press"`, `"anthropic"`, `"openai"`,
+//! is the provider short name (`"anthropic"`, `"openai"`,
 //! `"gemini"`, `"dashscope"`).
 //!
 //! Keys are decrypted only when read. At startup [`load_into_env`] pulls
@@ -91,10 +91,13 @@ fn resolved_backend() -> Backend {
 /// variants that share an env var with another provider (we dedupe by env
 /// var name in the UI layer).
 const MANAGED: &[ProviderKind] = &[
-    ProviderKind::AgenticPress,
     ProviderKind::Anthropic,
     ProviderKind::OpenAI,
     ProviderKind::OpenRouter,
+    ProviderKind::TokenRouter,
+    ProviderKind::AtlasCloud,
+    ProviderKind::MetaAi,
+    ProviderKind::NineRouter,
     ProviderKind::Gemini,
     ProviderKind::DashScope,
     ProviderKind::QwenCloud,
@@ -106,6 +109,10 @@ const MANAGED: &[ProviderKind] = &[
     ProviderKind::ThaiLLM,
     ProviderKind::Nvidia,
     ProviderKind::OpenCodeGo,
+    ProviderKind::Moonshot,
+    ProviderKind::XAi,
+    ProviderKind::Minimax,
+    ProviderKind::Groq,
 ];
 
 /// Non-LLM service keys we surface in the same Settings modal as the
@@ -117,6 +124,7 @@ const MANAGED: &[ProviderKind] = &[
 pub const SERVICE_KEYS: &[(&str, &str)] = &[
     ("tavily", "TAVILY_API_KEY"),
     ("brave-search", "BRAVE_SEARCH_API_KEY"),
+    ("serpapi", "SERPAPI_API_KEY"),
     ("hal", "HAL_API_KEY"),
 ];
 
@@ -332,13 +340,24 @@ pub struct KeyStatus {
     /// separately even though they flow through the same modal /
     /// IPC.
     pub kind: &'static str,
+    /// `true` for a Featured-tier (gateway-routable) provider. The Settings
+    /// modal groups providers into "Featured (gateway-routable)" vs
+    /// "Additional (bring your own key)" using this. Always false for services.
+    pub featured: bool,
+    /// The provider's representative default model (e.g. `gpt-4.1`), shown as a
+    /// hint in the modal — mirrors the `/providers` output. Empty for services.
+    pub default_model: &'static str,
 }
 
 /// Snapshot the current state of every managed provider's API key. Used by
 /// the UI to render "configured / not configured" and decide button state.
 pub fn status() -> Vec<KeyStatus> {
-    let mut out: Vec<KeyStatus> = MANAGED
-        .iter()
+    // Iterate in display order (Featured tier first, then Additional) so the
+    // Settings modal groups exactly like `/providers`. Only emit MANAGED
+    // providers (the ones whose key we store).
+    let mut out: Vec<KeyStatus> = crate::providers::ProviderKind::display_ordered()
+        .into_iter()
+        .filter(|p| MANAGED.contains(p))
         .filter_map(|p| {
             let env_var = p.api_key_env()?;
             let configured = get(p.name()).is_some();
@@ -355,6 +374,8 @@ pub fn status() -> Vec<KeyStatus> {
                 env_source,
                 key_length: env_value.as_deref().map(str::len).unwrap_or(0),
                 kind: "provider",
+                featured: p.tier() == crate::providers::ProviderTier::Featured,
+                default_model: p.default_model(),
             })
         })
         .collect();
@@ -373,6 +394,8 @@ pub fn status() -> Vec<KeyStatus> {
             env_source,
             key_length: env_value.as_deref().map(str::len).unwrap_or(0),
             kind: "service",
+            featured: false,
+            default_model: "",
         });
     }
     out
@@ -438,7 +461,6 @@ mod tests {
     fn status_lists_known_providers() {
         let s = status();
         let names: Vec<_> = s.iter().map(|k| k.provider).collect();
-        assert!(names.contains(&"agentic-press"));
         assert!(names.contains(&"anthropic"));
         assert!(names.contains(&"openai"));
         assert!(names.contains(&"gemini"));

@@ -8,7 +8,7 @@ The four modes:
 |---|---|---|---|
 | **GUI** (default) | `thclaws` | wry+tao desktop window with React UI | tao event loop on main thread + tokio worker thread |
 | **CLI REPL** | `thclaws-cli` OR `thclaws --cli` | rustyline interactive terminal | single tokio runtime; readline on a `spawn_blocking` thread |
-| **Headless / print** | `thclaws-cli -p "..."` OR `thclaws -p "..."` | non-interactive, one-shot prompt | single tokio runtime; exits when the turn completes |
+| **Headless / print** | `thclaws-cli -p "..."` OR `thclaws -p "..."` | non-interactive, one-shot prompt — since v0.88.0 a FULL surface: Task subagents, session persist + `--resume <id\|last>` (`--no-session` opts out), hooks | single tokio runtime; exits when the turn completes |
 | **Web (`--serve`)** | `thclaws --serve --port <N>` | Axum HTTP + WebSocket; React UI in browser | tokio runtime hosting Axum + the same shared worker the GUI uses |
 
 This doc covers: the shared engine that all four modes consume, the per-mode process model + dispatch chain, the binary + feature-flag layout (`thclaws` vs `thclaws-cli`, `gui` feature gate), how each mode handles input + output + approvals + hooks + cancellation, when to pick which, deployment patterns, and the M6.36 SERVE9 architecture invariant (`crate::ipc::handle_ipc` returning `bool` so wry GUI delegates to the shared dispatch then falls through for wry-only arms).
@@ -67,6 +67,8 @@ Two engines emerge from this:
 
 - **`Agent::run_turn`** — the per-turn LLM call loop ([`agentic-loop.md`](agentic-loop.md)). All four modes invoke it the same way. It produces an async stream of `AgentEvent`s (text deltas, tool calls, tool results, done).
 - **`SharedSessionHandle`** (gui + serve only) — wraps `Agent` + `Session` + the input mpsc + the events broadcast for multi-tab consumers. CLI + print drive `Agent::run_turn` directly without this wrapper.
+
+Print mode (`run_print_mode_with`, repl.rs) reached surface parity in v0.88.0: it registers the subagent Task tool (headless `AutoApprover` sink + the run's permission MODE, `--allowed/--disallowed-tools` filtered BEFORE the factory snapshot — same anti-escalation ordering as the REPL), persists its session to the workspace store and honors `--resume <id|last>` (provider session id rehydrated), and fires lifecycle hooks. `[session] …` notices go to stderr; stdout stays the clean answer. This is the primitive `thclaws schedule add --resume-session last` heartbeats spawn (see schedule.md).
 
 ---
 

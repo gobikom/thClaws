@@ -124,6 +124,12 @@ mcp 'weather' removed from .thclaws/mcp.json (restart to drop active tools)
 
 ## Marketplace
 
+MCP servers are one of the four types in the unified thClaws
+marketplace (skills · MCP · plugins · subagents — see
+[Chapter 12](ch12-skills.md)). In the GUI, **`/marketplace`** opens a
+browser modal with an **MCP** tab; the text commands below work
+everywhere.
+
 `/mcp marketplace` browses curated MCP servers vetted by the thClaws
 team. Same shape as the skill marketplace — three discovery commands
 plus a name-based install:

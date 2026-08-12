@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use crate::bridge::BridgeConfig;
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 

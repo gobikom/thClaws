@@ -737,3 +737,16 @@ The `all_presets_have_validatable_cron` test catches cron typos. Slash commands 
 - **inotify exhaustion** — Linux `fs.inotify.max_user_watches` defaults to 8192 per user. Recursive watches on huge trees can blow that. The daemon logs the error and skips the watcher; other schedules continue. No retry / quota-bumping logic.
 - **Cooldown is fixed (60s)** — not configurable per schedule. v1 trade-off; bump to a `cooldownSecs` field if a use case demands it.
 - **No per-schedule paused-by-system semantics** — if the laptop is closed or the daemon is stopped, the schedule simply doesn't fire and `lastRun` stays where it was. There's no way to ask "fire all missed events on resume" beyond the manual `lastRun` workaround.
+
+## Heartbeats — `resumeSession` (v0.88.0)
+
+`Schedule.resume_session` (`--resume-session <id|last>` on `schedule add`)
+appends `--resume <value>` to the spawned `thclaws --print` job. Print mode
+persists sessions + honors `--resume` since the same release
+(see running-modes.md), so every fire loads the prior fires' full history,
+adds one exchange, and saves — one growing conversation instead of a fresh
+amnesiac run. `last` resumes the cwd's most-recent session (first fire
+starts it); an explicit id chains onto an existing session. Serde default
+keeps old `schedules.json` files loading; the GUI add-modal passes `None`
+(CLI-only for now). E2E: two consecutive fires of a counting prompt answered
+"1" then "2" from one session file.

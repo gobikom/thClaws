@@ -14,8 +14,10 @@
 //!      it before anything else — otherwise the CLI ignores user input.
 //!   3. We write a user message envelope on stdin:
 //!        `{"type":"user","session_id":"","message":{"role":"user","content":"..."},"parent_tool_use_id":null}`
-//!   4. We close stdin (no bidirectional hooks / SDK MCP servers, so we
-//!      don't need it open past the first message).
+//!   4. We keep stdin open when the SDK MCP bridge is wired, because the
+//!      CLI drives that bridge over it — including DURING step 2, before
+//!      our own ack arrives. Only a bridge-less provider drops stdin
+//!      here (that path relies on EOF to commit the session file).
 //!   5. We stream stdout lines and parse events. Terminal event is
 //!      `{"type":"result",...}` — emit MessageStop with usage.
 //!
@@ -79,15 +81,21 @@ impl AgentSdkProvider {
     /// plan-mode tools) are filtered at `sdk_mcp::handle_mcp_message`
     /// time. Used by `build_provider` so the bridge stands up
     /// without the caller threading their own registry.
-    pub fn with_default_thclaws_tools() -> Arc<ToolRegistry> {
+    ///
+    /// Returns it unwrapped so the caller can still apply the operator's
+    /// `--allowed-tools` / `--disallowed-tools` before handing it over —
+    /// the bridge is a separate registry from the agent's, and skipping
+    /// that step let a restricted run reach unrestricted tools.
+    pub fn default_bridge_registry() -> ToolRegistry {
         let mut r = ToolRegistry::with_builtins();
         r.register(Arc::new(crate::tools::KmsReadTool));
         r.register(Arc::new(crate::tools::KmsSearchTool));
         r.register(Arc::new(crate::tools::KmsWriteTool));
+        r.register(Arc::new(crate::tools::KmsWriteSourceTool));
         r.register(Arc::new(crate::tools::KmsAppendTool));
         r.register(Arc::new(crate::tools::KmsDeleteTool));
         r.register(Arc::new(crate::tools::KmsCreateTool));
-        Arc::new(r)
+        r
     }
 
     fn next_request_id(&self) -> String {
@@ -109,24 +117,185 @@ impl Default for AgentSdkProvider {
     }
 }
 
+/// Resolve the `claude` CLI to a spawnable path.
+///
+/// - An explicit `configured` value (anything other than the bare
+///   `"claude"` default — i.e. a `CLAUDE_BIN`/`with_bin` override) is
+///   respected verbatim.
+/// - Otherwise, if `claude` is found on the current `PATH`, use the bare
+///   name (lets the OS resolve it — the terminal-launch happy path).
+/// - Otherwise fall back to the well-known install locations a
+///   GUI/launchd launch misses (its PATH is `/usr/bin:/bin:…`). Returns
+///   the first that exists; if none, returns `"claude"` unchanged so the
+///   caller's not-found error still fires with a helpful message.
+fn resolve_claude_bin(configured: &str) -> String {
+    if configured != "claude" {
+        return configured.to_string();
+    }
+    if let Some(p) = find_on_path("claude") {
+        return p.to_string_lossy().into_owned();
+    }
+    let home = crate::util::home_dir();
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(h) = &home {
+        for rel in [
+            ".claude/local/claude", // Claude Code's native installer
+            ".local/bin/claude",
+            ".npm-global/bin/claude",
+            ".volta/bin/claude",
+            ".bun/bin/claude",
+            ".yarn/bin/claude",
+        ] {
+            candidates.push(h.join(rel));
+        }
+    }
+    for abs in [
+        "/opt/homebrew/bin/claude", // Apple-Silicon Homebrew
+        "/usr/local/bin/claude",    // Intel Homebrew / manual
+        "/usr/bin/claude",
+    ] {
+        candidates.push(std::path::PathBuf::from(abs));
+    }
+    for c in candidates {
+        if c.is_file() {
+            return c.to_string_lossy().into_owned();
+        }
+    }
+    "claude".to_string()
+}
+
+/// First `<dir>/<name>` on `PATH` that is a file. `None` if `PATH` is
+/// unset or the binary isn't found (the GUI/launchd case).
+fn find_on_path(name: &str) -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let p = dir.join(name);
+        p.is_file().then_some(p)
+    })
+}
+
+/// Answer one `control_request` from the CLI on the SDK MCP bridge.
+///
+/// Shared by the initialize-ack wait and the main stream loop: the CLI
+/// can drive the bridge from the moment it has read `initialize`, so
+/// both windows have to be able to reply. Anything that isn't an
+/// `mcp_message` for our server is left alone — the CLI treats an
+/// unanswered request as a timeout, but answering one we don't
+/// understand would be worse.
+async fn answer_bridge_request(
+    v: &Value,
+    stdin: &mut tokio::process::ChildStdin,
+    tools: Option<&Arc<ToolRegistry>>,
+) {
+    if v.pointer("/request/subtype").and_then(Value::as_str) != Some("mcp_message") {
+        return;
+    }
+    if v.pointer("/request/server_name").and_then(Value::as_str)
+        != Some(crate::sdk_mcp::SERVER_NAME)
+    {
+        return;
+    }
+    let req_id = v
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mcp_msg = v
+        .pointer("/request/message")
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mcp_resp = match tools {
+        Some(reg) => crate::sdk_mcp::handle_mcp_message(reg.clone(), &mcp_msg).await,
+        None => json!({
+            "jsonrpc": "2.0",
+            "id": mcp_msg.get("id").cloned().unwrap_or(Value::Null),
+            "error": { "code": -32601, "message": "no tools registry attached" },
+        }),
+    };
+    let envelope = json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": req_id,
+            "response": { "mcp_response": mcp_resp },
+        },
+    });
+    if let Err(e) = stdin.write_all(envelope.to_string().as_bytes()).await {
+        eprintln!("[agent-sdk] mcp bridge (init window): stdin write failed: {e}");
+        return;
+    }
+    let _ = stdin.write_all(b"\n").await;
+    let _ = stdin.flush().await;
+}
+
+/// The `message.content` we hand the CLI for this turn.
+///
+/// Prior history lives server-side under `--session-id`, so only the new
+/// user message travels. It used to travel as the first text block and
+/// nothing else, which silently dropped a pasted or dragged image —
+/// under `agent/*` the model answered as if none had been attached
+/// (public issue #185, reported by HelloMAF).
+///
+/// A text-only turn still serializes as a bare string, which is what the
+/// CLI has always received; a turn carrying an image switches to the
+/// block array. `ContentBlock`'s serde tagging already emits the
+/// Anthropic wire shape the CLI accepts, so the blocks pass through
+/// as-is. Non-user-authored blocks (thinking, tool_use, tool_result) are
+/// history, not input, and stay out.
+fn user_turn_content(last: Option<&crate::types::Message>) -> Value {
+    use crate::types::ContentBlock;
+    let Some(msg) = last else {
+        return Value::String(String::new());
+    };
+    let carries_image = msg
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::Image { .. }));
+    if !carries_image {
+        let text = msg
+            .content
+            .iter()
+            .find_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        return Value::String(text);
+    }
+    let blocks: Vec<Value> = msg
+        .content
+        .iter()
+        .filter(|b| matches!(b, ContentBlock::Text { .. } | ContentBlock::Image { .. }))
+        .filter_map(|b| serde_json::to_value(b).ok())
+        .collect();
+    Value::Array(blocks)
+}
+
 #[async_trait]
 impl Provider for AgentSdkProvider {
     async fn stream(&self, req: StreamRequest) -> Result<EventStream> {
         // Pull the user's latest turn. Prior history lives server-side under
         // --session-id, so we only send the new user message.
-        let user_text = req
-            .messages
-            .last()
-            .and_then(|m| {
-                m.content.iter().find_map(|b| match b {
-                    crate::types::ContentBlock::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-            })
-            .unwrap_or_default();
+        let user_content = user_turn_content(req.messages.last());
 
-        // Build the CLI command.
-        let mut cmd = Command::new(&self.claude_bin);
+        // Build the CLI command. Resolve `claude` robustly: a GUI /
+        // launchd-launched app inherits a minimal PATH (no ~/.local/bin,
+        // Homebrew, npm, …) so a bare `claude` spawn ENOENTs even when it
+        // works from a terminal (public issues #174/#176).
+        let bin = resolve_claude_bin(&self.claude_bin);
+        let mut cmd = Command::new(&bin);
+
+        // Windows gives a console-subsystem child its own window, and this
+        // one is spawned per turn — so a normal back-and-forth flashes a
+        // black box that steals focus on every message (public issue #186,
+        // reported by HelloMAF). Same flag `context.rs` and `schedule.rs`
+        // already pass; this spawn was simply missed.
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+
         cmd.arg("--output-format")
             .arg("stream-json")
             .arg("--input-format")
@@ -206,9 +375,20 @@ impl Provider for AgentSdkProvider {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| Error::Provider(format!("spawn claude: {e}")))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Error::Provider(format!(
+                    "spawn claude: '{bin}' not found. The Claude Code CLI (`claude`) isn't on \
+                     this process's PATH — common when thClaws is launched from the macOS \
+                     Finder/Dock (or a scheduled job), which don't inherit your shell PATH. \
+                     Fix: install Claude Code, or set CLAUDE_BIN to its full path (e.g. \
+                     `~/.claude/local/claude`), or use a native provider model instead of \
+                     `agent/*`."
+                ))
+            } else {
+                Error::Provider(format!("spawn claude: {e}"))
+            }
+        })?;
 
         let mut stdin = child
             .stdin
@@ -285,6 +465,19 @@ impl Provider for AgentSdkProvider {
             let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
+            // Claude Code opens its side of the SDK MCP bridge as soon as
+            // it has processed `initialize` — so its own `control_request`
+            // lands in this window, BEFORE our ack arrives. Skipping it
+            // (which this loop used to do) left the CLI waiting on a reply
+            // that never came: it burned its full 60s control timeout,
+            // then re-drove the bridge and answered normally. That is the
+            // whole of public issue #188 — a flat ~60s on every single
+            // agent/* turn, independent of prompt size, tool count and
+            // model, which is why it reproduced under Ollama too.
+            if v.get("type").and_then(Value::as_str) == Some("control_request") {
+                answer_bridge_request(&v, &mut stdin, self.tools.as_ref()).await;
+                continue;
+            }
             if v.get("type").and_then(Value::as_str) != Some("control_response") {
                 continue;
             }
@@ -297,7 +490,7 @@ impl Provider for AgentSdkProvider {
         let user_msg = json!({
             "type": "user",
             "session_id": "",
-            "message": { "role": "user", "content": user_text },
+            "message": { "role": "user", "content": user_content },
             "parent_tool_use_id": null,
         });
         stdin
@@ -564,5 +757,116 @@ impl Provider for AgentSdkProvider {
         if let Ok(mut g) = self.session_id.lock() {
             *g = id;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_turn_carries_images_alongside_text() {
+        use crate::types::{ContentBlock, ImageSource, Message, Role};
+
+        let text_only = Message {
+            role: Role::User,
+            content: vec![ContentBlock::text("just words")],
+        };
+        assert_eq!(
+            user_turn_content(Some(&text_only)),
+            Value::String("just words".into()),
+            "a text-only turn keeps the bare-string shape the CLI always got"
+        );
+
+        let with_image = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::text("what is in this image?"),
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/png".into(),
+                        data: "iVBORw0KGgo=".into(),
+                    },
+                },
+            ],
+        };
+        let v = user_turn_content(Some(&with_image));
+        let blocks = v
+            .as_array()
+            .expect("image turn serializes as a block array");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "what is in this image?");
+        // The Anthropic wire shape the CLI accepts, straight off the
+        // ContentBlock derive.
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "iVBORw0KGgo=");
+
+        // History-only blocks are input to nothing — they must not ride along.
+        let noisy = Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::text("hi"),
+                ContentBlock::Thinking {
+                    content: "hmm".into(),
+                    signature: None,
+                },
+                ContentBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type: "image/jpeg".into(),
+                        data: "AA==".into(),
+                    },
+                },
+            ],
+        };
+        let blocks = user_turn_content(Some(&noisy));
+        let blocks = blocks.as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "thinking block dropped: {blocks:?}");
+
+        assert_eq!(user_turn_content(None), Value::String(String::new()));
+    }
+
+    #[test]
+    fn explicit_override_is_respected_verbatim() {
+        // A CLAUDE_BIN / with_bin override is never second-guessed.
+        assert_eq!(
+            resolve_claude_bin("/custom/path/claude"),
+            "/custom/path/claude"
+        );
+        assert_eq!(resolve_claude_bin("my-claude-wrapper"), "my-claude-wrapper");
+    }
+
+    // `falls_back_to_bare_name_when_nothing_found` removes the process-global
+    // PATH; serialize it with every test that reads PATH so they don't race
+    // (the parallel runner otherwise intermittently flaked `find_on_path`).
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn falls_back_to_bare_name_when_nothing_found() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // With an empty PATH and (almost certainly) none of the fallback
+        // locations present in the test env, we still return "claude" so
+        // the caller's not-found error fires with the helpful message
+        // rather than a wrong path.
+        let prev = std::env::var_os("PATH");
+        std::env::remove_var("PATH");
+        let got = resolve_claude_bin("claude");
+        if let Some(p) = prev {
+            std::env::set_var("PATH", p);
+        }
+        // Either a real install exists on this machine (full path) or we
+        // fall back to the bare name — never empty, never a nonexistent
+        // fabricated path.
+        assert!(got == "claude" || std::path::Path::new(&got).is_file());
+    }
+
+    #[test]
+    fn find_on_path_locates_a_ubiquitous_binary() {
+        let _guard = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        // `sh` is on PATH in every CI/dev env; prove the PATH walk works.
+        assert!(find_on_path("sh").is_some());
+        assert!(find_on_path("definitely-not-a-real-binary-xyzzy").is_none());
     }
 }

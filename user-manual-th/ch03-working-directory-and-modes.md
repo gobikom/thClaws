@@ -134,6 +134,33 @@ git hook หรือ pipeline ของ shell:
 git diff | thclaws -p "summarise this diff for a commit message"
 ```
 
+ตั้งแต่ **v0.88.0** `-p` เป็น headless แบบ *เต็มความสามารถ* — เท่า CLI
+แบบโต้ตอบ แค่ทีละหนึ่ง turn:
+
+- **Session ถูกบันทึก** ลง store ของ workspace
+  (`.thclaws/state/sessions/`) และ `--resume <id|last>` ต่อบทสนทนาเดิม
+  พร้อม history ครบ:
+
+  ```bash
+  thclaws -p "จำไว้: โค้ดเนมของ release คือ Falcon"
+  thclaws -p --resume last "โค้ดเนมของ release คืออะไร"   # → Falcon
+  ```
+
+  ใส่ `--no-session` ถ้าอยากได้พฤติกรรมเก่า (ไม่ทิ้งไฟล์) สำหรับ
+  script แบบ one-shot
+- **Subagent ใช้งานได้** — Task tool ถูก register แล้ว prompt ที่ต้อง
+  fan-out (pipeline วิจัย, `WorkflowRun`, งานหลายบทบาท) ทำงานเหมือนบน
+  GUI/CLI แทนที่ model จะ role-play ทุกบทบาทเองใน context เดียว
+- **Hooks ทำงาน** — hooks ใน `settings.json` ชุดเดียวกับทุกโหมด
+  (ดู[บทที่ 13](ch13-hooks.md))
+
+บรรทัดสถานะ (`[session] saved …`, tool trace) ออกทาง **stderr** —
+stdout ยังเป็นคำตอบสะอาดๆ pipe ได้เหมือนเดิม
+
+chain ของ `--resume` นี้คือกลไกเบื้องหลัง **heartbeat schedule** —
+งานประจำที่ต่อบทสนทนาเดียวโตขึ้นเรื่อยๆ แทนที่จะเริ่มจากศูนย์ทุกครั้ง
+ดู[บทที่ 19](ch19-scheduling.md#heartbeats)
+
 ![thClaws Non-Interactive Mode](../user-manual-img/ch-03/thclaws-non-interactive.png)
 
 ### `--serve` (HTTP/WebSocket server)
@@ -157,7 +184,7 @@ engine ตัวเดียวกันถูก expose ผ่าน HTTP + Web
   `/v1/chat/completions` (OpenAI-compatible — ให้ Cursor, Aider,
   n8n, openai-python เรียกใช้ได้เลย) และ `/agent/run` +
   `/v1/agent/info` (thClaws-native สำหรับ orchestrator เช่น
-  thcompany หรือ Paperclip) — agent ตัวเดียวให้บริการได้ทั้งคน
+  orchestrator ทั่วไป) — agent ตัวเดียวให้บริการได้ทั้งคน
   และซอฟต์แวร์พร้อมกัน
 
 ค่าเริ่มต้น bind ที่ `127.0.0.1` เท่านั้น (single-user, localhost
@@ -179,7 +206,7 @@ browser tab จะ attach session เดียวกัน ดู[บทที�
     --port N                 port for --serve mode (default 8443)
     --bind ADDR              bind address for --serve (default 127.0.0.1; 0.0.0.0 needs auth)
     --gui                    open desktop window (compose with --serve to attach to same engine)
--m, --model MODEL            override the model (e.g. claude-sonnet-4-6, ap/gemma4-26b)
+-m, --model MODEL            override the model (e.g. claude-sonnet-4-6, moonshot/kimi-k2.6)
     --accept-all             auto-approve every tool call (dangerous — see ch5)
     --permission-mode MODE   auto | ask
     --max-iterations N       max agent loop iterations per turn (0 = unlimited, default 200)
@@ -254,7 +281,7 @@ runtime toggle ทั้งหมดอยู่รวมกันในไฟ�
 | `maxTokens` | number | `32000` | (max output tokens ต่อ turn) |
 | `maxIterations` | number | `50` | (cap ของ tool-call loop ต่อ turn) |
 | `thinkingBudget` | number | `10000` | [บทที่ 6](ch06-providers-models-api-keys.md) (Anthropic extended-thinking) |
-| `searchEngine` | string | `"auto"` | (`auto` / `tavily` / `brave` / `duckduckgo`) |
+| `searchEngine` | string | `"auto"` | (`auto` / `tavily` / `brave` / `serpapi` / `duckduckgo`) |
 
 #### Permissions + tools
 

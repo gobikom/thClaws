@@ -330,10 +330,10 @@ impl ApprovalSink for ReplApprover {
         if self.session_allowed.load(Ordering::Relaxed) {
             return ApprovalDecision::Allow;
         }
-        let preview = req
-            .summary
-            .clone()
-            .unwrap_or_else(|| serde_json::to_string(&req.input).unwrap_or_default());
+        let preview = req.summary.clone().unwrap_or_else(|| {
+            serde_json::to_string(&crate::tool_display::redact_json_value(&req.input))
+                .unwrap_or_default()
+        });
         let prompt = format!(
             "\n\x1b[33m[approval] {} input={}\x1b[0m\n\x1b[90m[y]es / [n]o / yolo ▸ \x1b[0m",
             req.tool_name, preview

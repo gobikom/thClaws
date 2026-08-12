@@ -11,10 +11,13 @@ natural language; it reads
 your files, runs commands, uses tools, and talks back to you while it
 works.
 
-Six surfaces ship as one binary, sharing a single `Agent` loop,
-`Session`, and tool registry — the first five are for a single person
-(including chatting through LINE on your phone), the sixth lets other
-software hire thClaws to do work:
+Eight surfaces ship as one binary, sharing a single `Agent` loop,
+`Session`, and tool registry — the first seven are for a single person
+(including chatting through LINE, Telegram, or Facebook Messenger on
+your phone), the eighth lets other software hire thClaws to do work.
+Beyond the binary, **[thClaws.cloud](#thclawscloud--browse-run-and-host-agents)**
+adds a catalog you browse and a hosted runtime you rent — see the
+dedicated bullet below and [Chapter 27](ch27-thclaws-cloud.md):
 
 - **Desktop GUI** (`thclaws` with no flags) — a native window with a
   Terminal tab running the same interactive REPL as `--cli` mode, a
@@ -35,6 +38,15 @@ software hire thClaws to do work:
   platform and the thClaws running on your machine — the agent stays
   local but you can reach it from anywhere via your phone (see
   [Chapter 21](ch21-line-and-browser-chat.md)).
+- **Telegram bot** (`thclaws --telegram` or GUI Telegram Connect
+  modal) — create a bot with `@BotFather`, paste its token, and every
+  DM to the bot runs as a turn on your desktop. Tool calls that need
+  approval arrive as inline-keyboard buttons you tap from your phone
+  (see [Chapter 23](ch23-telegram.md)).
+- **Facebook Page Messenger** (`thclaws --messenger` or GUI Messenger
+  Connect modal) — connect a Facebook Page once, and every Messenger
+  DM to the Page runs as a turn on your desktop, with approvals shown
+  as quick-reply chips (see [Chapter 24](ch24-messenger.md)).
 - **AI Agent (API server)** (`thclaws --serve` + HTTP API) — lets
   *other software* (orchestrators, external clients, schedulers) call
   thClaws as an agent over the same HTTP API — details in later
@@ -42,6 +54,20 @@ software hire thClaws to do work:
 
 ## What makes it different
 
+- **thClaws.cloud — browse, run, and host agents.** An AI agent in
+  thClaws is just a folder ([Chapter 8](ch08-memory-and-agents-md.md)),
+  and thClaws.cloud turns that folder model into *git for AI agents*.
+  **Browse** a curated catalog at
+  [thclaws.cloud/browse](https://thclaws.cloud/browse), **install** any
+  agent into a local folder with one command (`/cloud get <slug>`),
+  **publish** your own (`/cloud publish`) — you own the folder and bring
+  your own provider keys. Bind your desktop to the catalog by pasting a
+  CLI token once in Settings → thClaws.cloud; from then on every catalog
+  op is a slash command inside an open session. For teams there's a
+  **hosted runtime** (managed runners, no setup — currently in closed
+  beta) and **shared agents**: a company-owned agent several people use,
+  gateway-billed to the owner with a read-only company knowledge base.
+  See [Chapter 27](ch27-thclaws-cloud.md). <a id="thclawscloud--browse-run-and-host-agents"></a>
 - **Self-improving AI Agent (auto-learn).** Turn on `autoLearn: true`
   in settings and thClaws automatically files every substantive
   session as a new page in a dedicated `self_learn` KMS (separate
@@ -51,7 +77,7 @@ software hire thClaws to do work:
   the session_end hook — no new agent prompts; just wiring. One flag
   to enable, `rm -rf .thclaws/kms/self_learn/` to reset. See
   [Chapter 9 §Self-improving AI Agent](ch09-knowledge-bases-kms.md#self-improving-ai-agent-auto-learn).
-- **Three tiers of agent orchestration.**
+- **Four tiers of agent orchestration.**
   - **`Task` tool** — model-driven subagents that block the parent's
     turn. Each gets its own tool registry, recurses up to 3 levels
     deep. Right when the parent's reasoning should decide whether and
@@ -66,23 +92,28 @@ software hire thClaws to do work:
     pane and optional git worktree. One agent writes your backend
     while a teammate builds the frontend in parallel; lead calls
     `TeamMerge` when both are done.
+  - **Workflows (`/workflow`)** — the orchestrator is *code*, not the
+    model: the LLM writes a JavaScript script that fans work out across
+    many subagents, and a sandboxed JS engine runs it deterministically
+    on your machine. Rerunning gives the same shape of work every time,
+    and a long job leaves a resumable checkpoint on disk. Right for
+    **bulk, deterministic, mostly-independent** work ("rewrite all 800
+    test files to the new fixture"; "translate every page under
+    `kms/bug/` to Thai") ([Chapter 25](ch25-workflows.md)).
 - **Hire-able as a working agent — your self-hosted sandbox.** The
   inverse direction of orchestration: thClaws itself runs as a
-  *worker* for another orchestrator (e.g. Paperclip / thcompany /
-  Anthropic Managed Agents), in either the **Employee** shape
-  (`thclaws_local` — a process on the same machine — equivalent to an
-  in-process sandbox) or the **Freelancer** shape (`thclaws_pod` — a
-  standalone pod that can run on a VPS, cloud, or your own k3s —
-  equivalent to a self-hosted sandbox where the agent loop is upstream
-  and tool execution stays inside *your* perimeter). The orchestrator
-  drives it through the same HTTP API users and IDEs use. See
-  [Chapter 22](ch22-paperclip-adapter.md).
+  *worker* for another orchestrator (a scheduler, a CI job, your own
+  control plane). It can share the caller's machine as a local process,
+  or stand alone as a pod on a VPS, cloud, or your own k3s — the agent
+  loop is upstream while tool execution stays inside *your* perimeter.
+  The orchestrator drives it through the same HTTP API users and IDEs
+  use: `POST /agent/run` and `GET /v1/agent/info`.
 - **Three tiers of long-term memory.**
   - **`AGENTS.md` / `CLAUDE.md`** — drop one in your repo; thClaws
     walks up from cwd and injects every match into the system prompt,
     the same way git resolves `.gitignore`
     ([Chapter 8](ch08-memory-and-agents-md.md)).
-  - **Memory store** at `~/.config/thclaws/memory/` — longer-lived
+  - **Memory store** at `~/.local/share/thclaws/memory/` — longer-lived
     facts the agent has learned about you, your preferences, and each
     project, classified as `user` / `feedback` / `project` /
     `reference` and indexed as markdown files.
@@ -91,11 +122,22 @@ software hire thClaws to do work:
     `.thclaws/kms/<name>/pages/`, tick the box in the sidebar, and
     the agent gets a table of contents every turn plus a full
     mutation surface (`KmsRead` / `KmsSearch` / `KmsWrite` /
-    `KmsAppend` / `KmsDelete`). No embeddings — grep + read,
-    following Andrej Karpathy's LLM-wiki pattern. Run `/dream` and a
-    built-in side-channel agent mines the 10 most recent sessions,
-    dedupes pages, surfaces insights, and writes a dated audit-trail
-    page — review with `git diff`
+    `KmsAppend` / `KmsDelete`). Search two ways: line-grep by regex,
+    or **BM25-ranked** search (`query:`) that ranks pages by relevance
+    (title ×4, topic ×2, body) — still no embeddings, just grep + an
+    on-disk index, following Andrej Karpathy's LLM-wiki pattern.
+    Maintenance is automated by side-channel agents: `/dream` mines
+    the 10 most recent sessions, dedupes pages, surfaces insights, and
+    writes a dated audit-trail page (review with `git diff`);
+    `/kms reconcile` resolves contradictions; `/kms challenge` stress-
+    tests an idea against the vault. **Browse + visualize** in the GUI:
+    a per-KMS browser sidebar, an Obsidian-style force-directed
+    **graph view** of `[[wikilinks]]`, and `/kms html` to export a
+    self-contained interactive site you can share or commit.
+    **Interoperable** via **OKF** (Google's Open Knowledge Format):
+    `/kms export-okf` ships a vendor-neutral bundle and
+    `/kms import-okf` turns any OKF bundle into a KMS — a clean
+    round-trip for handing knowledge between teams and agents
     ([Chapter 9](ch09-knowledge-bases-kms.md)).
 
   All three are plain markdown you read, edit, and commit. All three
@@ -124,7 +166,7 @@ software hire thClaws to do work:
   Code auth), OpenAI (Chat Completions + Responses/Codex), Google
   Gemini & Gemma, Alibaba DashScope (Qwen), DeepSeek, Z.ai (GLM Coding
   Plan), NVIDIA NIM, NSTDA Thai LLM (OpenThaiGPT, Typhoon, Pathumma,
-  THaLLE), OpenRouter, Agentic Press, Azure AI Foundry, Ollama (local,
+  THaLLE), OpenRouter, Moonshot, xAI, Groq, Azure AI Foundry, Ollama (local,
   local Anthropic-compatible, and Ollama Cloud), LMStudio, plus a
   generic **OpenAI-compatible** slot (`oai/*`) for LiteLLM / Portkey /
   Helicone / vLLM / internal proxies — auto-detected by model name
@@ -133,7 +175,7 @@ software hire thClaws to do work:
 - **API-ready for standard tooling.** `--serve` exposes
   `/v1/chat/completions` (OpenAI-compatible for Cursor, Aider, n8n,
   openai-python) and `/agent/run` + `/v1/agent/info` (thClaws-native
-  for orchestrators like thcompany). One agent instance can serve
+  for orchestrators). One agent instance can serve
   humans and other software at the same time.
 - **Async webhook delivery.** Long-running runs (deploys, builds,
   multi-step research) send the prompt + `x_callback` and close the
@@ -215,12 +257,11 @@ software hire thClaws to do work:
   block reports all five fields so orchestrators / UIs can compute
   cost locally without asking the provider.
 - **Host thClaws anywhere.** Run it locally on your own machine, or
-  deploy it to [thCompany.ai](https://thcompany.ai) so a cloud-hosted
-  thClaws runs under your account — either *hired by a Company* (as
-  employee or freelancer via [Chapter 22](ch22-paperclip-adapter.md))
-  or standing alone to take work directly. The deploy flow ships as a
-  plugin (`/plugin install …-deploy`) so hosts are swappable — the
-  client never locks you in.
+  deploy it to a host of your choice so a cloud-hosted thClaws runs
+  under your account — driven by an orchestrator, or standing alone to
+  take work directly. The deploy flow ships as a plugin
+  (`/plugin install …-deploy`) so hosts are swappable — the client
+  never locks you in.
 - **Session resume.** `thclaws --resume last` picks up where you left
   off; `thclaws --resume <id>` jumps to a specific session. Sessions
   live as JSONL under `.thclaws/sessions/` — git-friendly,
@@ -245,7 +286,7 @@ software hire thClaws to do work:
 - A supported OS: macOS (arm64 or x86_64), Linux (arm64 or x86_64), or
   Windows (arm64 or x86_64).
 - At least one LLM API key — Anthropic, OpenAI, Gemini, OpenRouter,
-  Agentic Press, DashScope, DeepSeek, Z.ai, NVIDIA NIM, NSTDA Thai LLM,
+  Moonshot, xAI, Groq, DashScope, DeepSeek, Z.ai, NVIDIA NIM, NSTDA Thai LLM,
   or Azure AI Foundry. (Or a local Ollama / LMStudio install if you'd
   rather stay offline.)
 
@@ -255,7 +296,7 @@ and how to paste keys.
 
 ## How this manual is organised
 
-22 chapters of reference material — how to install thClaws and then
+28 chapters of reference material — how to install thClaws and then
 every user-facing feature explained once with the commands and
 configuration you need:
 
@@ -283,13 +324,21 @@ configuration you need:
 - [Chapter 18](ch18-plan-mode.md) — Plan mode
 - [Chapter 19](ch19-scheduling.md) — Scheduling
 - [Chapter 20](ch20-research.md) — `/research` (background research)
+- [Chapter 25](ch25-workflows.md) — Workflows (the fourth orchestration tier)
 
 **Reaching thClaws from elsewhere**
 - [Chapter 21](ch21-line-and-browser-chat.md) — LINE chat + browser bridge
-- [Chapter 22](ch22-paperclip-adapter.md) — Paperclip adapter (let an orchestrator hire thClaws)
+- [Chapter 23](ch23-telegram.md) — Telegram bot
+- [Chapter 24](ch24-messenger.md) — Facebook Page Messenger bot
+- [Chapter 27](ch27-thclaws-cloud.md) — thClaws.cloud (catalog + hosted runtime)
+
+**Advanced surfaces & automation**
+- [Chapter 26](ch26-gui-shells.md) — GUI Shells (domain-specific frontends)
+- [Chapter 28](ch28-browser-automation.md) — Browser automation
 
 If you're new, read Chapter 2 next. If you're migrating from Claude
 Code, skip to Chapters 6, 7, 11, and 13. If you already know the
 basics and want what's new, the recent additions live in Chapter 9
 (auto-learn, `/dream`), Chapter 15 (`/agent` side-channels),
-Chapter 21 (LINE), and Chapter 22 (Paperclip adapter).
+Chapter 21 (LINE), Chapter 23 (Telegram), Chapter 24 (Messenger),
+and — the headline for this release — Chapter 27 (thClaws.cloud).

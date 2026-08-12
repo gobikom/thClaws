@@ -57,6 +57,11 @@ Registry คือ JSON array ที่เก็บชื่อ URL ต้นท
 
 ## Marketplace
 
+Plugin เป็น 1 ใน 4 ประเภทของ thClaws marketplace รวม (skills · MCP ·
+plugins · subagents — ดู [บทที่ 12](ch12-skills.md)) ใน GUI
+**`/marketplace`** เปิด browser modal ที่มีแท็บ **Plugins** ส่วนคำสั่ง
+text ด้านล่างใช้ได้ทุกที่
+
 `/plugin marketplace` เปิดดู catalog ที่ดูแลอยู่ที่
 [`thClaws/marketplace`](https://github.com/thClaws/marketplace)
 รูปแบบเดียวกับ skill marketplace — สามคำสั่งสำรวจ + install ด้วยชื่อ:

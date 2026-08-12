@@ -1,5 +1,27 @@
 @import "tailwindcss";
 
+/* Hide the scrollbar on horizontally-scrollable strips (e.g. the mobile
+   tab bar) while keeping them scrollable by touch/trackpad. */
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+/* Mobile: iOS Safari/Chrome auto-zoom the page when a focused text field
+   has a font-size < 16px. Force 16px on phones so focusing the chat
+   input / API-key fields / search boxes doesn't yank the viewport. Only
+   affects font-size below `sm`; desktop sizing is untouched. */
+@media (max-width: 639px) {
+  input:not([type="checkbox"]):not([type="radio"]),
+  textarea,
+  select {
+    font-size: 16px;
+  }
+}
+
 :root,
 :root[data-theme="dark"] {
   color-scheme: dark;
@@ -60,7 +82,11 @@ html, body, #root {
   background: var(--bg-primary);
   color: var(--text-primary);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  overflow: hidden;
+  /* `clip`, not `hidden`: an overflow:hidden box stays PROGRAMMATICALLY
+     scrollable, so a descendant scrollIntoView (chat auto-scroll) could
+     scroll #root and shift the whole app up by the tab-bar height. `clip`
+     is unscrollable — the app manages its own scroll regions internally. */
+  overflow: clip;
 }
 
 /* Markdown rendering inside the chat bubble. Assistant messages
@@ -228,6 +254,21 @@ html, body, #root {
   letter-spacing: 0.04em;
 }
 
+/* Mobile: dial the prose + heading scale down a touch so KMS docs read
+   comfortably on a phone (the desktop scale wraps awkwardly < 640px). */
+@media (max-width: 639px) {
+  .kms-viewer-prose { font-size: 13.5px; }
+  .kms-viewer-prose h1 { font-size: 1.5em; }
+  .kms-viewer-prose h2 { font-size: 1.3em; }
+  .kms-viewer-prose h3 { font-size: 1.12em; }
+  .kms-viewer-prose h1,
+  .kms-viewer-prose h2,
+  .kms-viewer-prose h3,
+  .kms-viewer-prose h4,
+  .kms-viewer-prose h5,
+  .kms-viewer-prose h6 { margin: 1.2em 0 0.5em; }
+}
+
 .kms-viewer-prose p { margin: 0.85em 0; }
 
 .kms-viewer-prose ul,
@@ -356,4 +397,29 @@ html, body, #root {
 }
 .kms-viewer-prose a[href*="../sources/"][href$=".md"]:hover {
   background: color-mix(in srgb, var(--accent) 25%, transparent);
+}
+
+/* dev-plan/36 — Running chip pulse. The chip is rendered by
+   RunningChip.tsx when the engine reports a user-facing turn in
+   flight. Pulse fades the dot's opacity to make the "live work"
+   state visible without animating layout. */
+@keyframes running-chip-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+.running-chip .running-chip-dot {
+  animation: running-chip-pulse 1.6s ease-in-out infinite;
+}
+
+/* Inactive tab panels are hidden with `visibility: hidden` (NOT
+   display:none — that would zero xterm's grid; see App.tsx). But
+   WebKit renders <video>/<audio> native controls in the element's UA
+   shadow DOM, which sets its own visibility — a descendant CAN override
+   an ancestor's visibility:hidden, so the controls bar kept painting
+   over other tabs after leaving Files with a player open. display:none
+   is not overridable by descendants, and toggling it on media elements
+   doesn't reset playback (audio keeps playing across tabs). */
+.tab-inactive video,
+.tab-inactive audio {
+  display: none !important;
 }

@@ -43,6 +43,7 @@ Every schedule entry has these fields. Only `id`, `cron`, and `prompt` are requi
 | `cwd` | — | current dir | Working directory for the spawned job. Determines which `.thclaws/settings.json`, sandbox, memory, and project-level MCP config the job picks up. |
 | `model` | — | from `cwd`'s settings | Model alias override (`gpt-4o`, `claude-sonnet-4-6`, etc.). |
 | `maxIterations` | — | from `cwd`'s settings | Per-job tool-call iteration cap. |
+| `resumeSession` | — | absent (stateless) | **Heartbeat mode** (v0.88.0+): pass `--resume-session last` and every fire continues ONE growing session instead of starting fresh — see [Heartbeats](#heartbeats). |
 | `timeoutSecs` | — | 600 (10 min) | Hard timeout. Job is killed if it exceeds this; recorded as `timed_out`. Pass `--timeout 0` to add for no timeout. |
 | `enabled` | — | `true` | If `false`, the scheduler skips it and `schedule run` refuses to fire it. |
 | `watchWorkspace` | — | `false` | If `true`, the daemon also fires the job when any file inside `cwd` changes (debounced ~2s) — see [Workspace-change trigger](#workspace-change-trigger) below. Daemon-only; the in-process scheduler ignores it. |
@@ -62,6 +63,51 @@ Standard POSIX 5-field cron: `minute hour day-of-month month day-of-week`.
 | `0 9,13,17 * * *` | 09:00, 13:00, 17:00 daily |
 
 Range / list syntax (`MON-FRI`, `1,15`) is supported. Cron expressions are validated when you run `schedule add` — a typo prints a friendly error rather than failing silently at fire time.
+
+## Heartbeats — schedules that remember {#heartbeats}
+
+By default every fire is **stateless**: the scheduler spawns a fresh
+`thclaws --print`, the agent knows only what it can read from disk
+(KMS, files, memory), and nothing of the previous fire's *conversation*
+survives. That's the right default for maintenance jobs — but the wrong
+shape for a continuous loop where the agent should get smarter each
+round: a trading strategy that adapts, a monitor that remembers what it
+already flagged, an overnight researcher that builds on its own
+reasoning.
+
+**Heartbeat mode** (v0.88.0+) chains every fire into ONE growing
+session:
+
+```bash
+thclaws schedule add trade-loop \
+  --cron "*/15 * * * *" \
+  --prompt "Review the portfolio. Adjust strategy based on how your previous decisions played out." \
+  --resume-session last
+```
+
+`--resume-session last` makes each fire run
+`thclaws --print --resume last` — the first fire starts the session,
+every later fire loads the full history, adds one exchange, and saves.
+The agent literally remembers its own prior decisions and their
+outcomes. (You can also pass an explicit session id to chain onto an
+existing conversation.)
+
+Practical notes:
+
+- **Dedicate a working directory** to a heartbeat (`--cwd`). `last`
+  resumes the *cwd's* most-recent session — if you also chat
+  interactively in the same workspace, your chat becomes "last" and the
+  heartbeat will chain onto it.
+- **Token cost grows with history.** A heartbeat re-reads its whole
+  conversation every fire; compaction kicks in automatically when it
+  gets long, but a 24/7 loop still costs meaningfully more than
+  stateless fires. This is the price of memory — use stateless
+  schedules when disk state (KMS) is enough.
+- **Inspect the conversation** any time: the session is a normal
+  session — open it from the GUI's session list or
+  `thclaws --cli` → `/resume <id>` in the same cwd.
+- Works with all three trigger layers (manual `schedule run`,
+  in-process, daemon).
 
 ## Workspace-change trigger
 

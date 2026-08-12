@@ -165,6 +165,25 @@ pub struct SkillDef {
     /// model supports what.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<SkillModelSpec>,
+    /// Optional tool gate this skill opens when invoked. Parsed from the
+    /// `tool-gate:` frontmatter key. When set, `SkillTool::call` calls
+    /// `crate::tools::activate_gate(<value>)`, making every tool whose
+    /// `requires_gate()` matches become visible to the model — lets a
+    /// skill lazily surface a whole tool group (e.g. `gui-shell`) that's
+    /// otherwise hidden, instead of carrying its docs in the system
+    /// prompt. See `dev-plan/43`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_gate: Option<String>,
+    /// A "job skill" declares `isolated: true` in its frontmatter. When
+    /// set, `SkillTool::call` runs the skill in a fresh sub-agent context
+    /// (SKILL.md becomes the sub-agent's instructions, the caller's `task`
+    /// arg its first message) and returns only the sub-agent's final
+    /// result to the main conversation — instead of pasting the body +
+    /// every intermediate tool step inline, which a long multi-run session
+    /// re-sends on every model call. Guidance/interactive skills omit it
+    /// and run inline as before. See dev-plan (isolated-skills).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolated: bool,
     pub dir: PathBuf,
     /// Body access goes through [`Self::content`]. Serialization
     /// always materializes to a string so cached SkillDef snapshots
@@ -228,6 +247,8 @@ impl SkillDef {
             description,
             when_to_use,
             model: None,
+            tool_gate: None,
+            isolated: false,
             dir,
             content: SkillContent::Eager(content),
         }
@@ -370,19 +391,31 @@ impl SkillStore {
         // for the `dream` built-in agent: ship a curated default,
         // let users redefine if they want.
         store.seed_builtins();
-        for dir in Self::user_skill_dirs() {
-            if dir.exists() {
-                store.load_dir(&dir);
+        // Shared-agent strict mode (dev-plan/41): skip every member-scope
+        // source so only built-ins + the company skills load.
+        let strict = crate::shared::is_strict();
+        if !strict {
+            for dir in Self::user_skill_dirs() {
+                if dir.exists() {
+                    store.load_dir(&dir);
+                }
+            }
+            for dir in extra {
+                if dir.exists() {
+                    store.load_dir(dir);
+                }
+            }
+            for dir in Self::project_skill_dirs() {
+                if dir.exists() {
+                    store.load_dir(&dir);
+                }
             }
         }
-        for dir in extra {
-            if dir.exists() {
-                store.load_dir(dir);
-            }
-        }
-        for dir in Self::project_skill_dirs() {
-            if dir.exists() {
-                store.load_dir(&dir);
+        // Company skills load LAST so they win on name collision (and are
+        // the only disk source under strict mode).
+        if let Some(shared) = crate::shared::shared_skills_dir() {
+            if shared.exists() {
+                store.load_dir(&shared);
             }
         }
         store
@@ -397,20 +430,31 @@ impl SkillStore {
     pub fn discover_in(workspace_dir: &Path, extra: &[PathBuf]) -> Self {
         let mut store = Self::default();
         store.seed_builtins();
-        for dir in Self::user_skill_dirs() {
-            if dir.exists() {
-                store.load_dir(&dir);
+        // dev-plan/41: mirror discover_with_extra's shared-agent handling
+        // on the workspace surface — strict mode skips member-scope skills,
+        // and the company's shared skills load last (and win).
+        let strict = crate::shared::is_strict();
+        if !strict {
+            for dir in Self::user_skill_dirs() {
+                if dir.exists() {
+                    store.load_dir(&dir);
+                }
+            }
+            for dir in extra {
+                if dir.exists() {
+                    store.load_dir(dir);
+                }
+            }
+            for rel in Self::project_skill_dirs() {
+                let dir = workspace_dir.join(rel);
+                if dir.exists() {
+                    store.load_dir(&dir);
+                }
             }
         }
-        for dir in extra {
-            if dir.exists() {
-                store.load_dir(dir);
-            }
-        }
-        for rel in Self::project_skill_dirs() {
-            let dir = workspace_dir.join(rel);
-            if dir.exists() {
-                store.load_dir(&dir);
+        if let Some(shared) = crate::shared::shared_skills_dir() {
+            if shared.exists() {
+                store.load_dir(&shared);
             }
         }
         store
@@ -428,10 +472,16 @@ impl SkillStore {
     /// produce a clearly-broken path the user can spot — pure-prompt
     /// skills don't reference `{skill_dir}` at all.
     fn seed_builtins(&mut self) {
-        const BUILTINS: &[(&str, &str)] = &[(
-            "extract-and-save",
-            include_str!("default_prompts/skills/extract-and-save.md"),
-        )];
+        const BUILTINS: &[(&str, &str)] = &[
+            (
+                "extract-and-save",
+                include_str!("default_prompts/skills/extract-and-save.md"),
+            ),
+            (
+                "gui-shell",
+                include_str!("default_prompts/skills/gui-shell.md"),
+            ),
+        ];
         for (fallback_name, raw) in BUILTINS {
             if let Some(skill) = parse_builtin_skill(fallback_name, raw) {
                 self.skills.insert(skill.name.clone(), skill);
@@ -506,6 +556,15 @@ impl SkillStore {
         let model = frontmatter
             .get("model")
             .and_then(|raw| parse_skill_model(raw));
+        let tool_gate = frontmatter
+            .get("tool-gate")
+            .or_else(|| frontmatter.get("tool_gate"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let isolated = frontmatter
+            .get("isolated")
+            .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+            .unwrap_or(false);
 
         // Canonicalize once at index time so the `{skill_dir}`
         // substitution inside the lazy body load doesn't have to —
@@ -524,6 +583,8 @@ impl SkillStore {
             description,
             when_to_use,
             model,
+            tool_gate,
+            isolated,
             dir: abs_dir.clone(),
             // Body is read on demand by `SkillDef::content()`. Only
             // the path + abs_dir are captured at boot.
@@ -563,6 +624,15 @@ fn parse_builtin_skill(fallback_name: &str, raw: &str) -> Option<SkillDef> {
     let model = frontmatter
         .get("model")
         .and_then(|raw| parse_skill_model(raw));
+    let tool_gate = frontmatter
+        .get("tool-gate")
+        .or_else(|| frontmatter.get("tool_gate"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let isolated = frontmatter
+        .get("isolated")
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "true" | "yes" | "1"))
+        .unwrap_or(false);
 
     let synthetic_dir = PathBuf::from(format!("<builtin>/{name}"));
     let body_with_subst = body.replace("{skill_dir}", &synthetic_dir.to_string_lossy());
@@ -572,6 +642,8 @@ fn parse_builtin_skill(fallback_name: &str, raw: &str) -> Option<SkillDef> {
         description,
         when_to_use,
         model,
+        tool_gate,
+        isolated,
         dir: synthetic_dir,
         content: SkillContent::Eager(body_with_subst),
     })
@@ -637,7 +709,7 @@ fn enforce_scripts_policy(skill_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn is_zip_url(url: &str) -> bool {
+pub(crate) fn is_zip_url(url: &str) -> bool {
     // Strip query/fragment before checking the extension so
     // `?token=...` or `#frag` don't mask the `.zip` suffix.
     let without_query = url.split(['?', '#']).next().unwrap_or(url);
@@ -788,7 +860,7 @@ fn target_root(project_scope: bool) -> Result<PathBuf> {
     }
 }
 
-async fn download_zip(url: &str) -> Result<Vec<u8>> {
+pub(crate) async fn download_zip(url: &str) -> Result<Vec<u8>> {
     // Cap the download at 64 MiB. Real skills are orders of magnitude
     // smaller; anything bigger is almost certainly the wrong URL.
     const MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -833,7 +905,7 @@ async fn download_zip(url: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
+pub(crate) fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
     let cursor = std::io::Cursor::new(bytes);
     let mut archive =
         zip::ZipArchive::new(cursor).map_err(|e| Error::Tool(format!("open zip: {e}")))?;
@@ -877,7 +949,7 @@ fn extract_zip(bytes: &[u8], dest: &Path) -> Result<()> {
 
 /// If `dir` contains exactly one child directory and no files, return that
 /// child. Covers the common `archive-v1/...` wrapper pattern in zips.
-fn single_wrapper_subdir(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn single_wrapper_subdir(dir: &Path) -> Option<PathBuf> {
     let mut subdirs = Vec::new();
     let mut has_files = false;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -1272,12 +1344,52 @@ mod install_tests {
 
 pub struct SkillTool {
     store: std::sync::Arc<std::sync::Mutex<SkillStore>>,
+    /// Per-subagent allow-list. `None` = no restriction (the parent /
+    /// default agent sees every installed skill). `Some(set)` = a
+    /// subagent scoped via `AgentDef::skills` — loading any name outside
+    /// the set is refused.
+    allowed: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    /// Isolated job-skill execution slot. A `Weak` to break the
+    /// factory → snapshot → tool registry → SkillTool → factory Arc
+    /// cycle; the surface that owns the `AgentFactory` populates it via
+    /// [`Self::factory_slot`] after the factory is built. Empty or
+    /// not-upgradable ⇒ the skill runs inline (tests, the HTTP surface
+    /// that registers no subagent tool, etc.).
+    factory:
+        std::sync::Arc<std::sync::OnceLock<std::sync::Weak<dyn crate::subagent::AgentFactory>>>,
+    /// Cancel token propagated into an isolated skill's sub-agent turn.
+    cancel: Option<crate::cancel::CancelToken>,
+    /// This tool's agent depth. An isolated skill spawns at `depth + 1`
+    /// and falls back to inline past a small cap so a skill that (however
+    /// indirectly) invokes itself can't recurse without bound.
+    depth: usize,
 }
+
+/// Appended to an isolated job-skill's sub-agent instructions so its
+/// return payload stays small in the caller's context — the whole point
+/// of running isolated is that the main conversation gets the result,
+/// not every intermediate step.
+const ISOLATED_SKILL_RETURN_CONTRACT: &str = "\n\n---\n\
+# Isolated run — return contract\n\
+You are running this skill as an isolated job in your own context. The \
+caller (the main conversation) will see ONLY your final message, not your \
+intermediate steps. When the job is done, reply with a COMPACT result: the \
+path(s) of any files you produced, a one-line status, and any warnings or \
+fields you could not fill. Do NOT echo file contents or paste large outputs \
+back — keep the result small.";
+
+/// Depth past which an isolated skill degrades to inline execution, to
+/// stop a skill that transitively re-invokes itself from recursing.
+const MAX_ISOLATED_SKILL_DEPTH: usize = 4;
 
 impl SkillTool {
     pub fn new(store: SkillStore) -> Self {
         Self {
             store: std::sync::Arc::new(std::sync::Mutex::new(store)),
+            allowed: None,
+            factory: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cancel: None,
+            depth: 0,
         }
     }
 
@@ -1287,7 +1399,106 @@ impl SkillTool {
     /// store without needing to find and mutate the tool through the
     /// registry.
     pub fn new_from_handle(store: std::sync::Arc<std::sync::Mutex<SkillStore>>) -> Self {
-        Self { store }
+        Self {
+            store,
+            allowed: None,
+            factory: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cancel: None,
+            depth: 0,
+        }
+    }
+
+    /// Shared handle to this tool's isolated-execution factory slot. The
+    /// surface that builds the `AgentFactory` calls
+    /// `slot.set(Arc::downgrade(&factory))` once the factory exists, so
+    /// isolated job-skills can spawn a sub-agent. Clone the `Arc` before
+    /// the tool is moved into the registry, then set it afterwards.
+    /// Idempotent (`OnceLock::set` ignores a second set).
+    pub fn factory_slot(
+        &self,
+    ) -> std::sync::Arc<std::sync::OnceLock<std::sync::Weak<dyn crate::subagent::AgentFactory>>>
+    {
+        self.factory.clone()
+    }
+
+    /// Propagate the worker's cancel token so an isolated skill's
+    /// sub-agent turn aborts on stop/ctrl-C like a `Task` spawn.
+    pub fn with_cancel(mut self, token: crate::cancel::CancelToken) -> Self {
+        self.cancel = Some(token);
+        self
+    }
+
+    /// Set the agent depth this tool runs at (isolated skills spawn at
+    /// `depth + 1`). Defaults to 0 (top-level agent).
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Run an isolated ("job") skill in a fresh sub-agent: the SKILL.md
+    /// body becomes the sub-agent's instructions, `task` its first
+    /// message, and only the sub-agent's final text returns to the
+    /// caller. Returns `None` when isolation isn't available (no `task`
+    /// arg, no factory wired on this surface, or past the recursion cap),
+    /// so `call` runs the skill inline instead.
+    async fn try_run_isolated(
+        &self,
+        name: &str,
+        description: &str,
+        model_spec: Option<&SkillModelSpec>,
+        body: &str,
+        input: &Value,
+    ) -> Option<Result<String>> {
+        let task = input.get("task").and_then(Value::as_str)?;
+        if task.trim().is_empty() || self.depth >= MAX_ISOLATED_SKILL_DEPTH {
+            return None;
+        }
+        // Upgrade the Weak factory; absent (tests, HTTP surface) ⇒ inline.
+        let factory = self.factory.get()?.upgrade()?;
+
+        // Pin the skill's recommended model only if the frontmatter names
+        // one — the factory's `subagent_model` further guards against a
+        // cross-provider pin misrouting.
+        let model = model_spec.and_then(|m| m.candidates().first().cloned());
+        let agent_def = crate::agent_defs::AgentDef {
+            name: format!("skill:{name}"),
+            description: description.to_string(),
+            instructions: format!("{body}{ISOLATED_SKILL_RETURN_CONTRACT}"),
+            model,
+            ..Default::default()
+        };
+
+        let task = task.to_string();
+        let agent = match factory.build(&task, Some(&agent_def), self.depth + 1).await {
+            Ok(a) => a,
+            Err(e) => return Some(Err(e)),
+        };
+        let stream = agent.run_turn(task);
+        let outcome =
+            crate::agent::collect_agent_turn_with_cancel(stream, self.cancel.clone()).await;
+        // Audit: persist the isolated run's full transcript to its own
+        // child session — the tool loop it kept out of the parent context
+        // stays recorded on disk.
+        crate::subagent::persist_subagent_session(
+            &agent,
+            &factory.base_model(),
+            &format!("skill:{name}"),
+        );
+        Some(match outcome {
+            Ok(o) if !o.text.trim().is_empty() => Ok(o.text),
+            Ok(_) => Ok(format!("(job skill '{name}' finished with no output)")),
+            Err(e) => Err(e),
+        })
+    }
+
+    /// Scope this tool to an allow-list of skill names (per-subagent,
+    /// from `AgentDef::skills`). The store handle is shared unchanged.
+    pub fn with_allowed(
+        mut self,
+        allowed: std::sync::Arc<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.allowed = Some(allowed);
+        self
     }
 
     /// Clone of the internal store handle. Lets the REPL re-populate the
@@ -1333,6 +1544,10 @@ impl Tool for SkillTool {
                 "name": {
                     "type": "string",
                     "description": "Name of the skill to invoke. See the system prompt's `# Available skills` section, or call `SkillList()` / `SkillSearch(query: ...)` to discover."
+                },
+                "task": {
+                    "type": "string",
+                    "description": "For a job skill (one that produces a result — the `# Available skills` entry marks it as isolated): the specific task to run, including inputs and desired output (e.g. 'fill the annual contract from /workspace/uploads/KSY_Order_Form.xlsx, output DOCX'). The skill runs in its own context and returns only its result. Omit for guidance skills."
                 }
             },
             "required": ["name"]
@@ -1341,33 +1556,89 @@ impl Tool for SkillTool {
 
     async fn call(&self, input: Value) -> Result<String> {
         let name = crate::tools::req_str(&input, "name")?;
-        let store = self.store.lock().unwrap();
 
-        let skill = store.get(name).ok_or_else(|| {
-            let available = store.names().join(", ");
-            Error::Tool(format!(
-                "skill '{}' not found. Available: {}",
-                name,
-                if available.is_empty() {
-                    "none"
-                } else {
-                    &available
-                }
-            ))
-        })?;
+        // Per-subagent scoping: refuse skills outside this agent's
+        // allow-list (AgentDef::skills) before touching the shared store.
+        if let Some(allowed) = &self.allowed {
+            if !allowed.contains(name) {
+                let mut names: Vec<&str> = allowed.iter().map(String::as_str).collect();
+                names.sort_unstable();
+                return Err(Error::Tool(format!(
+                    "skill '{}' is not available to this agent. Allowed: {}",
+                    name,
+                    if names.is_empty() {
+                        "none".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                )));
+            }
+        }
 
-        // Lazy-load the body on first SkillTool invocation. After P1
-        // dev-plan/06: SkillStore::discover() only read the
-        // frontmatter at boot; this `.content()` call materializes
-        // the body now and caches it in the SkillDef's OnceLock.
-        let mut result = skill.content().into_owned();
+        // Extract everything we need from the store, then drop the lock:
+        // a std Mutex guard is not `Send` and can't be held across the
+        // `.await` of an isolated skill's sub-agent run below.
+        let (isolated, body, dir, model_spec, tool_gate, description) = {
+            let store = self.store.lock().unwrap();
+            let skill = store.get(name).ok_or_else(|| {
+                let available = store.names().join(", ");
+                Error::Tool(format!(
+                    "skill '{}' not found. Available: {}",
+                    name,
+                    if available.is_empty() {
+                        "none"
+                    } else {
+                        &available
+                    }
+                ))
+            })?;
+            // Lazy-load the body on first invocation (dev-plan/06:
+            // discover() reads only frontmatter at boot; `.content()`
+            // materializes + caches the body now).
+            (
+                skill.isolated,
+                skill.content().into_owned(),
+                skill.dir.clone(),
+                skill.model.clone(),
+                skill.tool_gate.clone(),
+                skill.description.clone(),
+            )
+        };
+
+        // Job skill (`isolated: true`): run it in its own sub-agent and
+        // return only the result, so the main conversation doesn't
+        // accumulate every intermediate step. Falls through to inline
+        // when isolation isn't available (no `task` arg, no factory wired
+        // on this surface, or the recursion cap).
+        if isolated {
+            if let Some(res) = self
+                .try_run_isolated(name, &description, model_spec.as_ref(), &body, &input)
+                .await
+            {
+                return res;
+            }
+        }
+
+        // Inline path: guidance/interactive skills, or a job skill that
+        // couldn't isolate.
+        let mut result = body;
 
         // Auto-detect runtime needs: requirements.txt + scripts/ dir.
         // The skill author doesn't have to repeat install instructions
         // in their SKILL.md — we surface them here so the model
         // notices on every invocation. Idempotent: pip install with
         // already-installed deps is a no-op + cached.
-        append_skill_runtime_hints(&mut result, &skill.dir);
+        append_skill_runtime_hints(&mut result, &dir);
+
+        // Open the tool gate this skill declares (if any), making the
+        // gated tool group visible to the model from the next turn. The
+        // gate is process-global and session-sticky (dev-plan/43).
+        if let Some(gate) = tool_gate.as_deref() {
+            crate::tools::activate_gate(gate);
+            result.push_str(&format!(
+                "\n\n_(The `{gate}` tools are now available for this session.)_\n"
+            ));
+        }
 
         // Resolve the effective model recommendation. settings.json
         // may carry a per-skill override (e.g.
@@ -1377,7 +1648,7 @@ impl Tool for SkillTool {
         // forking the whole skill body. Falls through to the
         // frontmatter spec when no override is set.
         let effective_spec =
-            crate::skills_state::skill_override(name).or_else(|| skill.model.clone());
+            crate::skills_state::skill_override(name).or_else(|| model_spec.clone());
 
         // If a recommendation exists (from override OR frontmatter),
         // ask the worker's resolver to apply it. The resolver writes
@@ -1400,6 +1671,10 @@ impl Tool for SkillTool {
         }
 
         Ok(result)
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 }
 
@@ -1503,11 +1778,24 @@ fn suggest_interpreter(path: &Path) -> Option<&'static str> {
 
 pub struct SkillListTool {
     store: std::sync::Arc<std::sync::Mutex<SkillStore>>,
+    allowed: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 }
 
 impl SkillListTool {
     pub fn new_from_handle(store: std::sync::Arc<std::sync::Mutex<SkillStore>>) -> Self {
-        Self { store }
+        Self {
+            store,
+            allowed: None,
+        }
+    }
+
+    /// Scope listing to a per-subagent allow-list (`AgentDef::skills`).
+    pub fn with_allowed(
+        mut self,
+        allowed: std::sync::Arc<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.allowed = Some(allowed);
+        self
     }
 }
 
@@ -1530,7 +1818,16 @@ impl Tool for SkillListTool {
     }
     async fn call(&self, _input: Value) -> Result<String> {
         let store = self.store.lock().unwrap();
-        let mut entries: Vec<&SkillDef> = store.skills.values().collect();
+        let mut entries: Vec<&SkillDef> = store
+            .skills
+            .values()
+            .filter(|s| {
+                self.allowed
+                    .as_ref()
+                    .map(|a| a.contains(&s.name))
+                    .unwrap_or(true)
+            })
+            .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         if entries.is_empty() {
             return Ok("No skills installed. Use /skill marketplace to browse, \
@@ -1559,11 +1856,24 @@ impl Tool for SkillListTool {
 
 pub struct SkillSearchTool {
     store: std::sync::Arc<std::sync::Mutex<SkillStore>>,
+    allowed: Option<std::sync::Arc<std::collections::HashSet<String>>>,
 }
 
 impl SkillSearchTool {
     pub fn new_from_handle(store: std::sync::Arc<std::sync::Mutex<SkillStore>>) -> Self {
-        Self { store }
+        Self {
+            store,
+            allowed: None,
+        }
+    }
+
+    /// Scope search to a per-subagent allow-list (`AgentDef::skills`).
+    pub fn with_allowed(
+        mut self,
+        allowed: std::sync::Arc<std::collections::HashSet<String>>,
+    ) -> Self {
+        self.allowed = Some(allowed);
+        self
     }
 }
 
@@ -1600,6 +1910,11 @@ impl Tool for SkillSearchTool {
         let q = query.to_lowercase();
         let mut hits: Vec<(u8, &SkillDef)> = Vec::new();
         for s in store.skills.values() {
+            if let Some(a) = &self.allowed {
+                if !a.contains(&s.name) {
+                    continue;
+                }
+            }
             if s.name.to_lowercase().contains(&q) {
                 hits.push((0, s));
             } else if s.description.to_lowercase().contains(&q) {
@@ -1830,6 +2145,34 @@ mod tests {
     }
 
     #[test]
+    fn isolated_frontmatter_parses() {
+        let workspace = tempdir().unwrap();
+        let skills_dir = workspace.path().join(".thclaws/skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+        create_skill(
+            &skills_dir,
+            "jobby",
+            "---\nname: jobby\ndescription: a job skill\nisolated: true\n---\nbody",
+            &[],
+        );
+        create_skill(
+            &skills_dir,
+            "guide",
+            "---\nname: guide\ndescription: a guidance skill\n---\nbody",
+            &[],
+        );
+        let store = SkillStore::discover_in(workspace.path(), &[]);
+        assert!(
+            store.get("jobby").expect("jobby present").isolated,
+            "`isolated: true` frontmatter should parse to true"
+        );
+        assert!(
+            !store.get("guide").expect("guide present").isolated,
+            "a skill without `isolated:` should default to false (runs inline)"
+        );
+    }
+
+    #[test]
     fn discover_in_ignores_skills_outside_workspace() {
         // Skills in some other directory must NOT leak into the
         // workspace-scoped store — that's the isolation contract for
@@ -1872,6 +2215,20 @@ mod tests {
         assert!(matches!(skill.content, SkillContent::Eager(_)));
         // Body content is non-empty and recognizable.
         assert!(skill.content().contains("Extract"));
+    }
+
+    #[test]
+    fn seed_builtins_includes_gui_shell_with_tool_gate() {
+        let mut store = SkillStore::default();
+        store.seed_builtins();
+        let skill = store
+            .get("gui-shell")
+            .expect("gui-shell should be seeded as a built-in");
+        assert_eq!(skill.name, "gui-shell");
+        // The `tool-gate:` frontmatter must parse so SkillTool::call can
+        // open the gate that surfaces GuiShellCreate etc.
+        assert_eq!(skill.tool_gate.as_deref(), Some("gui-shell"));
+        assert!(skill.content().contains("GuiShellCreate"));
     }
 
     #[test]
@@ -1997,13 +2354,12 @@ mod tests {
         }
     }
 
-    /// Serializes tests in this module that mutate process-global CWD
-    /// — `set_current_dir` is a process-wide effect and parallel
-    /// `cargo test` runs would interleave otherwise. Same pattern as
-    /// `agent::tests::with_cwd`.
+    /// Serializes against the crate-wide env lock so concurrent tests
+    /// in kms/plugins/context/agent/config/repl/web that also mutate
+    /// cwd or HOME don't race with us. A module-local CWD_LOCK would
+    /// only block siblings inside this file.
     fn with_cwd<R>(dir: &Path, f: impl FnOnce() -> R) -> R {
-        static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _g = CWD_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _g = crate::kms::test_env_lock();
         let prior = std::env::current_dir().expect("cwd readable");
         std::env::set_current_dir(dir).expect("cwd to test dir");
         let out = f();
@@ -2046,6 +2402,68 @@ mod tests {
         assert!(
             body.contains("LOAD ME AFTER CWD CHANGE"),
             "lazy body should resolve under absolute path, got: {body:?}",
+        );
+    }
+
+    /// Tier-1 fix regression test for the v0.24 audit:
+    /// `SkillStore::discover()` is cwd-sensitive — its project-dir
+    /// scan resolves relative paths against `std::env::current_dir()`
+    /// indirectly via `load_dir`. The GUI worker's
+    /// `ShellInput::ChangeCwd` arm (`shared_session.rs:2866`) relies
+    /// on this: it calls `SkillStore::discover()` after `cwd`
+    /// updates, expecting the new cwd's `.thclaws/skills/<name>/`
+    /// to surface and any previous-cwd project skills to drop out.
+    ///
+    /// Without this property, the in-session "switch project"
+    /// affordance silently retains the previous project's skill
+    /// catalog forever — the original v0.24 bug.
+    ///
+    /// User-level skills (`~/.config/thclaws/skills/`, absolute) are
+    /// out of scope here; they correctly persist across cwd changes
+    /// regardless. This test only pins project-scope behaviour.
+    #[test]
+    fn discover_is_cwd_sensitive_for_project_skills() {
+        let proj_a = tempdir().unwrap();
+        let proj_b = tempdir().unwrap();
+
+        std::fs::create_dir_all(proj_a.path().join(".thclaws/skills/alpha")).unwrap();
+        std::fs::write(
+            proj_a.path().join(".thclaws/skills/alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: only in project A\n---\nA body\n",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(proj_b.path().join(".thclaws/skills/beta")).unwrap();
+        std::fs::write(
+            proj_b.path().join(".thclaws/skills/beta/SKILL.md"),
+            "---\nname: beta\ndescription: only in project B\n---\nB body\n",
+        )
+        .unwrap();
+
+        // discover() from project A — should see alpha, not beta.
+        let from_a = with_cwd(proj_a.path(), SkillStore::discover);
+        assert!(
+            from_a.skills.contains_key("alpha"),
+            "expected alpha in A's discover, got keys: {:?}",
+            from_a.skills.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !from_a.skills.contains_key("beta"),
+            "beta must NOT leak across cwd boundaries"
+        );
+
+        // discover() from project B — should see beta, not alpha.
+        // This is what the ChangeCwd fix at shared_session.rs:~2944
+        // re-runs after the worker's cwd flips.
+        let from_b = with_cwd(proj_b.path(), SkillStore::discover);
+        assert!(
+            from_b.skills.contains_key("beta"),
+            "expected beta in B's discover, got keys: {:?}",
+            from_b.skills.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !from_b.skills.contains_key("alpha"),
+            "alpha must NOT leak across cwd boundaries"
         );
     }
 
@@ -2167,6 +2585,61 @@ mod tests {
         );
         assert_eq!(s.content(), "BODY");
         assert!(matches!(s.content, SkillContent::Eager(_)));
+    }
+
+    /// Per-subagent allow-list scopes load (Skill), list (SkillList),
+    /// and search (SkillSearch) to exactly the named skills.
+    #[tokio::test]
+    async fn skill_allow_list_scopes_load_list_search() {
+        let mut store = SkillStore::default();
+        store.skills.insert(
+            "pdf".into(),
+            SkillDef::new_eager(
+                "pdf".into(),
+                "work with pdf".into(),
+                "".into(),
+                PathBuf::from("/tmp"),
+                "PDF BODY".into(),
+            ),
+        );
+        store.skills.insert(
+            "xlsx".into(),
+            SkillDef::new_eager(
+                "xlsx".into(),
+                "work with xlsx".into(),
+                "".into(),
+                PathBuf::from("/tmp"),
+                "XLSX BODY".into(),
+            ),
+        );
+        let handle = std::sync::Arc::new(std::sync::Mutex::new(store));
+        let allowed = std::sync::Arc::new(
+            ["pdf".to_string()]
+                .into_iter()
+                .collect::<std::collections::HashSet<String>>(),
+        );
+
+        let skill = SkillTool::new_from_handle(handle.clone()).with_allowed(allowed.clone());
+        assert!(skill
+            .call(json!({"name": "pdf"}))
+            .await
+            .unwrap()
+            .contains("PDF BODY"));
+        let err = skill.call(json!({"name": "xlsx"})).await.unwrap_err();
+        assert!(
+            format!("{err}").contains("not available to this agent"),
+            "got: {err}"
+        );
+
+        let list = SkillListTool::new_from_handle(handle.clone()).with_allowed(allowed.clone());
+        let out = list.call(json!({})).await.unwrap();
+        assert!(out.contains("pdf"));
+        assert!(!out.contains("xlsx"), "xlsx must be hidden: {out}");
+
+        let search = SkillSearchTool::new_from_handle(handle).with_allowed(allowed);
+        let out = search.call(json!({"query": "work with"})).await.unwrap();
+        assert!(out.contains("pdf"));
+        assert!(!out.contains("xlsx"), "xlsx must be hidden: {out}");
     }
 
     #[test]

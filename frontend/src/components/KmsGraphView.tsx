@@ -64,6 +64,7 @@ export function KmsGraphView({ kmsName, onClose, onOpenFile }: Props) {
   const [hover, setHover] = useState<string | null>(null);
   const [view, setView] = useState({ tx: 0, ty: 0, scale: 1 });
   const [includeSources, setIncludeSources] = useState(true);
+  const [hideOrphanSources, setHideOrphanSources] = useState(true);
   const [_, force] = useState(0); // re-render trigger from rAF loop
 
   const svgRef = useRef<SVGSVGElement | null>(null);
@@ -111,11 +112,37 @@ export function KmsGraphView({ kmsName, onClose, onOpenFile }: Props) {
     return unsub;
   }, [kmsName, includeSources]);
 
+  // Hide orphan source nodes (cached sources no page cites → degree 0). The
+  // pipeline archives EVERY fetched source, so many are never cited; drawing
+  // them scatters disconnected dots that make the graph look sparse. Pages
+  // always stay; a cited source (has an edge) always stays. UI-only — the
+  // source files on disk are untouched.
+  const connectedIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const e of edges) {
+      s.add(e.source);
+      s.add(e.target);
+    }
+    return s;
+  }, [edges]);
+  const displayNodes = useMemo(() => {
+    if (!nodes) return null;
+    if (!hideOrphanSources) return nodes;
+    return nodes.filter((n) => n.kind !== "source" || connectedIds.has(n.id));
+  }, [nodes, connectedIds, hideOrphanSources]);
+  const orphanCount = useMemo(
+    () =>
+      nodes
+        ? nodes.filter((n) => n.kind === "source" && !connectedIds.has(n.id)).length
+        : 0,
+    [nodes, connectedIds],
+  );
+
   // Initialize simulation positions when nodes arrive (or change).
   // Spread on a circle so the force layout has somewhere sensible
   // to relax from.
   useEffect(() => {
-    if (!nodes) return;
+    if (!displayNodes) return;
     const w = sizeRef.current.w;
     const h = sizeRef.current.h;
     const cx = w / 2;
@@ -133,7 +160,7 @@ export function KmsGraphView({ kmsName, onClose, onOpenFile }: Props) {
       (adjacency.get(e.source) ?? adjacency.set(e.source, []).get(e.source)!).push(e.target);
       (adjacency.get(e.target) ?? adjacency.set(e.target, []).get(e.target)!).push(e.source);
     }
-    simRef.current = nodes.map((n, i) => {
+    simRef.current = displayNodes.map((n, i) => {
       const radius = 2 + Math.min(4, n.size * 0.4);
       const carry = prev.get(n.id);
       if (carry) {
@@ -158,7 +185,7 @@ export function KmsGraphView({ kmsName, onClose, onOpenFile }: Props) {
         };
       }
       // No neighbor (orphan source / first paint): seed circle.
-      const theta = (i / Math.max(1, nodes.length)) * Math.PI * 2;
+      const theta = (i / Math.max(1, displayNodes.length)) * Math.PI * 2;
       return {
         ...n,
         x: cx + r * Math.cos(theta),
@@ -172,7 +199,7 @@ export function KmsGraphView({ kmsName, onClose, onOpenFile }: Props) {
     startSim();
     return () => stopSim();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes]);
+  }, [displayNodes]);
 
   // ESC closes.
   useEffect(() => {
@@ -433,7 +460,8 @@ export function KmsGraphView({ kmsName, onClose, onOpenFile }: Props) {
           </span>
           {nodes && (
             <span style={{ opacity: 0.6 }}>
-              {nodes.length} {nodes.length === 1 ? "node" : "nodes"} ·{" "}
+              {displayNodes?.length ?? 0}{" "}
+              {(displayNodes?.length ?? 0) === 1 ? "node" : "nodes"} ·{" "}
               {edges.length} {edges.length === 1 ? "edge" : "edges"}
             </span>
           )}
@@ -453,6 +481,22 @@ export function KmsGraphView({ kmsName, onClose, onOpenFile }: Props) {
             />
             <span>Include sources</span>
           </label>
+          {includeSources && (
+            <label
+              className="flex items-center gap-1.5 text-[10px] cursor-pointer select-none"
+              style={{ color: "var(--text-secondary)" }}
+              title="Hide cached sources that no page cites (orphan nodes). Files on disk are kept."
+            >
+              <input
+                type="checkbox"
+                checked={hideOrphanSources}
+                onChange={(e) => setHideOrphanSources(e.target.checked)}
+                className="cursor-pointer"
+                style={{ accentColor: "var(--accent, #61afef)" }}
+              />
+              <span>Hide unlinked{orphanCount > 0 ? ` (${orphanCount})` : ""}</span>
+            </label>
+          )}
           <div
             className="text-[10px]"
             style={{ color: "var(--text-secondary)", opacity: 0.7 }}

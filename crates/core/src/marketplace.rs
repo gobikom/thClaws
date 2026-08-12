@@ -213,6 +213,31 @@ pub struct MarketplacePlugin {
     pub homepage: String,
 }
 
+/// One subagent (local agent def) entry in the marketplace catalogue.
+/// Packaged as a single `.md` (YAML frontmatter + system prompt) and
+/// installed from a git URL or zip — same `<git-url>#<branch>:<subpath>`
+/// syntax as skills, where the subpath points at the `.md` (or a dir
+/// containing it). Distinct from the cloud agent catalogue
+/// (thclaws.cloud/browse) — these are the `.thclaws/agents/*.md` defs
+/// the Task tool and `/agent` use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketplaceSubagent {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_description: Option<String>,
+    pub description: String,
+    #[serde(default)]
+    pub category: String,
+    pub license: String,
+    pub license_tier: String,
+    /// Git/zip source handed to `agent_defs::install_subagent_from_url`.
+    /// May be `null` for `linked-only` entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_url: Option<String>,
+    #[serde(default)]
+    pub homepage: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Marketplace {
     #[serde(default)]
@@ -227,6 +252,8 @@ pub struct Marketplace {
     pub mcp_servers: Vec<MarketplaceMcpServer>,
     #[serde(default)]
     pub plugins: Vec<MarketplacePlugin>,
+    #[serde(default)]
+    pub subagents: Vec<MarketplaceSubagent>,
 }
 
 /// Derive a single-line catalog row from an entry's full description.
@@ -254,6 +281,12 @@ impl MarketplaceSkill {
     /// otherwise truncates `description` at the first sentence boundary
     /// (or falls back to a hard char cap) so we never blow the line in
     /// a typical 80-col terminal.
+    pub fn short_line(&self) -> String {
+        derive_short_line(self.short_description.as_deref(), &self.description)
+    }
+}
+
+impl MarketplaceSubagent {
     pub fn short_line(&self) -> String {
         derive_short_line(self.short_description.as_deref(), &self.description)
     }
@@ -354,6 +387,24 @@ impl MarketplaceEntry for MarketplacePlugin {
         } else {
             Some(&self.install_url)
         }
+    }
+}
+
+impl MarketplaceEntry for MarketplaceSubagent {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn description(&self) -> &str {
+        &self.description
+    }
+    fn category(&self) -> &str {
+        &self.category
+    }
+    fn license_tier(&self) -> &str {
+        &self.license_tier
+    }
+    fn policy_check_url(&self) -> Option<&str> {
+        self.install_url.as_deref()
     }
 }
 
@@ -469,6 +520,14 @@ impl Marketplace {
 
     pub fn search_plugin(&self, query: &str) -> Vec<&MarketplacePlugin> {
         search_entries(&self.plugins, query)
+    }
+
+    pub fn find_subagent(&self, name: &str) -> Option<&MarketplaceSubagent> {
+        find_entry(&self.subagents, name)
+    }
+
+    pub fn search_subagent(&self, query: &str) -> Vec<&MarketplaceSubagent> {
+        search_entries(&self.subagents, query)
     }
 }
 
@@ -1132,5 +1191,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn parses_subagents_and_finds_by_name() {
+        let json = r#"{
+            "schema": 1,
+            "subagents": [
+                {"name":"reviewer","description":"Read-only review","category":"development",
+                 "license":"Apache-2.0","license_tier":"open",
+                 "install_url":"https://example.com/m.git#main:agents/reviewer.md"},
+                {"name":"proprietary","description":"x","category":"misc",
+                 "license":"Anthropic","license_tier":"linked-only","homepage":"https://up"}
+            ]
+        }"#;
+        let m = Marketplace::from_json_str(json).unwrap();
+        assert_eq!(m.subagents.len(), 2);
+        let r = m.find_subagent("reviewer").expect("reviewer present");
+        assert_eq!(r.license_tier, "open");
+        assert!(r.install_url.as_deref().unwrap().contains("reviewer.md"));
+        // linked-only has no install_url → policy_check_url is None.
+        let p = m.find_subagent("proprietary").unwrap();
+        assert!(p.install_url.is_none());
+        assert!(m.find_subagent("nope").is_none());
+        // search ranks name hits first.
+        assert_eq!(m.search_subagent("review")[0].name, "reviewer");
+    }
+
+    #[test]
+    fn baseline_parses_subagents_array() {
+        // Backward-compat: the embedded baseline must still parse with
+        // the new `subagents` field present (default empty is fine).
+        let m = Marketplace::from_json_str(BASELINE_JSON).unwrap();
+        let _ = m.subagents.len();
     }
 }

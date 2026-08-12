@@ -136,7 +136,6 @@ mod tests {
         assert!(providers.contains(&"ollama"));
         assert!(!providers.contains(&"ollama-anthropic"));
         // Hosted services are locked.
-        assert!(!providers.contains(&"agentic-press"));
         assert!(!providers.contains(&"dashscope"));
     }
 

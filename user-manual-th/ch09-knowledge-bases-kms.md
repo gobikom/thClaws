@@ -654,6 +654,55 @@ page ที่ไม่มี frontmatter เลย จะถูกแยกร�
 
 KMS เก่า (ที่สร้างก่อนมี manifest) จะไม่มี `manifest.json` ระบบจะข้ามการตรวจ field ให้เงียบ ๆ ใช้ `/kms migrate <name> --apply` เพื่อย้ายขึ้นมา v1.0 ได้ migration นี้เป็นแบบเพิ่มเท่านั้น (เขียนไฟล์ manifest ไม่ยุ่งกับ page เลย)
 
+## Import และ export OKF bundle
+
+KMS สามารถส่งออกไปเป็น — และสร้างขึ้นจาก — **Open Knowledge Format (OKF)** bundle ได้ OKF คือสเปกเปิด v0.1 ของ Google สำหรับแทนความรู้ในรูปแบบโฟลเดอร์ของไฟล์ markdown ที่มี YAML frontmatter ซึ่งก็คือรูปทรงแบบ "LLM wiki" เดียวกับที่ KMS ใช้อยู่แล้ว เพราะรูปแบบทั้งสองใกล้เคียงกันมาก จึงเป็น round-trip ที่สะอาด คือ export KMS ออกมาเป็น bundle ที่ไม่ผูกกับ vendor ใดซึ่งคุณจะ zip เก็บ commit เข้า git หรือส่งให้ agent ของทีมอื่นก็ได้ และ import OKF bundle ใด ๆ (ของคุณเองหรือของคนอื่น) ขึ้นมาเป็น KMS ใหม่ได้
+
+วิธีที่ KMS ทำงานบนดิสก์ไม่มีอะไรเปลี่ยนเลย — นี่คือตัวแปลง ไม่ใช่รูปแบบจัดเก็บใหม่ agent ยังอ่าน KMS ของคุณเหมือนเดิมทุกประการ
+
+### Export — `/kms export-okf NAME [OUT-DIR]`
+
+เขียน KMS ออกมาเป็น OKF bundle หากไม่ระบุ output directory จะลงไว้ที่ `./NAME-okf/` ใน working directory ของคุณ:
+
+```
+❯ /kms export-okf notes
+exported 'notes' as OKF bundle → /Users/you/work/notes-okf (42 page(s), 7 reference(s)).
+```
+
+bundle เป็นโฟลเดอร์ธรรมดาที่คุณ browse, diff หรือ archive ได้:
+
+```
+notes-okf/
+├── index.md          # table of contents (declares okf_version)
+├── log.md            # change history
+├── SCHEMA.md         # your page conventions
+├── pages/            # one markdown file per page (your "concepts")
+└── references/       # your raw sources
+```
+
+ระหว่าง export ตัว frontmatter จะถูก normalise ให้เข้ากับ vocabulary ของ OKF — `category:` ของคุณจะกลายเป็น `type:` ที่ OKF บังคับ, `topic:` กลายเป็น `description:`, `tags` ที่คั่นด้วยจุลภาคจะกลายเป็น YAML list — และ `[[wikilinks]]` จะกลายเป็น markdown link ปกติเพื่อให้ OKF reader ใด ๆ ตามลิงก์ได้ ส่วน field เฉพาะของ KMS (`sources`, `verified`, `created`) จะถูกเก็บไว้ตามเดิม ดังนั้น round-trip จึงไม่สูญเสียอะไรเลย
+
+### Import — `/kms import-okf BUNDLE-DIR NAME [--project]`
+
+สร้าง KMS **ใหม่** ชื่อ `NAME` จาก bundle บนดิสก์ ค่าเริ่มต้นเป็น user scope เติม `--project` เพื่อสร้างไว้ใต้ `./.thclaws/kms/` แทน:
+
+```
+❯ /kms import-okf ./partner-bundle partner-knowledge
+imported OKF bundle './partner-bundle' → KMS 'partner-knowledge' (user scope): 30 page(s), 4 source(s).
+  attach it with `/kms use partner-knowledge`.
+```
+
+Import ถูกออกแบบมาให้ผ่อนปรน (ตามสเปก OKF) คือค่า field ที่ไม่รู้จัก, field ที่ขาดหาย และ cross-link ที่เสีย จะถูกยอมรับทั้งหมดแทนที่จะถูกปฏิเสธ concept ที่อยู่ที่ใดก็ตามใน bundle — ไม่จำเป็นต้องอยู่ใต้ `pages/` — จะถูกดึงเข้ามา และ table of contents จะถูกสร้างขึ้นใหม่ทั้งหมดเพื่อให้ผลลัพธ์ทำงานเหมือน KMS อื่น ๆ ทุกประการ Import จะปฏิเสธหากมี KMS ชื่อนี้อยู่แล้วใน scope ที่เลือก ให้ลบทิ้งหรือเลือกชื่ออื่น
+
+### จาก sidebar (GUI)
+
+ในแอปเดสก์ท็อปคุณไม่จำเป็นต้องใช้คำสั่งเหล่านี้ — **คลิกขวาที่หัวข้อ "Knowledge"** ใน sidebar:
+
+- **Import OKF bundle…** จะถามชื่อ KMS ใหม่และ scope จากนั้นเปิด folder picker แบบ native ให้เลือก directory ของ bundle
+- **Export OKF bundle** จะแสดงรายการ KMS ของคุณ เลือกหนึ่งตัวแล้วเลือกโฟลเดอร์ปลายทาง
+
+จะมีบรรทัดสถานะสั้น ๆ ใต้หัวข้อยืนยันผลลัพธ์ และเมื่อ import เสร็จ KMS ใหม่จะปรากฏขึ้นทันทีพร้อม checkbox สำหรับผูก (เมนูเหล่านี้ใช้ได้เฉพาะบนเดสก์ท็อปเพราะต้องเปิด folder dialog แบบ native หากใช้งานผ่าน `--serve`/remote ให้ใช้ slash command แทน)
+
 ## Sidebar (GUI)
 
 ส่วน **Knowledge** ของ sidebar จะแสดง KMS ทุกตัวที่ค้นพบ พร้อม checkbox ให้ทุกรายการ ติ๊กเพื่อผูก เอาติ๊กออกเพื่อถอด ซึ่งก็คือ toggle เดียวกับ `/kms use` และ `/kms off` นั่นเอง
@@ -674,9 +723,9 @@ agent จะเรียก tool นี้เมื่อเห็นราย�
 [result] (page content)
 ```
 
-### `KmsSearch(kms: "name", pattern: "regex")`
+### `KmsSearch(kms: "name", pattern: "regex")` — line grep (default)
 
-สแกนแบบ grep ครอบคลุม `<kms_root>/pages/*.md` ทั้งหมด แล้วคืนบรรทัดที่ตรงในรูปแบบ `page:line:text` หนึ่งรายการต่อบรรทัด
+สแกนแบบ grep ครอบคลุม `<kms_root>/pages/*.md` ทั้งหมด แล้วคืนบรรทัดที่ตรงในรูปแบบ `page:line:text` หนึ่งรายการต่อบรรทัด ใช้เมื่อรู้ pattern ที่แน่นอน (TODO marker, function name, error code)
 
 ```
 [assistant] Let me search for "bearer" across my notes…
@@ -684,6 +733,76 @@ agent จะเรียก tool นี้เมื่อเห็นราย�
 [result]
 auth-flow:12:Bearer tokens expire after 15 minutes
 api-conventions:34:Always include "Authorization: Bearer <token>"
+```
+
+### `KmsSearch(kms: "name", query: "...")` — BM25-ranked search (ค้นแบบ natural language)
+
+ค้นด้วยภาษาธรรมชาติ ครอบคลุม title (boost ×4), topic (×2), body คืน hit ที่เรียงตาม relevance พร้อม snippet preview ใช้เมื่อไม่รู้คำเป๊ะ ๆ และอยากได้หน้าที่เกี่ยวข้องที่สุด ไม่ใช่ทุกบรรทัดที่ match
+
+```
+[assistant] Let me find pages about refresh tokens…
+[tool: KmsSearch(kms: "notes", query: "token refresh flow")]
+[result]
+[score 6.12] page: auth-flow
+  title: Refresh-token rotation
+  topic: auth
+  preview: The token refresh rotates on every login. Refresh tokens are stored…
+
+[score 4.88] page: bug-2023-03
+  preview: Rotation logic in __refresh_token__ misfired when the session…
+```
+
+Optional filter (ไม่มีผลต่อ score ranking — แค่ narrow ผู้สมัคร):
+
+- `tags: ["auth", "security"]` — match หน้าที่มี tag ANY ของรายการ (OR semantics; ใช้ frontmatter `tags:`)
+- `category: "runbook"` — exact match กับ frontmatter `category:`
+- `limit: 20` — จำนวน hit สูงสุด (default 10, สูงสุด 50)
+
+**ข้อแม้ build prerequisite** `query:` mode ต้องการ Cargo feature `kms_search_index` ซึ่งเพิ่ม ~4-5 MB ใน binary (tantivy + Thai dict) Release binary ทางการบน github.com/thClaws/thClaws/releases เปิด feature นี้แล้ว user ที่ใช้ `cargo install` ต้อง `cargo install thclaws-core --features kms_search_index` ถ้าไม่มี feature `query:` จะคืน error ชัดเจนชี้ไป `pattern:` ทาง regex `pattern:` ใช้ได้เสมอ
+
+**First-touch indexing** การเรียก `query:` ครั้งแรกบน KMS ที่ยังไม่มี index จะ build index จาก `pages/` บน disk แบบ sync และแสดงบรรทัด `[index rebuilt — N page(s) indexed]` ครั้งเดียว ครั้งต่อ ๆ ไปจะใช้ warm index (sub-50 ms บน KMS 1000 หน้า) Bulk operation ที่ไม่ trigger hook ต่อหน้า — `/kms merge`, `/kms link --apply` — จะ trigger rebuild ในการค้นครั้งถัดไป หรือ force rebuild ทันทีด้วย `/kms reindex <name>`
+
+**Thai-aware tokenization** เส้น BM25 ใช้ Rust port ของ PyThaiNLP `newmm` segmenter ดังนั้นเนื้อหาภาษาไทยถูก index แบบคำต่อคำ ไม่ใช่ทั้งย่อหน้าเป็น token เดียว ค้นได้เท่ากันทั้ง `query: "token refresh"` และ `query: "การรีเฟรช token"` Per-project supplement ทาง `<kms_root>/extra_words_th.txt` ให้เพิ่มคำเฉพาะทาง domain ที่ base dict พลาด
+
+### `/kms search <name|*> <query>` — one-shot operator search
+
+Surface เดียวกับ tool `KmsSearch` แต่เป็น slash command ค้นได้โดยไม่ผ่าน model round-trip (ประหยัด token + latency สำหรับ lookup สำรวจ และยืนยันว่า index ทำงานหลัง `/kms reindex`)
+
+```
+> /kms search notes token refresh
+[score 6.12] page: auth-flow
+  title: Refresh-token rotation
+  preview: The token refresh rotates on every login…
+```
+
+ใช้ `*` แทน `<name>` เพื่อ fan out ค้นใน KMS ทั้งหมดที่มองเห็น — ผลลัพธ์ถูกจัดกลุ่มใต้ header ของแต่ละ KMS ดังนี้
+
+```
+> /kms search * bearer
+── KMS: notes ──
+[score 5.41] page: auth-flow
+  preview: Bearer tokens expire after 15 minutes…
+
+── KMS: project ──
+(no hits)
+```
+
+Default คือ BM25 `query:` สลับไป regex line-grep ด้วย `--pattern`
+
+```
+> /kms search notes --pattern ^TODO
+todos:3:TODO: rotate the staging cert
+api:18:TODO: deprecate /v1
+```
+
+### `/kms reindex <name>` — manual rebuild
+
+Drop `<kms_root>/.index/` แล้ว rebuild จาก `pages/` บน disk Operator-only (ไม่มี tool `KmsReindex` — model ไม่ตัดสินเองให้ rebuild กลางคัน) เหมาะหลัง bulk operation ที่ index ไม่เห็น หรือถ้า index file เสีย
+
+```
+> /kms reindex notes
+/kms reindex notes — rebuilding…
+/kms reindex notes — indexed 247 page(s)
 ```
 
 ### `KmsWrite`, `KmsAppend`, `KmsDelete`, `KmsCreate`

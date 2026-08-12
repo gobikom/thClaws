@@ -4,6 +4,8 @@
 
 One `ProviderKind` variant uses this impl: `OpenAIResponses`. Routing prefix: `codex/` (or any model id containing `codex`).
 
+> **Desktop/BYOK only.** `codex/` is **hidden from the cross-provider model picker** (`build_provider_all_models_payload` skips `OpenAIResponses`) and does **not** work through the thClaws Gateway: the gateway's provider segment maps `OpenAIResponses → openai` (the Chat Completions tee), which can't meter the `/v1/responses` shape, so a `codex/` model 401s in a hosted/multiuser pod. It still routes normally on desktop with a real `OPENAI_API_KEY`. An explicit `/model codex/<id>` resolves; it's just not listed. (Wiring a real gateway overlay for the Responses shape is a pending follow-up.)
+
 **Source:** `crates/core/src/providers/openai_responses.rs`
 **Constants:**
 - `DEFAULT_API_URL = "https://api.openai.com/v1/responses"`

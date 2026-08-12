@@ -45,7 +45,7 @@ Defaults:
 | Tool | Approval | Summary |
 |---|---|---|
 | `WebFetch` | prompt | HTTP GET (100 KB body cap, per section). When `HAL_API_KEY` is set, runs **both** a HAL headless-browser scrape **and** a plain HTTP GET in parallel and returns a single combined response with each section labelled (see below). |
-| `WebSearch` | prompt | Web search via Tavily / Brave / DuckDuckGo |
+| `WebSearch` | prompt | Web search via Tavily / Brave / SerpAPI (Google) / DuckDuckGo |
 | `WebScrape` | prompt | Direct HAL scrape with advanced parameters (`wait_for` CSS selector, `scroll_to_bottom`, `remove_selectors`, `output_format`) — appears only when `HAL_API_KEY` is set |
 | `YouTubeTranscript` | prompt | Fetch YouTube captions via HAL (multi-language fallback, optional timestamps) — appears only when `HAL_API_KEY` is set |
 
@@ -142,6 +142,71 @@ so Thai content renders correctly without a system-font dependency.
   unrelated regions survive the load+modify+save cycle. Cells use A1-
   style addresses (`B7`, `AA12`).
 
+## Media — image & video generation
+
+Provider-abstracted tools for generating and editing images and video.
+One tool per task; the `provider` + `model` arguments pick the backend.
+**Off by default** — see "Enabling media tools" below. Images are
+written to `output/img-<ts>-<hash>.<ext>`; videos run as async jobs and
+land at `output/vid-<ts>-<hash>.mp4` once finished.
+
+| Tool | Approval | Summary |
+|---|---|---|
+| `TextToImage` | prompt | Prompt → image |
+| `ImageToImage` | prompt | Source image + prompt → edited image |
+| `TextToVideo` | prompt | Prompt → video (async job) |
+| `ImageToVideo` | prompt | Source image as first frame + prompt → video (async job) |
+| `MediaJobStatus` | auto | Poll an async video job by `job_id` → `running` / `done` (path) / `failed` |
+
+**Models & keys** (choose with the `model` argument):
+
+| Provider | Image models | Video models | Key |
+|---|---|---|---|
+| Google Gemini | `gemini-3.1-flash-image`, `gemini-3.1-pro-image` | `veo-3.1-fast-generate-preview`, `veo-3.1-generate-preview`, `veo-3.1-lite-generate-preview` | `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
+| OpenAI | `gpt-image-2` | — | `OPENAI_API_KEY` |
+| Alibaba DashScope | `qwen-image-2.0`, `qwen-image-2.0-pro` | `happyhorse-1.0-t2v` (text→video), `happyhorse-1.0-i2v` (image→video) | `DASHSCOPE_API_KEY` |
+
+- **Video is asynchronous.** `TextToVideo` / `ImageToVideo` submit the
+  job and return a `job_id` immediately — the file isn't ready yet. Call
+  `MediaJobStatus { job_id }` to poll: `running`, `done` (with the saved
+  `output/…mp4` path), or `failed` (with the provider error). Job state
+  is journalled to `.thclaws/media-jobs.jsonl`, so a poll survives a
+  restart.
+- **Veo clips are 4–8 seconds.** Veo and HappyHorse take a `resolution`
+  of `720P` or `1080P`.
+- **`ImageToVideo`** uses a local image as the first frame, sent inline
+  (base64 data URI) — no separate upload step.
+
+### Enabling media tools
+
+Media tools cost money per image / per video-second, so they're **off by
+default**. Turn them on in `settings.json`:
+
+```jsonc
+// ./.thclaws/settings.json
+{ "mediaToolsEnabled": true }   // legacy alias: "imageToolsEnabled"
+```
+
+The built-in **Media Studio** GUI shell (Chapter 26) auto-enables them
+for its own session regardless of this flag — it's the no-config,
+point-and-click on-ramp for people who aren't driving the agent from
+chat.
+
+## Video review & movie-making
+
+| Tool | Approval | What it does |
+|---|---|---|
+| `WatchVideo` | prompt | Lets the model **watch** a local video: pulls scene-aware key frames (so it can *see* what happens) + a Whisper transcript when `GROQ_API_KEY` is set. Use it to review or critique a clip. |
+| `FilmCompile` / `FilmGenerate` / `FilmJobStatus` / `FilmJobCancel` / `FilmAssetImport` | `FilmGenerate` + `FilmAssetImport` prompt | The **Movie Maker** toolkit — turn a `.film` screenplay into a finished AI video. Hidden until you install the Movie Maker agent (which opens the `filmscript` gate). `FilmGenerate` needs a `budgetUsd` — that's your spend cap + consent. See Chapter 29. |
+
+## Other tools
+
+- **`FetchImages`** — downloads every remote image in a Markdown file into a
+  sibling `images/` folder and rewrites the links (used by content-extractor
+  agents). Confined to your workspace.
+- **`EpubCreate`** — Markdown → EPUB e-book (joins the Word/Excel/PowerPoint/PDF
+  document tools above).
+
 ## User interaction
 
 | Tool | Approval | Summary |
@@ -170,9 +235,33 @@ reaches for during long planning turns. See them mid-turn with
 | Tool | Approval | Summary |
 |---|---|---|
 | `Task` | prompt | Spawn a sub-agent for an isolated sub-problem |
+| `WorkflowRun` | prompt | Author + run a JavaScript workflow that fans work across many subagents |
 
-Sub-agents get their own tool registry and can recurse up to depth 3.
-Details in [Chapter 15](ch15-subagents.md).
+Sub-agents get their own tool registry and can recurse up to depth 3
+([Chapter 15](ch15-subagents.md)). `WorkflowRun` is the model-driven entry
+to workflows ([Chapter 25](ch25-workflows.md)).
+
+## Memory
+
+| Tool | Approval | Summary |
+|---|---|---|
+| `MemoryRead` | auto | Read one entry from the persistent file-based memory |
+| `MemoryWrite` | prompt | Create or replace a memory entry (frontmatter + body) |
+| `MemoryAppend` | prompt | Append to an existing memory entry |
+
+Cross-session memory that persists who you are and how you like to work —
+see [Chapter 8](ch08-memory-and-agents-md.md).
+
+## Goals (autonomous `/goal` mode)
+
+| Tool | Approval | Summary |
+|---|---|---|
+| `RecordGoalProgress` | auto | Log a step of progress toward the active goal |
+| `MarkGoalComplete` | auto | Declare the goal done — ends the autonomous loop |
+| `MarkGoalBlocked` | auto | Flag the goal as blocked (needs your input) |
+
+Registered only while a `/goal` autonomous run is active; the loop uses
+them to report progress and decide when to stop.
 
 ## Knowledge base (KMS)
 
@@ -199,6 +288,43 @@ Every MCP server's tools are discovered at startup and registered with
 names qualified by server: `weather__get_forecast`,
 `github__list_issues`, etc. All prompt for approval. Details in
 [Chapter 14](ch14-mcp.md).
+
+## Gated tools — GUI Shell
+
+Some tools are **registered but hidden** until a skill opens their *gate*.
+While closed they cost **zero tokens** — the model never sees their names —
+and they surface only when actually needed. The GUI-Shell authoring tools
+(for building a custom HTML frontend, [Chapter 26](ch26-gui-shells.md)) work
+this way:
+
+| Tool | Approval | Summary |
+|---|---|---|
+| `GuiShellCreate` | prompt | Scaffold a new GUI Shell (manifest + entry HTML) under `.thclaws/gui-shell/<id>/` |
+| `GuiShellWriteFile` | prompt | Write/overwrite a file inside a GUI Shell — path-jailed to its own directory |
+| `GuiShellList` | auto | List the installed GUI Shells |
+| `GuiShellRemove` | prompt | Delete a GUI Shell |
+
+### How the gate opens
+
+1. **Each gated tool declares a gate.** `Tool::requires_gate()` returns
+   `Some("gui-shell")`, so the **per-turn tool filter hides it** — the same
+   mechanism `requires_env` uses for service-key tools. The four `GuiShell*`
+   tools are invisible to the model and add nothing to the system prompt.
+2. **A skill owns the gate.** The bundled **`gui-shell` skill** declares
+   `tool-gate: gui-shell` in its frontmatter ([Chapter 12](ch12-skills.md)).
+3. **Invoking the skill opens it.** The skill triggers when you ask to
+   "build a UI / dashboard / custom frontend …"; when the model calls it,
+   `SkillTool::call` runs `activate_gate("gui-shell")`.
+4. **It takes effect next turn.** Gates are **process-global and
+   session-sticky** — once open, they stay open for the session. The
+   per-turn filter re-checks gates on the next request, so the `GuiShell*`
+   tools become visible and callable **without rebuilding the agent or
+   registry**.
+
+So the model can't reach the GUI-Shell tools out of nowhere — it has to go
+through the skill first, which is exactly what surfaces them. This
+gated-tool-group mechanism is reusable: future tool groups can be lazily
+surfaced the same way (a skill opens the gate → the group appears).
 
 ## Reading the tool stream
 

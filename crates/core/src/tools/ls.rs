@@ -19,6 +19,10 @@ impl Tool for LsTool {
         "Ls"
     }
 
+    fn parallelizable(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> &'static str {
         "List the immediate contents of a directory (files and subdirectories, \
          non-recursive). Use this for `list files` requests and general \

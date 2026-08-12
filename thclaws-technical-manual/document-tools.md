@@ -8,6 +8,7 @@ Twelve tools that read, create, and edit office-format documents (Word, Excel, P
 | Excel (`.xlsx`) | `XlsxCreate` | `XlsxEdit` | `XlsxRead` |
 | PowerPoint (`.pptx`) | `PptxCreate` | `PptxEdit` | `PptxRead` |
 | PDF | `PdfCreate` | — (PDF edit not in scope) | `PdfRead` |
+| EPUB | `EpubCreate` | — | — (compiles Markdown → EPUB; `src/tools/epub_create.rs`, `requires_approval`) |
 
 **Source:** `crates/core/src/tools/{docx,xlsx,pptx,pdf}_*.rs`
 **Bundled fonts:** `crates/core/resources/fonts/NotoSans-Regular.ttf` + `NotoSansThai-Regular.ttf` (PDF only — Docx/Pptx reference Noto Sans Thai by name and rely on the OS having it installed)

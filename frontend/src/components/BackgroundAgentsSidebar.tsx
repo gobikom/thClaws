@@ -98,10 +98,15 @@ export function BackgroundAgentsSidebar() {
           const id = String(msg.id ?? "");
           const toolName = String(msg.tool_name ?? "");
           if (!id || !toolName) break;
+          // Prefer the descriptive label the engine builds from the tool
+          // input (e.g. "WebFetch (https://…)", "Write (…/article.md)") so
+          // the running-agent line reads as real progress, not a bare tool
+          // name. Falls back to the name when no label is present.
+          const label = String(msg.label ?? "") || toolName;
           setAgents((prev) => {
             const entry = prev[id];
             if (!entry) return prev;
-            return { ...prev, [id]: { ...entry, lastTool: toolName } };
+            return { ...prev, [id]: { ...entry, lastTool: label } };
           });
           break;
         }

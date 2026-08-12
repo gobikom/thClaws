@@ -11,8 +11,8 @@ teams.
 |---|---|
 | 1 | [What is thClaws?](ch01-what-is-thclaws.md) |
 | 2 | [Installation](ch02-installation.md) |
-| 3 | [Desktop GUI tour](ch04-desktop-gui-tour.md) |
-| 4 | [Working directory & running modes](ch03-working-directory-and-modes.md) |
+| 3 | [Working directory & running modes](ch03-working-directory-and-modes.md) |
+| 4 | [Desktop GUI tour](ch04-desktop-gui-tour.md) |
 | 5 | [Permissions](ch05-permissions.md) |
 | 6 | [Providers, models & API keys](ch06-providers-models-api-keys.md) |
 | 7 | [Sessions](ch07-sessions.md) |
@@ -26,17 +26,30 @@ teams.
 | 15 | [Subagents](ch15-subagents.md) |
 | 16 | [Plugins](ch16-plugins.md) |
 | 17 | [Agent teams](ch17-agent-teams.md) |
+| 18 | [Plan mode](ch18-plan-mode.md) |
 | 19 | [Scheduling](ch19-scheduling.md) |
 | 20 | [Background research (`/research`)](ch20-research.md) |
 | 21 | [LINE chat & web browser bridge](ch21-line-and-browser-chat.md) |
-| 22 | [Paperclip adapter](ch22-paperclip-adapter.md) |
+| 22 | [Paperclip adapter](ch22-paperclip-adapter.md) — *retired* |
 | 23 | [Telegram bot](ch23-telegram.md) |
 | 24 | [Facebook Page Messenger bot](ch24-messenger.md) |
+| 25 | [Workflows (`/workflow run`)](ch25-workflows.md) |
+| 26 | [GUI Shells](ch26-gui-shells.md) |
+| 27 | [thClaws.cloud (catalog + hosted + gateway)](ch27-thclaws-cloud.md) |
+| 28 | [Browser automation](ch28-browser-automation.md) |
+| 29 | [Movie Maker (AI film from a screenplay)](ch29-movie-maker.md) |
+| 30 | [Job Artifacts (files in/out for orchestrators)](ch30-job-artifacts.md) |
 
-> **Part II — Case studies (chapters 25–28)** — applied walkthroughs
+> **Part II — Case studies (chapters 29–31)** — applied walkthroughs
 > for building real projects with thClaws (static sites, Node.js apps,
 > AI agents, deploying to Agentic Press) are in active development and
 > will be added to this manual as each is reviewed and ready.
+
+## Appendices
+
+| # | Appendix |
+|---|---|
+| A | [Providers, models & prices (thClaws.cloud gateway)](appendix-a-providers-models-prices.md) |
 
 ## Conventions used in this manual
 

@@ -95,6 +95,20 @@ impl ProjectContext {
             parts.push(base.trim().to_string());
         }
 
+        // Anchor the model in real time. Without a current-date signal the
+        // model treats its training cutoff as "now" and answers
+        // "latest"/"recent"/news queries from stale memory (the scheduled
+        // "latest AI news → year-old results" bug). State the date AND
+        // tell it to search for anything time-sensitive.
+        parts.push(format!(
+            "# Environment\nToday's date: {} (UTC).\nYour training data has a cutoff, so it is \
+             stale for anything time-sensitive — \"latest\", \"recent\", \"current\", news, \
+             prices, releases, versions, who-holds-an-office. For those, use WebSearch / \
+             WebFetch (or the browser tools) to get up-to-date information; do NOT answer from \
+             memory.",
+            crate::usage::today_str()
+        ));
+
         parts.push(format!("# Working directory\n{}", self.cwd.display()));
 
         if let Some(git) = &self.git {
@@ -147,6 +161,18 @@ fn load_claude_md_compat_flag() -> bool {
 /// those — the user's Claude Code identity isn't generic agent
 /// instructions and shouldn't bleed into thClaws's prompt.
 pub fn find_claude_md_with(start: &Path, claude_md_compat: bool) -> Option<String> {
+    // Shared-agent mode (dev-plan/41): instructions are LOCKED to the
+    // company brain's `AGENTS.md`. Every other source — working-dir
+    // CLAUDE.md/AGENTS.md, the ancestor walk, user scope
+    // (`~/.config/thclaws`, `~/.claude`), rules dirs, local overrides —
+    // is ignored, so a member can't smuggle instruction overrides in via
+    // any layer (also blunts prompt-injection on a company-billed agent).
+    if let Some(agents_md) = crate::shared::shared_agents_md() {
+        return std::fs::read_to_string(&agents_md)
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+    }
+
     let mut parts: Vec<String> = Vec::new();
 
     // 1. User-level instructions. Claude Code path first, then vendor-neutral
@@ -282,6 +308,15 @@ pub struct ClaudeMdOversize {
 /// counts so users can see which memory file is driving their token
 /// spend. Pure filesystem walk — no read.
 pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
+    // Shared-agent mode (dev-plan/41): only the locked company AGENTS.md
+    // is in the prompt, so /context must report just that — not member
+    // files that are ignored.
+    if let Some(agents_md) = crate::shared::shared_agents_md() {
+        return match std::fs::metadata(&agents_md) {
+            Ok(meta) if meta.is_file() => vec![(agents_md, meta.len())],
+            _ => Vec::new(),
+        };
+    }
     let claude_md_compat = load_claude_md_compat_flag();
     let mut out: Vec<(PathBuf, u64)> = Vec::new();
     let mut check = |path: PathBuf| {
@@ -345,6 +380,19 @@ pub fn scan_claude_md_sizes(start: &Path) -> Vec<(PathBuf, u64)> {
 /// file ≥ [`CLAUDE_MD_WARN_BYTES`]. Pure filesystem walk — no read —
 /// so it's cheap enough to call at every session startup.
 pub fn scan_claude_md_oversize(start: &Path) -> Vec<ClaudeMdOversize> {
+    // Shared-agent mode (dev-plan/41): only the locked company AGENTS.md
+    // is loaded — scan only that.
+    if let Some(agents_md) = crate::shared::shared_agents_md() {
+        return match std::fs::metadata(&agents_md) {
+            Ok(meta) if meta.is_file() && meta.len() >= CLAUDE_MD_WARN_BYTES => {
+                vec![ClaudeMdOversize {
+                    path: agents_md,
+                    bytes: meta.len(),
+                }]
+            }
+            _ => Vec::new(),
+        };
+    }
     let claude_md_compat = load_claude_md_compat_flag();
     let mut out = Vec::new();
     let mut check = |path: PathBuf| {
@@ -713,6 +761,10 @@ mod tests {
             project_instructions: None,
         };
         let p = ctx.build_system_prompt("");
-        assert!(p.starts_with("# Working directory"));
+        // Empty base leaves no leading blank — the prompt starts cleanly
+        // with the first real section (the date-anchored environment).
+        assert!(p.starts_with("# Environment"));
+        assert!(p.contains("Today's date:"));
+        assert!(p.contains("# Working directory"));
     }
 }

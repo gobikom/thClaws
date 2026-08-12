@@ -122,6 +122,11 @@ mcp 'weather' removed from .thclaws/mcp.json (restart to drop active tools)
 
 ## Marketplace
 
+MCP server เป็น 1 ใน 4 ประเภทของ thClaws marketplace รวม (skills · MCP ·
+plugins · subagents — ดู [บทที่ 12](ch12-skills.md)) ใน GUI
+**`/marketplace`** เปิด browser modal ที่มีแท็บ **MCP** ส่วนคำสั่ง text
+ด้านล่างใช้ได้ทุกที่
+
 `/mcp marketplace` เปิดดู MCP servers ที่ทีม thClaws คัดสรรไว้
 รูปแบบเหมือน skill marketplace — สามคำสั่งสำรวจ + install ด้วยชื่อ:
 

@@ -1,9 +1,8 @@
 # Model catalogue
 
 How thClaws stores per-model metadata — context window, max output,
-modality, **pricing** — and how downstream consumers
-(paperclip-adapter, thcompany, external dashboards) discover and use
-it. Reference for [dev-plan/24](../dev-plan/24-model-catalogue-pricing.md).
+modality, **pricing** — and how downstream consumers (external
+dashboards, schedulers, billing) discover and use it. Reference for [dev-plan/24](../dev-plan/24-model-catalogue-pricing.md).
 
 > **TL;DR**: thClaws ships a JSON catalogue compiled into the binary
 > ([`crates/core/resources/model_catalogue.json`][cat]). It tracks
@@ -71,9 +70,20 @@ graceful degradation, no panic.
 | **`cached_input_per_mtok`** | `f64` | no | USD per 1M cache-READ tokens. Anthropic publishes a discounted rate (e.g. Sonnet 4.6: `$0.30`); OpenAI's `prompt_tokens_details.cached_tokens` falls back to `input_per_mtok` when this field is absent. |
 | **`cache_creation_per_mtok`** | `f64` | no | USD per 1M cache-WRITE tokens. Anthropic charges a write premium (Sonnet 4.6: `$3.75` for 5min TTL); OpenAI auto-manages, leaves this `null`. The 5min vs 1h TTL distinction is collapsed into one field for v1; split later if a real use case demands it. |
 | **`reasoning_per_mtok`** | `f64` | no | USD per 1M o1/o3 hidden reasoning tokens. Most providers fold this into output_per_mtok — leave absent there. |
-| **`tier_billed`** | `bool` | no | `true` ⇒ model is bundled into a subscription tier (Codex via ChatGPT Plus/Pro/Team, enterprise contracts). `compute_cost_usd` returns `None` so callers show "tier-billed" rather than $0. |
+| **`tier_billed`** | `bool` | no | `true` ⇒ the model has no fixed per-token price to meter — either a subscription-bundled model (Codex via ChatGPT Plus/Pro/Team) **or** a variable-priced router (`openrouter/fusion`, `openrouter/fusion+`) that can't carry a gateway price. `compute_cost_usd` returns `None`; the `audit-pricing` gate exempts these (they're BYOK-only, off-gateway). |
+| `price_per_image_usd` | `f64` | no | USD per generated image — image models (`gpt-image-2`, `gemini-3.1-*-image`, `qwen-image-2.0`). Per-image, outside the `*_per_mtok` sum. |
+| `video_price_per_second_usd` | `f64` | no | USD per second of generated video — LTX / DashScope / Veo. Metered per output-second at the gateway (`video_forward`). |
+| `tts_price_per_kchar_usd` | `f64` | no | USD per 1,000 input characters — TTS models (`elevenlabs/eleven_v3`, `openai/gpt-4o-mini-tts`, `minimax/speech-02-hd`). Rows carry `kind:"tts"`. |
+| `audio_price_per_second_usd` | `f64` | no | USD per second of input audio — speech-to-text (Groq Whisper). |
 
-Bold rows added in schema 4 (dev-plan/24).
+Media rows carry only their media price (token `*_per_mtok` = 0) and are
+metered per-unit at the gateway, not per-token. **These media fields live
+in the JSON + `model_pricing` only** — the engine's Rust `ModelEntry`
+loader carries just `price_per_image_usd`, so `video`/`tts`/`audio`/`kind`
+are gateway-side (silently ignored by the engine). Bold rows added in
+schema 4 (dev-plan/24); image/video/tts/audio metering in dev-plan/40 + /53.
+
+> **Pseudo-model rows.** `openrouter/fusion+` is a thClaws pseudo-model with no upstream `/v1/models` entry. It carries the variable-price sentinel and is **pinned** in `refresh-model-catalogue.py` (`PROVIDERS["openrouter"]["pin"]`) so a normal `make catalogue` run never prunes it. See [`provider-openai.md`](provider-openai.md) §7.
 
 ### `ProviderCatalogue` fields
 
@@ -140,13 +150,37 @@ counts; see [`openai-api.md` §usage block](openai-api.md#post-v1chatcompletions
 
 ## Pricing data source
 
-Pricing data is hand-curated; provider `/v1/models` endpoints don't
-include rates (Anthropic, OpenAI, Gemini all keep pricing in docs).
-Source of truth for the catalogue's pricing fields is
-**[LiteLLM][litellm]**'s `model_prices_and_context_window.json`, a
-community-maintained file updated frequently.
+`model_catalogue.json` itself is the **single source of truth** for
+pricing — every row is provenance-tagged (`source`, `verified_at`).
+Provider `/v1/models` endpoints don't include rates, so figures are
+hand-curated, with **[LiteLLM][litellm]** used as one convenient *input*
+for per-token rates (below).
 
-Refresh workflow:
+### Cloud billing pipeline (catalogue → gateway)
+
+The catalogue → the gateway's `model_pricing` table is a one-way sync:
+
+```
+model_catalogue.json  ──make sync-cloud-pricing──▶  model_pricing (cloud DB)  ──▶  gateway meter
+     (SSOT, raw prices)      (only writer)              (per-provider rows)         (×1.25 markup here)
+```
+
+- **`make sync-cloud-pricing`** (`scripts/sync-cloud-pricing.py`) is the
+  **only** writer of `model_pricing`; it upserts token rows plus the media
+  rows (`tts_price_per_kchar_usd` → `tts_micros_per_kchar`,
+  `audio_price_per_second_usd`, `price_per_image_usd`,
+  `video_price_per_second_usd`). `--prune` deactivates rows no longer in
+  the catalogue (use with care — some rows, e.g. a Gemini TTS model, may
+  live only in the DB).
+- The **×1.25 platform markup is applied ONLY at gateway meter time**,
+  never stored in a catalogue or `model_pricing` row (`meter.rs`).
+- **`make audit-pricing`** is the release gate — every gateway-servable
+  Featured model must carry a priced row (variable-priced routers are
+  marked `tier_billed: true` and exempted).
+
+### LiteLLM token-price refresh (a catalogue input, not the SSOT)
+
+Refresh the catalogue's `*_per_mtok` fields from LiteLLM:
 
 ```sh
 # From the workspace root:
@@ -236,14 +270,6 @@ Migration policy:
 
 ## Downstream consumers
 
-- **paperclip-adapter** bundles a snapshot of pricing fields as
-  `pricing-fallback.ts` (generated by
-  `scripts/sync-pricing-to-paperclip-adapter.py`). Its
-  `tokensToCostUsd` helper is the TypeScript port of
-  `compute_cost_usd`. See [paperclip-adapter.md](paperclip-adapter.md).
-- **thcompany** imports `tokensToCostUsd` from paperclip-adapter and
-  uses it on both sync (in the adapter) and async (in the run-callback
-  route). See `dev-plan/24` Phase D for the wiring.
 - **External tools** (n8n, Zapier, custom dashboards) hit
   [`GET /v1/models`](openai-api.md#get-v1models) and read the
   `pricing` block per model. The shape is stable — fields are
@@ -253,7 +279,5 @@ Migration policy:
 
 - [`openai-api.md`](openai-api.md) — `/v1/models` response shape +
   `usage` block fields
-- [`paperclip-adapter.md`](paperclip-adapter.md) — TypeScript cost
-  compute on the consumer side
 - [`../dev-plan/24-model-catalogue-pricing.md`](../dev-plan/24-model-catalogue-pricing.md)
   — full design rationale and phase breakdown

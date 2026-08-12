@@ -2,12 +2,15 @@ import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
+import { resolveAssetSrc } from "../lib/fileAsset";
 import { Check, Copy, Paperclip } from "lucide-react";
-import { send, subscribe } from "../hooks/useIPC";
+import { basePath, send, subscribe } from "../hooks/useIPC";
+import { promptHistory, recordPrompt } from "../hooks/promptHistory";
 import { useTheme } from "../hooks/useTheme";
 import { useVersion } from "../hooks/useVersion";
 import logoDark from "../assets/thClaws-logo-dark.png";
 import logoLight from "../assets/thClaws-logo-light.png";
+import { WorkflowReviewBubble } from "./WorkflowReviewBubble";
 import {
   SlashCommandPopup,
   filterCommands,
@@ -16,14 +19,34 @@ import {
 import { McpAppIframe } from "./McpAppIframe";
 
 type ChatMessage = {
-  role: "user" | "assistant" | "tool" | "system" | "error";
+  role: "user" | "assistant" | "tool" | "system" | "error" | "workflow_review";
   content: string;
+  /// `system` messages only — marks a bubble that accumulates a slash
+  /// command's streamed output (e.g. `/cloud push` progress). Consecutive
+  /// `chat_slash_output` lines fold into ONE such bubble instead of a balloon
+  /// per line, and progress lines (`… MB (N%)`) update its last line in place.
+  slashOutput?: boolean;
+  /// `workflow_review` messages only — dev-plan/32 Tier 3 GUI
+  /// approval. Carries the script + id the WorkflowReviewBubble
+  /// posts back when the user clicks Approve / Cancel / Re-author.
+  workflowReview?: {
+    id: string;
+    script: string;
+    prompt: string;
+    model: string;
+    revision: number;
+  };
   /// `assistant` messages only — accumulated `reasoning_content` from
   /// thinking models (DeepSeek v4/r1, OpenAI o-series, NVIDIA NIM
   /// glm4.7, etc.). Rendered as a collapsible dimmed block above the
   /// assistant text so the user can see the model is working without
   /// the reasoning blending into the final answer.
   thinking?: string;
+  /// Total accumulated thinking length. `thinking` above is capped at
+  /// MAX_THINKING_CHARS (tail kept) so an hours-long reasoning stream
+  /// can't grow the webview unbounded — this carries the real count
+  /// for the summary line.
+  thinkingChars?: number;
   toolName?: string;
   /// `tool` messages only — flips from false (running) to true (done)
   /// when the matching `chat_tool_result` arrives. Drives the leading
@@ -101,7 +124,21 @@ type AskPrompt = {
 const SUPPORTED_IMAGE_MIME = /^image\/(png|jpeg|jpg|webp|gif)$/;
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB per attachment
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25 MB per uploaded file (--serve / webapp upload)
+// A pasted text blob at/above this length is routed to an _uploads/ file (path
+// injected) instead of dumped into the composer. ~2k chars ≈ 2-3 dense
+// paragraphs — small enough to stay editable inline, large enough that a whole
+// article / log / source file goes to a file so it doesn't bloat the prompt.
+const PASTE_TO_FILE_THRESHOLD = 2000;
 const MAX_UPLOAD_FILES = 5;
+
+/// Cap on the thinking text a bubble HOLDS (not what the model produced —
+/// the full stream persists in the session JSONL). Long agentic runs
+/// accumulate megabytes of reasoning; every delta re-rendered the whole
+/// open `<details>` block and the unbounded string eventually killed the
+/// webview's web-content process (GUI "crash" — the CLI, which just
+/// prints, was unaffected). Keep the tail: that's what the user watches
+/// live. 150k chars ≈ a few thousand lines, bounded relayout cost.
+const MAX_THINKING_CHARS = 150_000;
 
 const HAS_WRY_TRANSPORT =
   typeof window !== "undefined" && typeof window.ipc !== "undefined";
@@ -125,6 +162,91 @@ function stripThinkBlocks(content: string): string {
   return content.replace(THINK_BLOCK, "").replace(ORPHAN_CLOSE, "");
 }
 
+/// Detect bare multi-line JSON object/array blocks at line-start and
+/// wrap them in ```json fences before handing to ReactMarkdown.
+///
+/// Without this pass, markdown collapses single newlines inside an
+/// unfenced JSON block to spaces — so a tool response the model echoes
+/// back as
+///   {
+///     "next_action": "first_greet",
+///     ...
+///   }
+/// renders as a single-line wall instead of the indented block the
+/// terminal tab shows (xterm.js just replaces \n with \r\n and the
+/// monospace renderer preserves layout).
+///
+/// Walks the text once with a brace counter so nested braces inside
+/// the JSON don't terminate early. Skips regions already inside a ```
+/// fence. Only wraps a candidate if `JSON.parse` accepts it — keeps
+/// false positives off (a paragraph that happens to start with `{`
+/// is left alone).
+function wrapBareJsonBlocks(content: string): string {
+  // Map of already-fenced regions to skip.
+  const fenced: [number, number][] = [];
+  const fenceRe = /```[\s\S]*?```/g;
+  let fm: RegExpExecArray | null;
+  while ((fm = fenceRe.exec(content)) !== null) {
+    fenced.push([fm.index, fm.index + fm[0].length]);
+  }
+  const inFence = (i: number) => fenced.some(([s, e]) => i >= s && i < e);
+
+  const out: string[] = [];
+  let i = 0;
+  while (i < content.length) {
+    const ch = content[i];
+    const atLineStart = i === 0 || content[i - 1] === "\n";
+    if (atLineStart && (ch === "{" || ch === "[") && !inFence(i)) {
+      const close = ch === "{" ? "}" : "]";
+      let depth = 0;
+      let j = i;
+      let inString = false;
+      let escape = false;
+      while (j < content.length) {
+        const c = content[j];
+        if (escape) {
+          escape = false;
+          j++;
+          continue;
+        }
+        if (inString) {
+          if (c === "\\") escape = true;
+          else if (c === '"') inString = false;
+          j++;
+          continue;
+        }
+        if (c === '"') inString = true;
+        else if (c === ch) depth++;
+        else if (c === close) {
+          depth--;
+          if (depth === 0) {
+            j++;
+            break;
+          }
+        }
+        j++;
+      }
+      if (depth === 0 && j > i + 1) {
+        const candidate = content.substring(i, j);
+        // Only wrap if it's actually valid JSON. Streaming partial
+        // blocks (depth never reached 0) and prose paragraphs that
+        // happen to start with `{` will fall through here.
+        try {
+          JSON.parse(candidate);
+          out.push("```json\n", candidate, "\n```");
+          i = j;
+          continue;
+        } catch {
+          /* not valid JSON — leave as-is */
+        }
+      }
+    }
+    out.push(ch);
+    i++;
+  }
+  return out.join("");
+}
+
 function blobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -133,7 +255,8 @@ function blobToBase64(blob: Blob): Promise<string> {
       if (typeof result === "string") resolve(dataUrlToBase64(result));
       else reject(new Error("FileReader: non-string result"));
     };
-    reader.onerror = () => reject(reader.error ?? new Error("FileReader failed"));
+    reader.onerror = () =>
+      reject(reader.error ?? new Error("FileReader failed"));
     reader.readAsDataURL(blob);
   });
 }
@@ -163,9 +286,23 @@ export function ChatView({ active, modalOpen }: Props) {
   /// so the user knows the request is in flight.
   const [waitingFirstByte, setWaitingFirstByte] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Auto-scroll only when the user is parked at the bottom. When they
+  // scroll up to read history, streamed tokens must NOT yank them back
+  // down (issue #170). Updated by the messages container's onScroll.
+  const messagesContainerRef = useRef<HTMLDivElement>(null);
+  const isAtBottomRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Bash-style prompt-history recall (shared with the Terminal tab). -1 = not
+  // navigating (the textarea holds the user's own draft); otherwise an index
+  // into promptHistory(). savedDraft restores the draft on Down past the newest.
+  const histIndexRef = useRef(-1);
+  const savedDraftRef = useRef("");
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  // IDs of drag-drop `file_upload` requests in flight, so the shared
+  // `file_upload_result` subscriber injects the path only for OUR uploads
+  // (the Files tab uses the same IPC with its own ids).
+  const droppedUploadIds = useRef<Set<string>>(new Set());
   const copiedTimerRef = useRef<number | null>(null);
   const errorTimerRef = useRef<number | null>(null);
   const waitingTimerRef = useRef<number | null>(null);
@@ -178,7 +315,10 @@ export function ChatView({ active, modalOpen }: Props) {
   // streaming turn — slash commands fire instantly so there's nothing
   // useful to autocomplete while the model is still talking.
   const slashOpen =
-    !askPrompt && !streaming && input.startsWith("/") && !input.slice(1).includes(" ");
+    !askPrompt &&
+    !streaming &&
+    input.startsWith("/") &&
+    !input.slice(1).includes(" ");
   const slashQuery = slashOpen ? input.slice(1).split(/\s/)[0] : "";
   const slashFiltered = slashOpen
     ? filterCommands(slashCommands, slashQuery)
@@ -186,7 +326,8 @@ export function ChatView({ active, modalOpen }: Props) {
 
   const showAttachmentError = (msg: string) => {
     setAttachmentError(msg);
-    if (errorTimerRef.current !== null) window.clearTimeout(errorTimerRef.current);
+    if (errorTimerRef.current !== null)
+      window.clearTimeout(errorTimerRef.current);
     errorTimerRef.current = window.setTimeout(() => {
       setAttachmentError(null);
       errorTimerRef.current = null;
@@ -238,18 +379,57 @@ export function ChatView({ active, modalOpen }: Props) {
     }
   };
 
+  /// Save a dropped file to the workspace `_uploads/` dir (backend
+  /// `file_upload` IPC — works desktop + `--serve`) and, on success, inject
+  /// its workspace-relative path into the composer as text. This is what lets
+  /// a dropped doc feed `/summarize`, `/translate`, `/extract` — the subagents
+  /// Read the path, so the file's bytes never bloat the prompt. Images get
+  /// this too (path injected) *and* the inline attach below.
+  const uploadAndInjectPath = async (file: File) => {
+    if (file.size > MAX_UPLOAD_BYTES) {
+      showAttachmentError(
+        `${file.name} is ${(file.size / 1024 / 1024).toFixed(1)} MB (max ${MAX_UPLOAD_BYTES / 1024 / 1024} MB)`,
+      );
+      return;
+    }
+    let data: string;
+    try {
+      data = await blobToBase64(file);
+    } catch {
+      showAttachmentError(`Couldn't read ${file.name}`);
+      return;
+    }
+    const id = crypto.randomUUID();
+    droppedUploadIds.current.add(id);
+    const safeName =
+      (file.name.split(/[/\\]/).pop() || "file").trim() || "file";
+    setUploading(true);
+    send({ type: "file_upload", id, path: `_uploads/${safeName}`, data });
+  };
+
   const onPaste = (e: React.ClipboardEvent) => {
     if (askPrompt) return;
     const items = e.clipboardData?.items;
-    if (!items) return;
-    for (const item of Array.from(items)) {
-      if (item.kind === "file" && item.type.startsWith("image/")) {
-        const file = item.getAsFile();
-        if (file) {
-          e.preventDefault();
-          void addImageBlob(file);
+    if (items) {
+      for (const item of Array.from(items)) {
+        if (item.kind === "file" && item.type.startsWith("image/")) {
+          const file = item.getAsFile();
+          if (file) {
+            e.preventDefault();
+            void addImageBlob(file);
+          }
         }
       }
+    }
+    // Large text paste → save it to _uploads/ and inject the path, instead of
+    // stuffing the composer (and, on send, the whole prompt). Small pastes fall
+    // through to the default textarea insert so short snippets stay editable.
+    const text = e.clipboardData?.getData("text/plain") ?? "";
+    if (text.length >= PASTE_TO_FILE_THRESHOLD) {
+      e.preventDefault();
+      void uploadAndInjectPath(
+        new File([text], "pasted.txt", { type: "text/plain" }),
+      );
     }
   };
 
@@ -271,9 +451,13 @@ export function ChatView({ active, modalOpen }: Props) {
     const files = e.dataTransfer?.files;
     if (!files) return;
     for (const file of Array.from(files)) {
-      if (file.type.startsWith("image/")) {
+      // Images within the inline limit: attach (so the model SEES them) AND
+      // save+inject path. Oversized images skip the inline attach (its error
+      // toast would collide with the upload's) but still get the path.
+      if (file.type.startsWith("image/") && file.size <= MAX_IMAGE_BYTES) {
         void addImageBlob(file);
       }
+      void uploadAndInjectPath(file);
     }
   };
 
@@ -286,7 +470,9 @@ export function ChatView({ active, modalOpen }: Props) {
     fileInputRef.current?.click();
   };
 
-  const onUploadFilesSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+  const onUploadFilesSelected = async (
+    e: React.ChangeEvent<HTMLInputElement>,
+  ) => {
     const list = e.target.files;
     if (!list || list.length === 0) return;
     if (list.length > MAX_UPLOAD_FILES) {
@@ -307,13 +493,18 @@ export function ChatView({ active, modalOpen }: Props) {
     }
     setUploading(true);
     try {
-      const resp = await fetch("/upload", { method: "POST", body: form });
+      const resp = await fetch(`${basePath()}upload`, {
+        method: "POST",
+        body: form,
+      });
       if (!resp.ok) {
         const detail = await resp.text().catch(() => "");
         showAttachmentError(`Upload failed (${resp.status}) ${detail}`);
       }
     } catch (err) {
-      showAttachmentError(`Upload failed: ${err instanceof Error ? err.message : String(err)}`);
+      showAttachmentError(
+        `Upload failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
     } finally {
       setUploading(false);
       e.target.value = "";
@@ -323,6 +514,30 @@ export function ChatView({ active, modalOpen }: Props) {
   useEffect(() => {
     const unsub = subscribe((msg) => {
       switch (msg.type) {
+        case "file_upload_result": {
+          // Only handle results for OUR drag-drop uploads (the Files tab
+          // uses the same IPC with its own id-correlation).
+          const rid = typeof msg.id === "string" ? (msg.id as string) : "";
+          if (!droppedUploadIds.current.has(rid)) break;
+          droppedUploadIds.current.delete(rid);
+          // Keep the spinner up while other files in the same batch finish.
+          setUploading(droppedUploadIds.current.size > 0);
+          if (msg.ok && typeof msg.path === "string") {
+            const path = msg.path as string;
+            // Inject the saved path into the composer as text (space-padded),
+            // so the user can prepend /summarize · /translate · /extract.
+            setInput(
+              (prev) =>
+                `${prev}${prev && !prev.endsWith(" ") ? " " : ""}${path} `,
+            );
+            inputRef.current?.focus();
+          } else {
+            showAttachmentError(
+              `Upload failed: ${(msg.error as string) ?? "unknown"}`,
+            );
+          }
+          break;
+        }
         case "chat_user_message": {
           // Echo of a prompt the user submitted (possibly from the
           // Terminal tab — we render it as a user bubble either way).
@@ -363,7 +578,10 @@ export function ChatView({ active, modalOpen }: Props) {
                 { ...last, content: last.content + (msg.text as string) },
               ];
             }
-            return [...prev, { role: "assistant", content: msg.text as string }];
+            return [
+              ...prev,
+              { role: "assistant", content: msg.text as string },
+            ];
           });
           break;
         case "chat_error":
@@ -387,14 +605,26 @@ export function ChatView({ active, modalOpen }: Props) {
             const last = prev[prev.length - 1];
             const chunk = msg.text as string;
             if (last && last.role === "assistant") {
+              const total =
+                (last.thinkingChars ?? last.thinking?.length ?? 0) +
+                chunk.length;
+              let thinking = (last.thinking ?? "") + chunk;
+              if (thinking.length > MAX_THINKING_CHARS) {
+                thinking = thinking.slice(-MAX_THINKING_CHARS);
+              }
               return [
                 ...prev.slice(0, -1),
-                { ...last, thinking: (last.thinking ?? "") + chunk },
+                { ...last, thinking, thinkingChars: total },
               ];
             }
             return [
               ...prev,
-              { role: "assistant", content: "", thinking: chunk },
+              {
+                role: "assistant",
+                content: "",
+                thinking: chunk.slice(-MAX_THINKING_CHARS),
+                thinkingChars: chunk.length,
+              },
             ];
           });
           break;
@@ -416,7 +646,8 @@ export function ChatView({ active, modalOpen }: Props) {
               role: "tool",
               content: msg.name as string,
               toolName: msg.name as string,
-              toolKind: typeof msg.tool_name === "string" ? msg.tool_name : undefined,
+              toolKind:
+                typeof msg.tool_name === "string" ? msg.tool_name : undefined,
               toolInput: msg.input,
               toolDone: false,
             },
@@ -495,18 +726,90 @@ export function ChatView({ active, modalOpen }: Props) {
           });
           break;
         }
-        case "chat_slash_output":
-          setMessages((prev) => [
-            ...prev,
-            { role: "system", content: msg.text as string },
-          ]);
+        case "chat_slash_output": {
+          // Fold a command's streamed output (e.g. /cloud push) into ONE
+          // system bubble instead of a balloon per line. A progress line
+          // (`… N/M MB (P%)`) replaces the previous progress line in place so
+          // the upload counter ticks in a single spot rather than stacking.
+          const line = msg.text as string;
+          setMessages((prev) => {
+            const last = prev[prev.length - 1];
+            if (last && last.role === "system" && last.slashOutput) {
+              const lines = last.content.split("\n");
+              const prevLast = lines[lines.length - 1] ?? "";
+              const isProgress = (s: string) =>
+                /\(\s*\d+\s*%\s*\)\s*$/.test(s) ||
+                /\d[\d.,]*\s*\/\s*\d[\d.,]*\s*[KMGT]?B/i.test(s);
+              // Text before the first number — same for consecutive ticks of
+              // the same operation ("uploading… "), so we can replace vs append.
+              const stem = (s: string) => s.replace(/[\d.,].*$/s, "");
+              if (
+                isProgress(line) &&
+                isProgress(prevLast) &&
+                stem(line) === stem(prevLast)
+              ) {
+                lines[lines.length - 1] = line;
+              } else {
+                lines.push(line);
+              }
+              return [
+                ...prev.slice(0, -1),
+                { ...last, content: lines.join("\n") },
+              ];
+            }
+            return [
+              ...prev,
+              { role: "system", content: line, slashOutput: true },
+            ];
+          });
           break;
+        }
+        case "chat_workflow_review": {
+          // dev-plan/32 Tier 3: spawn a review bubble. We replace any
+          // earlier review bubble for the same id (re-author cycle
+          // emits a fresh `WorkflowReviewRequest` with revision + 1)
+          // so the user sees the latest revision in place rather
+          // than a growing stack.
+          const id = typeof msg.id === "string" ? msg.id : "";
+          const script = typeof msg.script === "string" ? msg.script : "";
+          const prompt = typeof msg.prompt === "string" ? msg.prompt : "";
+          const model = typeof msg.model === "string" ? msg.model : "?";
+          const revision = typeof msg.revision === "number" ? msg.revision : 0;
+          if (!id) break;
+          setMessages((prev) => {
+            const existing = prev.findIndex(
+              (m) =>
+                m.role === "workflow_review" && m.workflowReview?.id === id,
+            );
+            const next: ChatMessage = {
+              role: "workflow_review",
+              content: "",
+              workflowReview: { id, script, prompt, model, revision },
+            };
+            if (existing >= 0) {
+              const out = prev.slice();
+              out[existing] = next;
+              return out;
+            }
+            return [...prev, next];
+          });
+          break;
+        }
         case "chat_skill_model_note":
           // Skill-recommended-model swap or fallback. Renders as the
           // same muted system bubble as slash output — terse, in-line
           // with the conversation, no popup. The worker emits these
           // around skill invocation: one when the swap takes effect,
           // and a follow-up "[model → X (skill ended)]" at end of turn.
+          setMessages((prev) => [
+            ...prev,
+            { role: "system", content: msg.text as string },
+          ]);
+          break;
+        case "chat_turn_usage":
+          // Per-turn token/cost footer (parity with the CLI REPL's
+          // `[tokens: …in/…out · …s · $… session]`). Rendered as the same
+          // muted system line as skill notes / slash output.
           setMessages((prev) => [
             ...prev,
             { role: "system", content: msg.text as string },
@@ -520,6 +823,16 @@ export function ChatView({ active, modalOpen }: Props) {
             window.clearTimeout(waitingTimerRef.current);
             waitingTimerRef.current = null;
           }
+          break;
+        case "initial_state":
+          // (Re)connect handshake. If the worker has a turn in flight —
+          // e.g. this browser detached during a long TextToSpeech/render
+          // and is reconnecting mid-run — restore the "working" indicator
+          // so the still-running turn doesn't look stopped. The live event
+          // stream we re-subscribed to on connect delivers the eventual
+          // chat_done, which clears it. Never force it false here: a
+          // handshake mustn't cancel the visual state of a turn we started.
+          if (msg.agent_busy === true) setStreaming(true);
           break;
         case "ask_user_question": {
           const id = typeof msg.id === "number" ? msg.id : null;
@@ -543,33 +856,70 @@ export function ChatView({ active, modalOpen }: Props) {
           break;
         case "chat_history_replaced":
           if (msg.messages && Array.isArray(msg.messages)) {
-            setMessages(
-              (msg.messages as { role: string; content: string }[]).map(
-                (m) => {
-                  const role =
-                    m.role === "assistant"
-                      ? "assistant"
-                      : m.role === "tool"
-                        ? "tool"
-                        : m.role === "system"
-                          ? "system"
-                          : "user";
-                  // Restored tool entries are historical — they've
-                  // already finished. Mark them done so they render
-                  // with the ✓ glyph rather than the running ▸.
-                  // Backend sends the bare tool name as `content`.
-                  if (role === "tool") {
-                    return {
-                      role,
-                      content: m.content,
-                      toolName: m.content,
-                      toolDone: true,
-                    } satisfies ChatMessage;
-                  }
-                  return { role, content: m.content } satisfies ChatMessage;
-                },
-              ),
-            );
+            setMessages((prev) => {
+              // A replay of the conversation we are ALREADY showing is a
+              // no-op — and repainting from it would be destructive: the
+              // store keeps only user/assistant/tool messages, so the
+              // turn's thinking block and its `[tokens: …]` footer would
+              // vanish. (They did: any redundant session_load wiped the
+              // live footer, which read as "the usage line is gone".)
+              // Compare against the persisted-shaped subset of what's on
+              // screen and keep the richer live view when they match.
+              const incoming = msg.messages as {
+                role: string;
+                content: string;
+                thinking?: string;
+              }[];
+              // Compare on SPOKEN text only. The live view carries shapes
+              // the store never sees — a thinking-only assistant bubble,
+              // tool markers, the usage footer — so a strict element-by-
+              // element match would call an identical conversation
+              // "different" and repaint anyway.
+              const spoken = (rows: { role: string; content: string }[]) =>
+                rows
+                  .filter(
+                    (m) =>
+                      (m.role === "user" || m.role === "assistant") &&
+                      (m.content ?? "").trim() !== "",
+                  )
+                  .map((m) => `${m.role}:${m.content}`);
+              const mine = spoken(prev);
+              const theirs = spoken(incoming);
+              const sameConversation =
+                mine.length === theirs.length &&
+                mine.every((line, i) => line === theirs[i]);
+              if (sameConversation && mine.length > 0) return prev;
+              return incoming.map((m) => {
+                const role =
+                  m.role === "assistant"
+                    ? "assistant"
+                    : m.role === "tool"
+                      ? "tool"
+                      : m.role === "system"
+                        ? "system"
+                        : "user";
+                // Restored tool entries are historical — they've
+                // already finished. Mark them done so they render
+                // with the ✓ glyph rather than the running ▸.
+                // Backend sends the bare tool name as `content`.
+                if (role === "tool") {
+                  return {
+                    role,
+                    content: m.content,
+                    toolName: m.content,
+                    toolDone: true,
+                  } satisfies ChatMessage;
+                }
+                // Reasoning is persisted with the turn, so a reloaded
+                // conversation keeps its collapsed thinking blocks
+                // instead of losing them at the session boundary.
+                return {
+                  role,
+                  content: m.content,
+                  ...(m.thinking ? { thinking: m.thinking } : {}),
+                } satisfies ChatMessage;
+              });
+            });
             setStreaming(false);
             setAskPrompt(null);
           }
@@ -607,17 +957,12 @@ export function ChatView({ active, modalOpen }: Props) {
               .map((s) => s.trim())
               .find((s) => s.length > 0) ?? "(no result text)";
           const truncated =
-            firstLine.length > 240
-              ? `${firstLine.slice(0, 237)}…`
-              : firstLine;
+            firstLine.length > 240 ? `${firstLine.slice(0, 237)}…` : firstLine;
           const seconds = (durationMs / 1000).toFixed(1);
           const content = `✓ /${agentName} done in ${seconds}s — ${truncated}${
             id ? `  (id: ${id})` : ""
           }`;
-          setMessages((prev) => [
-            ...prev,
-            { role: "system", content },
-          ]);
+          setMessages((prev) => [...prev, { role: "system", content }]);
           break;
         }
         case "chat_side_channel_error": {
@@ -630,16 +975,11 @@ export function ChatView({ active, modalOpen }: Props) {
               .map((s) => s.trim())
               .find((s) => s.length > 0) ?? "unknown error";
           const truncated =
-            firstLine.length > 240
-              ? `${firstLine.slice(0, 237)}…`
-              : firstLine;
+            firstLine.length > 240 ? `${firstLine.slice(0, 237)}…` : firstLine;
           const content = `✗ /${agentName} failed — ${truncated}${
             id ? `  (id: ${id})` : ""
           }`;
-          setMessages((prev) => [
-            ...prev,
-            { role: "system", content },
-          ]);
+          setMessages((prev) => [...prev, { role: "system", content }]);
           break;
         }
       }
@@ -665,8 +1005,36 @@ export function ChatView({ active, modalOpen }: Props) {
     if (active && !modalOpen) inputRef.current?.focus();
   }, [active, modalOpen]);
 
+  // Copy any selected page text (message bubbles, tool output, code, …) on
+  // Cmd/Ctrl+C. The desktop webview blocks navigator.clipboard, so route the
+  // selection through the IPC bridge (browser --serve mode uses the native
+  // clipboard). Textarea/input selections report empty via window.getSelection,
+  // so this never shadows normal input-field copy — only DOM text selections
+  // are intercepted. Scoped to the active tab so it doesn't fire over Terminal.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (!active) return;
+    const onCopyKey = (e: KeyboardEvent) => {
+      const isMac = navigator.platform.startsWith("Mac");
+      const mod = isMac ? e.metaKey : e.ctrlKey;
+      if (!mod || e.altKey || (e.key !== "c" && e.key !== "C")) return;
+      const sel = window.getSelection()?.toString() ?? "";
+      if (!sel) return; // no page selection → let the input / browser handle it
+      e.preventDefault();
+      if (typeof window !== "undefined" && !window.ipc && navigator.clipboard) {
+        navigator.clipboard.writeText(sel).catch(() => {});
+      } else {
+        send({ type: "clipboard_write", text: sel });
+      }
+    };
+    document.addEventListener("keydown", onCopyKey, true);
+    return () => document.removeEventListener("keydown", onCopyKey, true);
+  }, [active]);
+
+  useEffect(() => {
+    // Only follow new content if the user hasn't scrolled up to read.
+    if (isAtBottomRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [messages]);
 
   useEffect(() => {
@@ -686,18 +1054,25 @@ export function ChatView({ active, modalOpen }: Props) {
   // browser via the vetted `open_external` IPC. MCP-Apps tools render
   // their own widgets inline via `McpAppIframe`, so we don't need
   // an in-app lightbox for image previews — links can just hand off.
-  const handleChatLinkClick = useCallback((
-    e: React.MouseEvent<HTMLAnchorElement>,
-    href: string,
-  ) => {
-    if (!href) return;
-    e.preventDefault();
-    send({ type: "open_external", url: href });
-  }, []);
+  const handleChatLinkClick = useCallback(
+    (e: React.MouseEvent<HTMLAnchorElement>, href: string) => {
+      if (!href) return;
+      e.preventDefault();
+      send({ type: "open_external", url: href });
+    },
+    [],
+  );
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const text = input.trim();
+    // Record every non-empty submission in the shared recall ring and reset
+    // navigation so the next Up starts from the newest entry.
+    if (text) {
+      recordPrompt(text);
+      histIndexRef.current = -1;
+      savedDraftRef.current = "";
+    }
     if (askPrompt) {
       if (!text) return;
       setInput("");
@@ -749,7 +1124,17 @@ export function ChatView({ active, modalOpen }: Props) {
     // Don't optimistically add the user bubble — the backend will echo
     // a `chat_user_message` back to us (it does so for both tabs). This
     // keeps a single source of truth about what's in the conversation.
-    if (!text.startsWith("/")) {
+    //
+    // `/workflow run` and `/workflow resume` are the slash commands
+    // that do genuinely long-running work (author + review + execute /
+    // replay + execute), so flip streaming on for them too — otherwise
+    // the Stop button (visible only while `streaming === true`) stays
+    // hidden during the workflow lifecycle. The backend emits TurnDone
+    // at the end of the workflow, which restores `streaming = false`
+    // via the chat_done handler.
+    const isLongRunningSlash =
+      text.startsWith("/workflow run") || text.startsWith("/workflow resume");
+    if (!text.startsWith("/") || isLongRunningSlash) {
       setStreaming(true);
       // Arm the cold-start indicator: if no text/thinking delta has
       // arrived 5s after submit, surface a "Waiting…" hint so the user
@@ -823,6 +1208,52 @@ export function ChatView({ active, modalOpen }: Props) {
         }
       }
     }
+    // Prompt-history recall (bash-style Up/Down), shared with the Terminal tab.
+    // The slash popup owns the arrows when open (handled above, returns first).
+    // Entering history from a fresh draft needs the caret on the edge line so
+    // multi-line editing keeps working; once navigating, Up/Down always cycle.
+    if (
+      (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+      !e.nativeEvent.isComposing
+    ) {
+      const el = e.currentTarget;
+      const caret = el.selectionStart ?? input.length;
+      const navigating = histIndexRef.current !== -1;
+      const hist = promptHistory();
+      const caretToEnd = () =>
+        requestAnimationFrame(() => {
+          const t = inputRef.current;
+          if (t) t.selectionStart = t.selectionEnd = t.value.length;
+        });
+      if (e.key === "ArrowUp") {
+        const atFirstLine = !input.slice(0, caret).includes("\n");
+        if ((navigating || atFirstLine) && hist.length > 0) {
+          e.preventDefault();
+          if (histIndexRef.current === -1) {
+            savedDraftRef.current = input;
+            histIndexRef.current = hist.length - 1;
+          } else if (histIndexRef.current > 0) {
+            histIndexRef.current -= 1;
+          }
+          setInput(hist[histIndexRef.current]);
+          caretToEnd();
+          return;
+        }
+      } else if (navigating) {
+        // ArrowDown while navigating → newer entry, or restore the draft.
+        e.preventDefault();
+        if (histIndexRef.current < hist.length - 1) {
+          histIndexRef.current += 1;
+          setInput(hist[histIndexRef.current]);
+        } else {
+          histIndexRef.current = -1;
+          setInput(savedDraftRef.current);
+          savedDraftRef.current = "";
+        }
+        caretToEnd();
+        return;
+      }
+    }
     // Multi-line textarea behaviour:
     //   Enter           → submit
     //   Shift+Enter     → newline
@@ -865,333 +1296,374 @@ export function ChatView({ active, modalOpen }: Props) {
     el.style.overflowY = sh > maxHeight ? "auto" : "hidden";
   }, [input]);
 
-  const messageElements = useMemo(() => messages.map((msg, i) => {
-          // (Pre-fix this map opened with a side-channel bubble render
-          // pulling state off `msg.sideChannel`. The bubble showed
-          // live tool-call markers + streamed prose for every /dream
-          // / /agent spawn, which duplicated the BackgroundAgentsSidebar
-          // and crowded the chat. Live progress is sidebar-only now;
-          // the chat gets a one-line system message on done/error
-          // pushed by the `chat_side_channel_done` / `_error`
-          // handlers above — same `role: "system"` shape as any
-          // other system note, no special render branch needed.)
-          // Tool calls render as a thin one-line indicator (▸ running,
-          // ✓ done) rather than a full bubble — the chat tab is for
-          // the user↔assistant conversation; raw tool output lives on
-          // the Terminal tab.
-          if (msg.role === "tool") {
-            const glyph = msg.toolDone ? "✓" : "▸";
-            const copied = copiedMessageIndex === i;
-            // MCP-Apps tools widen the bubble so the embedded iframe
-            // gets meaningful width. Plain tools keep the thin
-            // one-liner indicator.
-            const widget = msg.uiResource;
-            // TodoWrite gets a custom card showing the rendered list
-            // — the user wants to see plan-style progression even
-            // though TodoWrite is the casual scratchpad. Each call
-            // shows the snapshot at that point; successive cards let
-            // the user see the diff over time.
-            const todos = (() => {
-              if (msg.toolKind !== "TodoWrite") return null;
-              const inp = msg.toolInput as { todos?: unknown } | undefined;
-              if (!inp || !Array.isArray(inp.todos)) return null;
-              return inp.todos as TodoItemInput[];
-            })();
-            return (
-              <div key={i} className="flex justify-start">
-                <div
-                  className={`group flex max-w-[80%] flex-col gap-1 ${widget || todos ? "w-[80%]" : ""}`}
-                  style={{
-                    color: "var(--text-secondary)",
-                    fontFamily:
-                      "Menlo, Monaco, 'Courier New', monospace",
-                    paddingLeft: 2,
-                    // The 0.7 dim signals "this tool finished" on the
-                    // text-only indicator. Skip it when there's an
-                    // embedded MCP-Apps widget — opacity inherits into
-                    // the iframe and washes out widget content (light
-                    // mode is most visible). The widget is the focus;
-                    // the parent indicator above it doesn't need the
-                    // dim treatment when there's actual UI to look at.
-                    opacity: msg.toolDone && !widget ? 0.7 : 1,
-                  }}
-                >
-                  <div className="inline-flex items-center gap-1 text-xs">
-                    <span className="truncate">
-                      {glyph} {msg.toolName ?? msg.content}
-                      {msg.toolSource && msg.toolDone && (
-                        <span style={{ opacity: 0.7 }}>
-                          {" "}
-                          (via {msg.toolSource})
-                        </span>
-                      )}
-                    </span>
-                    <CopyMessageButton
-                      copied={copied}
-                      compact
-                      onCopy={() => copyMessage(msg, i)}
-                    />
-                  </div>
-                  {todos && todos.length > 0 && (
-                    <div
-                      className="mt-1 rounded border px-2 py-1.5"
-                      style={{
-                        borderColor: "var(--border, #2a2a2a)",
-                        background: "var(--surface-1, rgba(255,255,255,0.03))",
-                        fontFamily:
-                          "ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
-                      }}
-                    >
-                      {todos.map((t) => {
-                        const glyphForStatus =
-                          t.status === "completed"
-                            ? "✓"
-                            : t.status === "in_progress"
-                              ? "◉"
-                              : "☐";
-                        const colorForStatus =
-                          t.status === "completed"
-                            ? "var(--success, #6cc070)"
-                            : t.status === "in_progress"
-                              ? "var(--warning, #d4a657)"
-                              : "var(--text-secondary)";
-                        return (
-                          <div
-                            key={t.id}
-                            className="flex items-baseline gap-2"
-                            style={{
-                              fontSize: "11px",
-                              lineHeight: "1.5",
-                            }}
-                          >
-                            <span
-                              style={{
-                                color: colorForStatus,
-                                fontFamily:
-                                  "Menlo, Monaco, 'Courier New', monospace",
-                                fontSize: "11px",
-                              }}
-                            >
-                              {glyphForStatus}
-                            </span>
-                            <span
-                              style={{
-                                textDecoration:
-                                  t.status === "completed"
-                                    ? "line-through"
-                                    : "none",
-                                color:
-                                  t.status === "pending"
-                                    ? "var(--text-secondary)"
-                                    : "var(--text-primary)",
-                                wordBreak: "break-word",
-                              }}
-                            >
-                              {t.content}
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                  {widget && msg.toolDone && (
-                    <McpAppIframe
-                      uri={widget.uri}
-                      html={widget.html}
-                      allowSameOrigin={widget.allowSameOrigin === true}
-                      autoSize={widget.autoSize === true}
-                      parentToolName={msg.toolName ?? ""}
-                      toolResult={{
-                        content: [{ type: "text", text: msg.content }],
-                        isError: false,
-                      }}
-                    />
-                  )}
-                </div>
-              </div>
-            );
-          }
-
-          const isAssistant = msg.role === "assistant";
-          const isSystem = msg.role === "system";
-          const isError = msg.role === "error";
-          const copied = copiedMessageIndex === i;
-          // Restored chat histories can be a wall of tool indicators
-          // between user turns; an extra blank line before each user
-          // message makes turn boundaries scannable. We apply it only
-          // when the previous message was something other than a
-          // user bubble — back-to-back user inputs (rare, but
-          // possible) keep the standard `space-y-3` spacing.
-          const needsTurnGap =
-            msg.role === "user" && i > 0 && messages[i - 1]?.role !== "user";
+  const messageElements = useMemo(
+    () =>
+      messages.map((msg, i) => {
+        // (Pre-fix this map opened with a side-channel bubble render
+        // pulling state off `msg.sideChannel`. The bubble showed
+        // live tool-call markers + streamed prose for every /dream
+        // / /agent spawn, which duplicated the BackgroundAgentsSidebar
+        // and crowded the chat. Live progress is sidebar-only now;
+        // the chat gets a one-line system message on done/error
+        // pushed by the `chat_side_channel_done` / `_error`
+        // handlers above — same `role: "system"` shape as any
+        // other system note, no special render branch needed.)
+        // Tool calls render as a thin one-line indicator (▸ running,
+        // ✓ done) rather than a full bubble — the chat tab is for
+        // the user↔assistant conversation; raw tool output lives on
+        // the Terminal tab.
+        // dev-plan/32 Tier 3 workflow review bubble. Renders a
+        // dedicated card with Approve / Cancel / Re-author buttons;
+        // each click posts a `workflow_decision` back through IPC.
+        if (msg.role === "workflow_review" && msg.workflowReview) {
+          const wr = msg.workflowReview;
           return (
-            <div
-              key={i}
-              className={`flex ${msg.role === "user" ? "justify-end" : isSystem || isError ? "justify-center" : "justify-start"}${needsTurnGap ? " pt-4" : ""}`}
-            >
+            <WorkflowReviewBubble
+              key={`${i}-${wr.id}-${wr.revision}`}
+              id={wr.id}
+              script={wr.script}
+              prompt={wr.prompt}
+              model={wr.model}
+              revision={wr.revision}
+            />
+          );
+        }
+        if (msg.role === "tool") {
+          const glyph = msg.toolDone ? "✓" : "▸";
+          const copied = copiedMessageIndex === i;
+          // MCP-Apps tools widen the bubble so the embedded iframe
+          // gets meaningful width. Plain tools keep the thin
+          // one-liner indicator.
+          const widget = msg.uiResource;
+          // TodoWrite gets a custom card showing the rendered list
+          // — the user wants to see plan-style progression even
+          // though TodoWrite is the casual scratchpad. Each call
+          // shows the snapshot at that point; successive cards let
+          // the user see the diff over time.
+          const todos = (() => {
+            if (msg.toolKind !== "TodoWrite") return null;
+            const inp = msg.toolInput as { todos?: unknown } | undefined;
+            if (!inp || !Array.isArray(inp.todos)) return null;
+            return inp.todos as TodoItemInput[];
+          })();
+          return (
+            <div key={i} className="flex justify-start">
               <div
-                className={`group relative max-w-[80%] rounded-lg py-2 pl-3 pr-9 text-sm ${isAssistant ? "" : "whitespace-pre-wrap"}`}
+                className={`group flex max-w-[92%] sm:max-w-[80%] flex-col gap-1 ${widget || todos ? "w-[92%] sm:w-[80%]" : ""}`}
                 style={{
-                  background:
-                    msg.role === "user"
-                      ? "var(--chat-user-bg)"
-                      : isError
-                        ? "color-mix(in srgb, #f85149 12%, transparent)"
-                        : isSystem
-                          ? "transparent"
-                          : "var(--bg-secondary)",
-                  color:
-                    msg.role === "user"
-                      ? "var(--chat-user-fg)"
-                      : isError
-                        ? "#f85149"
-                        : isSystem
-                          ? "var(--text-secondary)"
-                          : "var(--text-primary)",
-                  border: isError
-                    ? "1px solid color-mix(in srgb, #f85149 50%, transparent)"
-                    : isSystem
-                      ? "1px solid var(--border)"
-                      : "none",
-                  fontFamily: isSystem
-                    ? "Menlo, Monaco, 'Courier New', monospace"
-                    : "inherit",
-                  fontSize: isSystem ? "12px" : "14px",
+                  color: "var(--text-secondary)",
+                  fontFamily: "Menlo, Monaco, 'Courier New', monospace",
+                  paddingLeft: 2,
+                  // The 0.7 dim signals "this tool finished" on the
+                  // text-only indicator. Skip it when there's an
+                  // embedded MCP-Apps widget — opacity inherits into
+                  // the iframe and washes out widget content (light
+                  // mode is most visible). The widget is the focus;
+                  // the parent indicator above it doesn't need the
+                  // dim treatment when there's actual UI to look at.
+                  opacity: msg.toolDone && !widget ? 0.7 : 1,
                 }}
               >
-                {isAssistant && msg.thinking && (
-                  // Reasoning models (DeepSeek v4/r1, OpenAI o-series,
-                  // NVIDIA NIM glm4.7, …) emit `reasoning_content` before
-                  // their final answer. Show it as a dim collapsible
-                  // block above the assistant text so the user sees the
-                  // model is working — but visibly distinct from its
-                  // final reply.
-                  <details
-                    className="mb-2 rounded border px-2 py-1"
-                    open={!msg.content}
+                <div className="inline-flex items-center gap-1 text-xs">
+                  <span className="truncate">
+                    {glyph} {msg.toolName ?? msg.content}
+                    {msg.toolSource && msg.toolDone && (
+                      <span style={{ opacity: 0.7 }}>
+                        {" "}
+                        (via {msg.toolSource})
+                      </span>
+                    )}
+                  </span>
+                  <CopyMessageButton
+                    copied={copied}
+                    compact
+                    onCopy={() => copyMessage(msg, i)}
+                  />
+                </div>
+                {todos && todos.length > 0 && (
+                  <div
+                    className="mt-1 rounded border px-2 py-1.5"
                     style={{
                       borderColor: "var(--border, #2a2a2a)",
                       background: "var(--surface-1, rgba(255,255,255,0.03))",
-                      fontSize: "12px",
-                      color: "var(--text-secondary)",
-                      fontStyle: "italic",
+                      fontFamily:
+                        "ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
                     }}
                   >
-                    <summary
-                      className="cursor-pointer select-none text-xs"
-                      style={{ fontStyle: "normal" }}
-                    >
-                      ▾ Thinking ({msg.thinking.length} chars)
-                    </summary>
-                    <div className="mt-1 whitespace-pre-wrap">
-                      {msg.thinking}
-                    </div>
-                  </details>
-                )}
-                {isAssistant ? (
-                  // Assistant turns are rendered through react-markdown
-                  // so headings/lists/code-blocks/tables come out as
-                  // proper HTML rather than literal **bold** text.
-                  // remark-gfm adds GitHub-flavored markdown (tables,
-                  // strikethrough, task lists). rehype-highlight runs
-                  // syntax highlighting against fenced code blocks —
-                  // styled by the .hljs-* rules in index.css.
-                  //
-                  // SECURITY: msg.content is untrusted (model output).
-                  // The pipeline above is the safe stack — no
-                  // allowDangerousHtml, no allowSvg, no rehype-raw.
-                  // rehype-highlight is a CSS-class applier (no code
-                  // execution); fenced-code language IDs flow into it
-                  // unchecked but are rendered as text. Don't add HTML
-                  // pass-through plugins or dangerouslySetInnerHTML
-                  // here without rethinking that threat model.
-                  <div className="markdown-body">
-                    <ReactMarkdown
-                      remarkPlugins={[remarkGfm]}
-                      rehypePlugins={[rehypeHighlight]}
-                      components={{
-                        // Intercept link clicks so the wry webview
-                        // never navigates away from the chat. Image
-                        // URLs open in a lightbox; everything else
-                        // hands off to the OS browser.
-                        a: ({ href, children, ...rest }) => (
-                          <a
-                            {...rest}
-                            href={href}
-                            onClick={(e) =>
-                              handleChatLinkClick(e, href ?? "")
-                            }
-                          >
-                            {children}
-                          </a>
-                        ),
-                        // Markdown `![alt](url)` images render inline.
-                        // Click-to-zoom isn't needed: MCP-Apps tools
-                        // produce their own iframe widgets, and any
-                        // other inline image (e.g. attached by the
-                        // user) is already shown at full bubble width.
-                        img: ({ src, alt, ...rest }) => (
-                          <img
-                            {...rest}
-                            src={src}
-                            alt={alt}
+                    {todos.map((t) => {
+                      const glyphForStatus =
+                        t.status === "completed"
+                          ? "✓"
+                          : t.status === "in_progress"
+                            ? "◉"
+                            : "☐";
+                      const colorForStatus =
+                        t.status === "completed"
+                          ? "var(--success, #6cc070)"
+                          : t.status === "in_progress"
+                            ? "var(--warning, #d4a657)"
+                            : "var(--text-secondary)";
+                      return (
+                        <div
+                          key={t.id}
+                          className="flex items-baseline gap-2"
+                          style={{
+                            fontSize: "11px",
+                            lineHeight: "1.5",
+                          }}
+                        >
+                          <span
                             style={{
-                              maxWidth: "100%",
-                              height: "auto",
-                              borderRadius: 6,
+                              color: colorForStatus,
+                              fontFamily:
+                                "Menlo, Monaco, 'Courier New', monospace",
+                              fontSize: "11px",
                             }}
-                          />
-                        ),
-                      }}
-                    >
-                      {stripThinkBlocks(msg.content)}
-                    </ReactMarkdown>
+                          >
+                            {glyphForStatus}
+                          </span>
+                          <span
+                            style={{
+                              textDecoration:
+                                t.status === "completed"
+                                  ? "line-through"
+                                  : "none",
+                              color:
+                                t.status === "pending"
+                                  ? "var(--text-secondary)"
+                                  : "var(--text-primary)",
+                              wordBreak: "break-word",
+                            }}
+                          >
+                            {t.content}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </div>
-                ) : isError ? (
-                  <span>
-                    <span aria-hidden="true" style={{ marginRight: 6 }}>
-                      ⚠
-                    </span>
-                    {msg.content}
-                  </span>
-                ) : (
-                  msg.content
                 )}
-                {msg.injectionState && (
-                  // Mid-turn injection badge (issue #106). "queued"
-                  // → message sits in the agent's queue; "delivered"
-                  // → agent drained it at a tool_result boundary and
-                  // the LLM now sees it in the next turn's context.
-                  <span
-                    className="ml-2 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider align-middle"
-                    style={{
-                      background:
-                        msg.injectionState === "queued"
-                          ? "color-mix(in srgb, var(--accent) 18%, transparent)"
-                          : "color-mix(in srgb, #22c55e 22%, transparent)",
-                      color:
-                        msg.injectionState === "queued"
-                          ? "var(--accent)"
-                          : "#22c55e",
-                      fontWeight: 600,
+                {widget && msg.toolDone && (
+                  <McpAppIframe
+                    uri={widget.uri}
+                    html={widget.html}
+                    allowSameOrigin={widget.allowSameOrigin === true}
+                    autoSize={widget.autoSize === true}
+                    parentToolName={msg.toolName ?? ""}
+                    toolResult={{
+                      content: [{ type: "text", text: msg.content }],
+                      isError: false,
                     }}
-                    title={
-                      msg.injectionState === "queued"
-                        ? "Queued — the agent will see this at the next tool boundary"
-                        : "Delivered — the agent has read this message"
-                    }
-                  >
-                    {msg.injectionState === "queued" ? "queued" : "delivered"}
-                  </span>
+                  />
                 )}
-                <CopyMessageButton
-                  copied={copied}
-                  onCopy={() => copyMessage(msg, i)}
-                />
               </div>
             </div>
           );
-        }), [messages, copiedMessageIndex, copyMessage, handleChatLinkClick]);
+        }
+
+        const isAssistant = msg.role === "assistant";
+        const isSystem = msg.role === "system";
+        const isError = msg.role === "error";
+        const copied = copiedMessageIndex === i;
+        // Restored chat histories can be a wall of tool indicators
+        // between user turns; an extra blank line before each user
+        // message makes turn boundaries scannable. We apply it only
+        // when the previous message was something other than a
+        // user bubble — back-to-back user inputs (rare, but
+        // possible) keep the standard `space-y-3` spacing.
+        const needsTurnGap =
+          msg.role === "user" && i > 0 && messages[i - 1]?.role !== "user";
+        return (
+          <div
+            key={i}
+            className={`flex ${msg.role === "user" ? "justify-end" : isSystem || isError ? "justify-center" : "justify-start"}${needsTurnGap ? " pt-4" : ""}`}
+          >
+            <div
+              className={`group relative max-w-[92%] sm:max-w-[80%] rounded-lg py-2 pl-3 pr-9 text-sm ${isAssistant ? "" : "whitespace-pre-wrap"}`}
+              style={{
+                background:
+                  msg.role === "user"
+                    ? "var(--chat-user-bg)"
+                    : isError
+                      ? "color-mix(in srgb, #f85149 12%, transparent)"
+                      : isSystem
+                        ? "transparent"
+                        : "var(--bg-secondary)",
+                color:
+                  msg.role === "user"
+                    ? "var(--chat-user-fg)"
+                    : isError
+                      ? "#f85149"
+                      : isSystem
+                        ? "var(--text-secondary)"
+                        : "var(--text-primary)",
+                border: isError
+                  ? "1px solid color-mix(in srgb, #f85149 50%, transparent)"
+                  : isSystem
+                    ? "1px solid var(--border)"
+                    : "none",
+                fontFamily: isSystem
+                  ? "Menlo, Monaco, 'Courier New', monospace"
+                  : "inherit",
+                fontSize: isSystem ? "12px" : "14px",
+              }}
+            >
+              {isAssistant && msg.thinking && (
+                // Reasoning models (DeepSeek v4/r1, OpenAI o-series,
+                // NVIDIA NIM glm4.7, …) emit `reasoning_content` before
+                // their final answer. Show it as a dim collapsible
+                // block above the assistant text so the user sees the
+                // model is working — but visibly distinct from its
+                // final reply.
+                <details
+                  className="mb-2 rounded border px-2 py-1"
+                  open={!msg.content}
+                  style={{
+                    borderColor: "var(--border, #2a2a2a)",
+                    background: "var(--surface-1, rgba(255,255,255,0.03))",
+                    fontSize: "12px",
+                    color: "var(--text-secondary)",
+                    fontStyle: "italic",
+                  }}
+                >
+                  <summary
+                    className="cursor-pointer select-none text-xs"
+                    style={{ fontStyle: "normal" }}
+                  >
+                    ▾ Thinking (
+                    {(
+                      msg.thinkingChars ?? msg.thinking.length
+                    ).toLocaleString()}{" "}
+                    chars
+                    {(msg.thinkingChars ?? 0) > msg.thinking.length
+                      ? `, showing last ${msg.thinking.length.toLocaleString()}`
+                      : ""}
+                    )
+                  </summary>
+                  <div className="mt-1 whitespace-pre-wrap">
+                    {
+                      // While the reasoning is still streaming (no
+                      // answer text yet → details forced open), render
+                      // only a tail ticker: relayouting the full block
+                      // on every delta is what froze the webview on
+                      // hours-long runs. The full (capped) text renders
+                      // once the answer starts and the block collapses.
+                      msg.content || msg.thinking.length <= 4000
+                        ? msg.thinking
+                        : `…${msg.thinking.slice(-4000)}`
+                    }
+                  </div>
+                </details>
+              )}
+              {isAssistant ? (
+                // Assistant turns are rendered through react-markdown
+                // so headings/lists/code-blocks/tables come out as
+                // proper HTML rather than literal **bold** text.
+                // remark-gfm adds GitHub-flavored markdown (tables,
+                // strikethrough, task lists). rehype-highlight runs
+                // syntax highlighting against fenced code blocks —
+                // styled by the .hljs-* rules in index.css.
+                //
+                // SECURITY: msg.content is untrusted (model output).
+                // The pipeline above is the safe stack — no
+                // allowDangerousHtml, no allowSvg, no rehype-raw.
+                // rehype-highlight is a CSS-class applier (no code
+                // execution); fenced-code language IDs flow into it
+                // unchecked but are rendered as text. Don't add HTML
+                // pass-through plugins or dangerouslySetInnerHTML
+                // here without rethinking that threat model.
+                <div className="markdown-body">
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeHighlight]}
+                    components={{
+                      // Intercept link clicks so the wry webview
+                      // never navigates away from the chat. Image
+                      // URLs open in a lightbox; everything else
+                      // hands off to the OS browser.
+                      a: ({ href, children, ...rest }) => (
+                        <a
+                          {...rest}
+                          href={href}
+                          onClick={(e) => handleChatLinkClick(e, href ?? "")}
+                        >
+                          {children}
+                        </a>
+                      ),
+                      // Markdown `![alt](url)` images render inline.
+                      // A workspace-relative src (e.g. `output/img-….jpg`
+                      // written by TextToImage) is routed through
+                      // /file-asset via resolveAssetSrc — otherwise the
+                      // browser resolves it against the page origin and
+                      // 404s. Click-to-zoom isn't needed: MCP-Apps tools
+                      // produce their own iframe widgets, and any other
+                      // inline image (e.g. attached by the user) is
+                      // already shown at full bubble width.
+                      img: ({ src, alt, ...rest }) => (
+                        <img
+                          {...rest}
+                          src={resolveAssetSrc(
+                            typeof src === "string" ? src : undefined,
+                          )}
+                          alt={alt}
+                          style={{
+                            maxWidth: "100%",
+                            height: "auto",
+                            borderRadius: 6,
+                          }}
+                        />
+                      ),
+                    }}
+                  >
+                    {wrapBareJsonBlocks(stripThinkBlocks(msg.content))}
+                  </ReactMarkdown>
+                </div>
+              ) : isError ? (
+                <span>
+                  <span aria-hidden="true" style={{ marginRight: 6 }}>
+                    ⚠
+                  </span>
+                  {msg.content}
+                </span>
+              ) : (
+                msg.content
+              )}
+              {msg.injectionState && (
+                // Mid-turn injection badge (issue #106). "queued"
+                // → message sits in the agent's queue; "delivered"
+                // → agent drained it at a tool_result boundary and
+                // the LLM now sees it in the next turn's context.
+                <span
+                  className="ml-2 px-1.5 py-0.5 rounded text-[10px] uppercase tracking-wider align-middle"
+                  style={{
+                    background:
+                      msg.injectionState === "queued"
+                        ? "color-mix(in srgb, var(--accent) 18%, transparent)"
+                        : "color-mix(in srgb, #22c55e 22%, transparent)",
+                    color:
+                      msg.injectionState === "queued"
+                        ? "var(--accent)"
+                        : "#22c55e",
+                    fontWeight: 600,
+                  }}
+                  title={
+                    msg.injectionState === "queued"
+                      ? "Queued — the agent will see this at the next tool boundary"
+                      : "Delivered — the agent has read this message"
+                  }
+                >
+                  {msg.injectionState === "queued" ? "queued" : "delivered"}
+                </span>
+              )}
+              <CopyMessageButton
+                copied={copied}
+                onCopy={() => copyMessage(msg, i)}
+              />
+            </div>
+          </div>
+        );
+      }),
+    [messages, copiedMessageIndex, copyMessage, handleChatLinkClick],
+  );
 
   const awaitingUserAnswer = askPrompt !== null;
   // Allow typing while the agent is streaming so the user can queue
@@ -1207,7 +1679,7 @@ export function ChatView({ active, modalOpen }: Props) {
     ? !input.trim()
     : streaming
       ? !input.trim() || input.trim().startsWith("/") || attachments.length > 0
-      : (!input.trim() && attachments.length === 0);
+      : !input.trim() && attachments.length === 0;
   // The full question now renders as a markdown card above the input
   // (see `<AskCard>` below) — the placeholder is just a short hint
   // that points at the card. Truncating multi-line markdown into a
@@ -1218,14 +1690,23 @@ export function ChatView({ active, modalOpen }: Props) {
       ? "Waiting for response..."
       : attachments.length > 0
         ? "Add a prompt (or send as-is)..."
-        : "Type a message — paste or drop an image to attach...";
+        : "Type a message — drop a file to add its path (or paste/drop an image to attach)...";
 
   return (
     <div className="flex flex-col h-full">
       {/* Messages */}
       <div
+        ref={messagesContainerRef}
         className="flex-1 overflow-y-auto p-4 space-y-3"
         style={{ background: "var(--bg-primary)" }}
+        onScroll={() => {
+          const el = messagesContainerRef.current;
+          if (!el) return;
+          // Within 64px of the bottom counts as "pinned" — so smooth
+          // scrolls and 1px rounding don't unpin the follow behavior.
+          isAtBottomRef.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 64;
+        }}
       >
         {/* Empty-state hero — count only user/assistant turns. System
             bubbles (MCP "connected" notices, slash-output, skill model
@@ -1267,8 +1748,8 @@ export function ChatView({ active, modalOpen }: Props) {
                 fontStyle: "italic",
               }}
             >
-              Waiting for first response… (some hosted models cold-start
-              for 30–120s before the first byte)
+              Waiting for first response… (some hosted models cold-start for
+              30–120s before the first byte)
             </div>
           </div>
         )}
@@ -1400,11 +1881,13 @@ export function ChatView({ active, modalOpen }: Props) {
                 onClick={onUploadButtonClick}
                 disabled={uploading || streaming}
                 aria-label="Upload files"
-                title={`Upload up to ${MAX_UPLOAD_FILES} files (max ${MAX_UPLOAD_BYTES / 1024 / 1024} MB each) to ./uploads/`}
+                title={`Upload up to ${MAX_UPLOAD_FILES} files (max ${MAX_UPLOAD_BYTES / 1024 / 1024} MB each) to _uploads/`}
                 className="px-2 py-2 rounded text-sm transition-colors inline-flex items-center justify-center"
                 style={{
                   background: "var(--bg-tertiary)",
-                  color: uploading ? "var(--text-secondary)" : "var(--text-primary)",
+                  color: uploading
+                    ? "var(--text-secondary)"
+                    : "var(--text-primary)",
                   border: "1px solid var(--border)",
                   cursor: uploading || streaming ? "not-allowed" : "pointer",
                   minHeight: "36px",
@@ -1417,12 +1900,22 @@ export function ChatView({ active, modalOpen }: Props) {
           <textarea
             ref={inputRef}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              // User edited the line → leave history navigation (their text is
+              // the live draft again). Recall itself uses setInput, not onChange.
+              histIndexRef.current = -1;
+            }}
             onKeyDown={handleInputKeyDown}
             onPaste={onPaste}
             placeholder={inputPlaceholder}
             disabled={inputDisabled}
             rows={1}
+            spellCheck={false}
+            autoCorrect="off"
+            autoCapitalize="off"
+            autoComplete="off"
+            data-gramm="false"
             className="flex-1 px-3 py-2 rounded text-sm outline-none resize-none"
             style={{
               background: "var(--bg-tertiary)",
@@ -1469,8 +1962,12 @@ export function ChatView({ active, modalOpen }: Props) {
               disabled={submitDisabled}
               className="px-4 py-2 rounded text-sm font-medium transition-colors"
               style={{
-                background: submitDisabled ? "var(--bg-tertiary)" : "var(--accent)",
-                color: submitDisabled ? "var(--text-secondary)" : "var(--accent-fg)",
+                background: submitDisabled
+                  ? "var(--bg-tertiary)"
+                  : "var(--accent)",
+                color: submitDisabled
+                  ? "var(--text-secondary)"
+                  : "var(--accent-fg)",
                 cursor: submitDisabled ? "not-allowed" : "pointer",
               }}
             >

@@ -1,39 +1,38 @@
 import { useEditor, EditorContent } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
-import { marked } from "marked";
-import TurndownService from "turndown";
 import { useEffect, useRef } from "react";
+import {
+  MARKDOWN_NODE_CSS,
+  editorHtmlToMarkdown,
+  markdownExtensions,
+  markdownToEditorHtml,
+  joinFrontmatter,
+  splitFrontmatter,
+} from "../lib/markdownRoundTrip";
 
 interface Props {
   source: string;
   onChange: (markdown: string) => void;
+  /// Directory of the file being edited, so relative `![](img/x.png)`
+  /// references resolve through the /file-asset handler. Omit for
+  /// content with no on-disk location — images still round-trip, they
+  /// just won't render.
+  baseDir?: string;
 }
 
-// Markdown ↔ HTML round-trip via marked + turndown. TipTap works in
-// HTML natively; `tiptap-markdown` does not parse markdown on
-// `setContent`, which is why clicking Edit on a `.md` used to render
-// the raw `#` / `-` markers as plain paragraphs. `async: false`
-// forces `marked.parse` to return a string synchronously so TipTap
-// never sees `[object Promise]`.
-marked.setOptions({ gfm: true, breaks: false, async: false });
-const turndownService = new TurndownService({
-  headingStyle: "atx",
-  bulletListMarker: "-",
-  codeBlockStyle: "fenced",
-  emDelimiter: "_",
-});
-
-export function MarkdownEditor({ source, onChange }: Props) {
+export function MarkdownEditor({ source, onChange, baseDir }: Props) {
   // Track the last markdown we emitted so an echoed `source` prop
   // doesn't reset the editor and jump the caret on every keystroke.
   const lastEmittedRef = useRef<string | null>(null);
+  // YAML frontmatter is held aside rather than edited: it isn't
+  // markdown, and the converter mangles it into a thematic break plus a
+  // heading. Re-attached verbatim on every save.
+  const frontmatterRef = useRef("");
 
   const editor = useEditor({
-    extensions: [StarterKit.configure({})],
+    extensions: markdownExtensions,
     content: "",
     onUpdate: ({ editor }) => {
-      const html = editor.getHTML();
-      const md = turndownService.turndown(html).trim() + "\n";
+      const md = joinFrontmatter(frontmatterRef.current, editorHtmlToMarkdown(editor.getHTML()));
       lastEmittedRef.current = md;
       onChange(md);
     },
@@ -44,8 +43,7 @@ export function MarkdownEditor({ source, onChange }: Props) {
         // typography plugin isn't installed, and Tailwind 4 preflight
         // strips heading sizes + list markers — so without these rules
         // headings and bullets render as plain paragraphs.
-        class:
-          "tiptap-compact max-w-none focus:outline-none px-4 py-3",
+        class: "tiptap-compact max-w-none focus:outline-none px-4 py-3",
         spellcheck: "false",
       },
     },
@@ -54,16 +52,18 @@ export function MarkdownEditor({ source, onChange }: Props) {
   useEffect(() => {
     if (!editor) return;
     if (lastEmittedRef.current === source) return;
-    const parsed = marked.parse(source);
-    const html = typeof parsed === "string" ? parsed : "";
+    const { frontmatter, body } = splitFrontmatter(source);
+    frontmatterRef.current = frontmatter;
+    const html = markdownToEditorHtml(body, baseDir);
     queueMicrotask(() => {
+      if (editor.isDestroyed) return;
       editor.commands.setContent(html, {
         emitUpdate: false,
         parseOptions: { preserveWhitespace: false },
       });
       lastEmittedRef.current = source;
     });
-  }, [source, editor]);
+  }, [source, baseDir, editor]);
 
   return (
     <div
@@ -111,6 +111,7 @@ export function MarkdownEditor({ source, onChange }: Props) {
         .tiptap-compact strong { font-weight: 600; }
         .tiptap-compact em { font-style: italic; }
         .tiptap-compact hr { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
+        ${MARKDOWN_NODE_CSS}
       `}</style>
       <EditorContent editor={editor} className="h-full" />
     </div>

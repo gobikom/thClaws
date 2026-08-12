@@ -4,11 +4,13 @@
 //! recurring jobs. Each job carries its own working directory, prompt,
 //! optional model/iteration overrides, and a standard 5-field cron
 //! expression. `run_once` fires a single job synchronously by spawning
-//! `thclaws --print "<prompt>"` with `current_dir(<cwd>)`, capturing
-//! stdout+stderr to a per-run log file under
-//! `~/.local/share/thclaws/logs/<id>/<ts>.log`, and recording the exit
-//! code + duration back into the schedule entry's `last_run` /
-//! `last_exit` fields.
+//! `thclaws --print "<prompt>"` with `current_dir(<cwd>)`. The job's
+//! clean output (stdout — the agent's final answer) is auto-saved into
+//! the WORKSPACE at `<cwd>/.thclaws/schedule/<id>/<ts>.md` so the user
+//! can open the result in the Files tab; stderr (the MCP banner,
+//! warnings, errors) goes to a separate diagnostic log under
+//! `~/.local/share/thclaws/logs/<id>/<ts>.log`. The exit code + duration
+//! are recorded back into the schedule entry's `last_run` / `last_exit`.
 //!
 //! Step 1 is intentionally **without an in-process scheduler** — the
 //! `run` subcommand fires a single job by id, so users can wire it
@@ -17,7 +19,7 @@
 //! verbatim — only the trigger changes.
 
 use crate::error::{Error, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -83,6 +85,13 @@ pub struct Schedule {
     /// process resolves it through the same alias path the CLI uses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// dev-plan/heartbeat: chain fires into ONE session instead of a fresh
+    /// amnesiac run each time. Passed to the spawned job as
+    /// `--resume <value>`. Use `"last"` (recommended — resumes the cwd's
+    /// most-recent session; the first fire starts it) or an existing
+    /// session id. `None` keeps the classic stateless behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_session: Option<String>,
 
     /// Cap on the agent loop's tool-call iterations for this job.
     /// `None` falls through to the project's `maxIterations` setting
@@ -332,6 +341,13 @@ fn normalize_cron(expr: &str) -> String {
 /// killed by the timeout enforcer or never produced a status.
 #[derive(Debug, Clone)]
 pub struct RunOutcome {
+    /// The run's clean output (the agent's final answer) — captured
+    /// stdout, written into the workspace at
+    /// `<cwd>/.thclaws/schedule/<id>/<ts>.md` so the user can open it in
+    /// the Files tab without digging into `~/.local/share`.
+    pub result_path: PathBuf,
+    /// Diagnostics for this run (captured stderr: MCP banner, warnings,
+    /// errors) under `~/.local/share/thclaws/logs/<id>/<ts>.log`.
     pub log_path: PathBuf,
     pub exit_code: Option<i32>,
     pub duration: Duration,
@@ -413,20 +429,37 @@ fn spawn_job(schedule: &Schedule, binary_path: &Path) -> Result<RunOutcome> {
     let ts = Utc::now().format("%Y-%m-%dT%H-%M-%SZ").to_string();
     let log_path = log_dir.join(format!("{ts}.log"));
     let log_file = std::fs::File::create(&log_path)?;
-    // stderr piped into the same file as stdout so the run log is
-    // a single linear trace; matches what a user would see in the
-    // terminal.
-    let log_file_for_err = log_file.try_clone()?;
+
+    // The RESULT (stdout = the agent's final answer; print mode already
+    // suppresses ANSI/thinking when not a TTY) is auto-saved into the
+    // WORKSPACE so the user can view it in the Files tab regardless of
+    // what the prompt was — no need to ask the agent to "save to a file".
+    // Diagnostics (stderr: the MCP banner, warnings, errors) go to the
+    // separate log under ~/.local/share so the result file stays clean.
+    let result_dir = schedule
+        .cwd
+        .join(".thclaws")
+        .join("state")
+        .join("schedule")
+        .join(&schedule.id);
+    std::fs::create_dir_all(&result_dir)?;
+    let result_path = result_dir.join(format!("{ts}.md"));
+    let result_file = std::fs::File::create(&result_path)?;
 
     let mut cmd = Command::new(binary_path);
     cmd.arg("--print")
         .arg(&schedule.prompt)
         .current_dir(&schedule.cwd)
         .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(log_file_for_err));
+        .stdout(Stdio::from(result_file))
+        .stderr(Stdio::from(log_file));
     if let Some(ref m) = schedule.model {
         cmd.arg("--model").arg(m);
+    }
+    // Heartbeat: continue the same session across fires. Print mode now
+    // persists sessions + honors --resume, so history accumulates.
+    if let Some(ref sid) = schedule.resume_session {
+        cmd.arg("--resume").arg(sid);
     }
     if let Some(n) = schedule.max_iterations {
         cmd.arg("--max-iterations").arg(n.to_string());
@@ -463,6 +496,7 @@ fn spawn_job(schedule: &Schedule, binary_path: &Path) -> Result<RunOutcome> {
     };
 
     Ok(RunOutcome {
+        result_path,
         log_path,
         exit_code,
         duration: started.elapsed(),
@@ -506,6 +540,19 @@ pub fn log_dir_for(id: &str) -> Result<PathBuf> {
     Ok(home.join(".local/share/thclaws/logs").join(id))
 }
 
+/// Newest diagnostic log for a schedule, if any. Each fire writes one
+/// timestamped `<ts>.log` (its stderr — where the actual error is), so the
+/// lexicographically-largest name is the most recent fire's log. Used by
+/// `schedule status` to point the user at the error behind an `err`.
+pub fn latest_log(id: &str) -> Option<PathBuf> {
+    let dir = log_dir_for(id).ok()?;
+    std::fs::read_dir(&dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .max_by(|a, b| a.file_name().cmp(&b.file_name()))
+}
+
 // ─── Step 2: in-process scheduler ────────────────────────────────────
 //
 // Long-running tokio task that polls the schedule store every
@@ -540,13 +587,26 @@ pub fn parse_last_run(schedule: &Schedule) -> Option<DateTime<Utc>> {
         .map(|d| d.with_timezone(&Utc))
 }
 
+/// Format a last-run timestamp for display in the local timezone.
+/// Returns `never` when the field is absent and preserves the raw
+/// string if parsing fails.
+pub fn display_last_run(last_run: Option<&str>) -> String {
+    last_run
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Local).to_rfc3339())
+        .unwrap_or_else(|| last_run.unwrap_or("never").to_string())
+}
+
 /// First cron fire strictly after `after`. Returns `None` if the
 /// expression is invalid or has no upcoming fire (rare — e.g. a
 /// `cron` expression pinned to a specific year that's already past).
 pub fn compute_next_fire(cron_expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let normalized = normalize_cron(cron_expr);
     let schedule = cron::Schedule::from_str(&normalized).ok()?;
-    schedule.after(&after).next()
+    schedule
+        .after(&after.with_timezone(&Local))
+        .next()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Next time `schedule` is due relative to `cursor`, unifying the
@@ -577,7 +637,11 @@ pub fn compute_next_n_fires(cron_expr: &str, after: DateTime<Utc>, n: usize) -> 
     let Ok(schedule) = cron::Schedule::from_str(&normalized) else {
         return Vec::new();
     };
-    schedule.after(&after).take(n).collect()
+    schedule
+        .after(&after.with_timezone(&Local))
+        .take(n)
+        .map(|dt| dt.with_timezone(&Utc))
+        .collect()
 }
 
 /// In-process scheduler state. Owns the per-schedule cursor map and
@@ -680,9 +744,10 @@ impl InProcessScheduler {
                             .unwrap_or_else(|| "(timeout)".to_string());
                         eprintln!(
                             "\x1b[36m[schedule] '{id_for_task}' fired \
-                             — exit={exit} duration={}.{:03}s log={}\x1b[0m",
+                             — exit={exit} duration={}.{:03}s → result={} (log={})\x1b[0m",
                             outcome.duration.as_secs(),
                             outcome.duration.subsec_millis(),
+                            outcome.result_path.display(),
                             outcome.log_path.display(),
                         );
                     }
@@ -1435,9 +1500,10 @@ impl WatchManager {
                                     .map(|c| c.to_string())
                                     .unwrap_or_else(|| "(timeout)".into());
                                 eprintln!(
-                                    "\x1b[36m[watch] '{id_for_blocking}' done — exit={exit} duration={}.{:03}s log={}\x1b[0m",
+                                    "\x1b[36m[watch] '{id_for_blocking}' done — exit={exit} duration={}.{:03}s → result={} (log={})\x1b[0m",
                                     o.duration.as_secs(),
                                     o.duration.subsec_millis(),
+                                    o.result_path.display(),
                                     o.log_path.display(),
                                 );
                             }
@@ -1650,6 +1716,7 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 prompt: "hello".into(),
                 model: Some("gpt-4o".into()),
+                resume_session: None,
                 max_iterations: Some(20),
                 timeout_secs: Some(60),
                 enabled: true,
@@ -1675,6 +1742,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             prompt: "x".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: None,
             enabled: true,
@@ -1696,6 +1764,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             prompt: "x".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: None,
             enabled: true,
@@ -1718,6 +1787,7 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 prompt: "p".into(),
                 model: None,
+                resume_session: None,
                 max_iterations: None,
                 timeout_secs: None,
                 enabled: true,
@@ -1740,6 +1810,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_job_captures_exit_and_writes_log() {
+        // `log_dir_for` reads `$HOME` to place the log file. Concurrent
+        // tests in tools/{memory,kms} + research/* + kms.rs flip HOME
+        // to tempdirs they then drop on guard release — racing those
+        // would leave `outcome.log_path` pointing at a deleted dir.
+        let _env = crate::kms::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         // Fake binary: ignores --print + the prompt, just echoes its
         // cwd to stdout and exits 0. This proves cwd was honored.
@@ -1754,6 +1829,7 @@ mod tests {
             cwd: work.path().to_path_buf(),
             prompt: "hello there".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: Some(5),
             enabled: true,
@@ -1765,16 +1841,25 @@ mod tests {
         let outcome = spawn_job(&schedule, &fake).unwrap();
         assert_eq!(outcome.exit_code, Some(7));
         assert!(!outcome.timed_out);
-        let log = std::fs::read_to_string(&outcome.log_path).unwrap();
+        // The fake echoes pwd + the prompt to STDOUT, which is now the
+        // auto-saved RESULT file in the workspace (.thclaws/schedule/...).
+        let result = std::fs::read_to_string(&outcome.result_path).unwrap();
+        assert!(
+            outcome
+                .result_path
+                .starts_with(work.path().join(".thclaws").join("state").join("schedule")),
+            "result must be saved in the workspace; got: {}",
+            outcome.result_path.display()
+        );
         // pwd in the spawned shell should match `work.path()` after
         // canonicalization (macOS adds `/private` to `/var/folders/...`).
         let canonical = work.path().canonicalize().unwrap();
         assert!(
-            log.contains(canonical.to_string_lossy().trim_end_matches('/'))
-                || log.contains(work.path().to_string_lossy().trim_end_matches('/')),
-            "log should contain cwd; got: {log}"
+            result.contains(canonical.to_string_lossy().trim_end_matches('/'))
+                || result.contains(work.path().to_string_lossy().trim_end_matches('/')),
+            "result should contain cwd; got: {result}"
         );
-        assert!(log.contains("prompt-was: hello there"));
+        assert!(result.contains("prompt-was: hello there"));
 
         // Cleanup the schedule's log directory we just created under
         // the real ~/.local/share/thclaws/logs/<id>/.
@@ -1946,7 +2031,7 @@ mod tests {
         // Pre-create the .thclaws directory so the file write below
         // is observed as a child of an existing dir (some platforms
         // emit different events for create-dir vs create-in-dir).
-        let thclaws_dir = work.path().join(".thclaws").join("sessions");
+        let thclaws_dir = work.path().join(".thclaws").join("state").join("sessions");
         std::fs::create_dir_all(&thclaws_dir).unwrap();
 
         let store_dir = tempfile::tempdir().unwrap();
@@ -2078,18 +2163,13 @@ mod tests {
             .with_timezone(&Utc);
         let fires = compute_next_n_fires("0 9 * * *", after, 3);
         assert_eq!(fires.len(), 3);
-        assert_eq!(
-            fires[0].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-06T09:00"
-        );
-        assert_eq!(
-            fires[1].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-07T09:00"
-        );
-        assert_eq!(
-            fires[2].format("%Y-%m-%dT%H:%M").to_string(),
-            "2026-05-08T09:00"
-        );
+        assert!(fires.windows(2).all(|pair| pair[0] < pair[1]));
+        for fire in fires {
+            assert_eq!(
+                fire.with_timezone(&Local).format("%H:%M").to_string(),
+                "09:00"
+            );
+        }
     }
 
     #[test]
@@ -2106,13 +2186,15 @@ mod tests {
 
     #[test]
     fn compute_next_fire_handles_minute_cron() {
-        // 8:30 every day. After 2026-05-06T08:00:00Z next fire is 08:30 same day.
+        // 8:30 every day in local time.
         let after = DateTime::parse_from_rfc3339("2026-05-06T08:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
         let next = compute_next_fire("30 8 * * *", after).unwrap();
-        assert_eq!(next.format("%H:%M").to_string(), "08:30");
-        assert_eq!(next.format("%Y-%m-%d").to_string(), "2026-05-06");
+        assert_eq!(
+            next.with_timezone(&Local).format("%H:%M").to_string(),
+            "08:30"
+        );
     }
 
     #[test]
@@ -2129,6 +2211,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             prompt: "p".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: None,
             enabled: true,
@@ -2148,6 +2231,7 @@ mod tests {
             cwd: std::env::temp_dir(),
             prompt: "p".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: None,
             enabled: true,
@@ -2161,6 +2245,22 @@ mod tests {
             parsed.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
             "2026-05-06T12:34:56Z"
         );
+    }
+
+    #[test]
+    fn display_last_run_formats_local_time_and_preserves_instant() {
+        let displayed = display_last_run(Some("2026-05-06T12:34:56Z"));
+        let parsed = DateTime::parse_from_rfc3339(&displayed).unwrap();
+        assert_eq!(
+            parsed.with_timezone(&Utc).to_rfc3339(),
+            "2026-05-06T12:34:56+00:00"
+        );
+    }
+
+    #[test]
+    fn display_last_run_handles_absent_and_invalid_values() {
+        assert_eq!(display_last_run(None), "never");
+        assert_eq!(display_last_run(Some("bad-timestamp")), "bad-timestamp");
     }
 
     /// Tick logic end-to-end: covers catch-up skipping (fresh
@@ -2193,6 +2293,7 @@ mod tests {
                 cwd: work.path().to_path_buf(),
                 prompt: "p".into(),
                 model: None,
+                resume_session: None,
                 max_iterations: None,
                 timeout_secs: Some(5),
                 enabled: true,
@@ -2209,6 +2310,7 @@ mod tests {
                 cwd: work.path().to_path_buf(),
                 prompt: "p".into(),
                 model: None,
+                resume_session: None,
                 max_iterations: None,
                 timeout_secs: Some(5),
                 enabled: true,
@@ -2225,6 +2327,7 @@ mod tests {
                 cwd: work.path().to_path_buf(),
                 prompt: "p".into(),
                 model: None,
+                resume_session: None,
                 max_iterations: None,
                 timeout_secs: Some(5),
                 enabled: false,
@@ -2363,6 +2466,7 @@ mod tests {
             cwd: work.path().to_path_buf(),
             prompt: "p".into(),
             model: None,
+            resume_session: None,
             max_iterations: None,
             timeout_secs: Some(1),
             enabled: true,

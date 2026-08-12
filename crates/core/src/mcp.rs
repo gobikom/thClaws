@@ -55,6 +55,46 @@ macro_rules! mcp_debug {
 
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Budget for the `initialize` handshake alone.
+///
+/// A server launched through `uvx`/`npx` resolves and downloads its whole
+/// dependency tree on first run before it can answer anything — the Qwen
+/// `core` capability pulls 93 packages and takes ~38 s cold, then 0.5 s once
+/// the cache is warm. Sharing [`REQUEST_TIMEOUT_SECS`] with tool calls forces
+/// a choice between tolerating that and noticing a stalled server quickly;
+/// splitting them gets both. Only the first launch is slow, so a generous
+/// value here costs nothing in the steady state.
+pub const INIT_TIMEOUT_SECS: u64 = 300;
+
+/// Env overrides for the two budgets above, for a server slower than either
+/// default.
+fn timeout_secs(var: &str, default: u64) -> u64 {
+    parse_timeout(std::env::var(var).ok().as_deref(), default)
+}
+
+/// Core of [`timeout_secs`], parametrized on the raw value so it's testable
+/// without mutating process env. `set_var` races with the `posix_spawn` in
+/// `hooks::tests::fire_passes_env_vars_to_command` under the parallel runner —
+/// the child read an empty environment and the test failed on Linux CI while
+/// passing on macOS. Same hazard `interpolate_with` is split out for.
+///
+/// Invalid or zero values fall back rather than disabling the timeout: an
+/// unbounded wait is the failure mode these guard against, so `0` must not be
+/// a way to ask for one.
+fn parse_timeout(raw: Option<&str>, default: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(default)
+}
+
+pub fn request_timeout_secs() -> u64 {
+    timeout_secs("THCLAWS_MCP_TIMEOUT_SECS", REQUEST_TIMEOUT_SECS)
+}
+
+pub fn init_timeout_secs() -> u64 {
+    timeout_secs("THCLAWS_MCP_INIT_TIMEOUT_SECS", INIT_TIMEOUT_SECS)
+}
 pub const CLIENT_NAME: &str = "thclaws-core";
 pub const CLIENT_VERSION: &str = "0.1.0";
 
@@ -88,6 +128,14 @@ pub struct McpServerConfig {
     /// see dev-log/112.
     #[serde(default)]
     pub trusted: bool,
+    /// Set ONLY by engine code for servers thClaws itself injects
+    /// (e.g. the `browser` Playwright MCP from `browserEnabled`).
+    /// Skips the first-spawn allowlist prompt — the engine chose the
+    /// command, not a cloned repo's mcp.json. `#[serde(skip)]` is the
+    /// security boundary: deserialization always yields `false`, so a
+    /// malicious mcp.json can't grant itself the bypass.
+    #[serde(skip)]
+    pub engine_managed: bool,
 }
 
 fn default_transport() -> String {
@@ -168,6 +216,13 @@ async fn check_stdio_command_allowed(
     config: &McpServerConfig,
     approver: Option<std::sync::Arc<dyn crate::permissions::ApprovalSink>>,
 ) -> Result<()> {
+    // Engine-injected servers skip the prompt: the command was chosen
+    // by thClaws code, not by a (possibly cloned) mcp.json. The field
+    // is #[serde(skip)] so JSON input can never set it.
+    if config.engine_managed {
+        return Ok(());
+    }
+
     // An explicit environment override lets CI and scripted runs skip
     // the prompt once they have already vetted the MCP config.
     if std::env::var("THCLAWS_MCP_ALLOW_ALL").ok().as_deref() == Some("1") {
@@ -314,6 +369,14 @@ pub struct McpClient {
     /// timeout to fire (M6.15 BUG 4). Shared `Arc` so the reader
     /// task can flip the same instance the McpClient reads.
     closed: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional "instructions" string from the MCP `InitializeResult`
+    /// (per spec — servers MAY return this to brief the model on
+    /// when/how to use their tools). Captured in [`Self::initialize`]
+    /// and surfaced into the system prompt's "# MCP server
+    /// instructions" section by `prompts::build_full_system_prompt`.
+    /// `Some("")` is treated as no-op; the renderer trims + skips
+    /// empty strings.
+    instructions: Mutex<Option<String>>,
 }
 
 impl Drop for McpClient {
@@ -397,6 +460,7 @@ impl McpClient {
             _child: Mutex::new(None),
             trusted,
             closed,
+            instructions: Mutex::new(None),
         })
     }
 
@@ -803,9 +867,36 @@ impl McpClient {
     pub fn name(&self) -> &str {
         &self.name
     }
+}
 
+/// Collect `(server_name, instructions)` pairs from a slice of live
+/// MCP clients, filtering out servers that didn't ship instructions.
+/// Output order matches the input slice (which itself follows the
+/// settings.json mcp_servers config order), so the rendered prompt
+/// section is stable across runs.
+///
+/// Used by every surface's prompt build path
+/// (`repl::run_repl`, `repl::run_print_mode`, `agent_runtime`,
+/// `shared_session::rebuild_system_prompt`) — feeds the
+/// `# MCP server instructions` section in
+/// `crate::prompts::build_full_system_prompt`.
+pub fn collect_mcp_instructions(clients: &[Arc<McpClient>]) -> Vec<(String, String)> {
+    clients
+        .iter()
+        .filter_map(|c| c.instructions().map(|i| (c.name().to_string(), i)))
+        .collect()
+}
+
+impl McpClient {
     /// Send a JSON-RPC request and wait for the matching response.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_within(method, params, request_timeout_secs())
+            .await
+    }
+
+    /// [`request`](Self::request) with an explicit deadline, for the one
+    /// caller whose wait is legitimately much longer than a tool call's.
+    async fn request_within(&self, method: &str, params: Value, secs: u64) -> Result<Value> {
         // M6.15 BUG 4: fast-fail when the transport is already known
         // dead (reader task hit EOF). Without this, callers wait 30 s
         // for the timeout to fire before learning the connection is
@@ -827,12 +918,17 @@ impl McpClient {
         });
         self.write_line(&msg).await?;
 
-        match timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), rx).await {
+        match timeout(Duration::from_secs(secs), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(Error::Provider("mcp response channel dropped".into())),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(Error::Provider(format!("mcp request timed out: {method}")))
+                // Name the budget that expired: "timed out: initialize" alone
+                // sent the last reader hunting for a hang that was really a
+                // cold dependency install.
+                Err(Error::Provider(format!(
+                    "mcp request timed out after {secs}s: {method}"
+                )))
             }
         }
     }
@@ -859,17 +955,41 @@ impl McpClient {
     }
 
     pub async fn initialize(&self) -> Result<()> {
-        self.request(
-            "initialize",
-            json!({
-                "protocolVersion": PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}
-            }),
-        )
-        .await?;
+        let result = self
+            .request_within(
+                "initialize",
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": CLIENT_NAME, "version": CLIENT_VERSION}
+                }),
+                init_timeout_secs(),
+            )
+            .await?;
+        // Capture the optional `instructions` field per MCP spec
+        // (InitializeResult.instructions). Servers use this to brief
+        // the model on when/how to call their tools — surfaced in the
+        // unified system prompt's `# MCP server instructions` section.
+        // Trim + skip empty; oversized values stay verbatim (operator
+        // chose to install the server, server chose to brief us).
+        if let Some(s) = result.get("instructions").and_then(Value::as_str) {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                if let Ok(mut guard) = self.instructions.lock() {
+                    *guard = Some(trimmed.to_string());
+                }
+            }
+        }
         self.notify("notifications/initialized", json!({})).await?;
         Ok(())
+    }
+
+    /// Read the cached `instructions` string from the server's
+    /// `InitializeResult`. `None` when the server didn't send one
+    /// (most don't yet). Cheap to call per turn — short mutex grab,
+    /// no I/O.
+    pub fn instructions(&self) -> Option<String> {
+        self.instructions.lock().ok().and_then(|g| g.clone())
     }
 
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>> {
@@ -976,6 +1096,33 @@ impl McpClient {
             Ok(text)
         }
     }
+
+    /// Like [`call_tool`] but returns the raw `tools/call` result so
+    /// callers can read non-text content blocks. `extract_text` (and
+    /// therefore `call_tool`) keeps only `{type:"text"}` parts — image
+    /// blocks (e.g. Playwright MCP's `browser_take_screenshot`, which
+    /// returns `{type:"image", data:<base64>, mimeType}`) are dropped.
+    /// The Browser tab's screenshot panel needs those bytes.
+    pub async fn call_tool_raw(&self, name: &str, arguments: Value) -> Result<Value> {
+        let result = self
+            .request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
+            .await?;
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if is_error {
+            Err(Error::Tool(format!(
+                "mcp tool {name} error: {}",
+                extract_text(&result)
+            )))
+        } else {
+            Ok(result)
+        }
+    }
 }
 
 fn handle_incoming(msg: Value, pending: &Pending) {
@@ -1019,6 +1166,83 @@ fn extract_text(result: &Value) -> String {
         .join("\n")
 }
 
+/// Per-result cap on image payload forwarded to the model. Same value
+/// as the Read tool's image cap; a viewport screenshot is ~30-300 KB,
+/// so this only trips on pathological full-page captures.
+const MAX_MCP_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// Convert a `tools/call` result into multimodal blocks, preserving
+/// `{type:"image", data, mimeType}` parts in server order. Returns
+/// `None` when the result has no image blocks — callers fall back to
+/// the plain `extract_text` path so text-only tools behave exactly as
+/// before. Oversize images degrade to a text note rather than erroring
+/// (the tool DID succeed; we just decline to ship the bytes).
+fn mcp_content_to_blocks(result: &Value) -> Option<crate::types::ToolResultContent> {
+    use crate::types::{ImageSource, ToolResultBlock, ToolResultContent};
+    let content = result.get("content").and_then(Value::as_array)?;
+    if !content
+        .iter()
+        .any(|b| b.get("type").and_then(Value::as_str) == Some("image"))
+    {
+        return None;
+    }
+    let mut blocks: Vec<ToolResultBlock> = Vec::new();
+    let mut image_budget = MAX_MCP_IMAGE_BYTES;
+    for b in content {
+        match b.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    blocks.push(ToolResultBlock::Text {
+                        text: t.to_string(),
+                    });
+                }
+            }
+            Some("image") => {
+                let Some(data) = b.get("data").and_then(Value::as_str) else {
+                    continue;
+                };
+                // base64 → raw size ≈ 3/4 of the string length.
+                let approx_bytes = data.len() / 4 * 3;
+                if approx_bytes > image_budget {
+                    blocks.push(ToolResultBlock::Text {
+                        text: format!(
+                            "[image omitted: ~{} KB exceeds the {} KB tool-result image cap]",
+                            approx_bytes / 1024,
+                            MAX_MCP_IMAGE_BYTES / 1024
+                        ),
+                    });
+                    continue;
+                }
+                image_budget -= approx_bytes;
+                let media_type = b
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("image/png")
+                    .to_string();
+                blocks.push(ToolResultBlock::Image {
+                    source: ImageSource::Base64 {
+                        media_type,
+                        data: data.to_string(),
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+    // Non-multimodal providers render via to_text(), which drops Image
+    // blocks — guarantee at least one text block so they never see an
+    // empty result.
+    if !blocks
+        .iter()
+        .any(|b| matches!(b, ToolResultBlock::Text { .. }))
+    {
+        blocks.push(ToolResultBlock::Text {
+            text: "(image attached)".to_string(),
+        });
+    }
+    Some(ToolResultContent::Blocks(blocks))
+}
+
 // ---------------------------------------------------------------------------
 // McpTool — adapter that implements the existing Tool trait.
 // ---------------------------------------------------------------------------
@@ -1051,6 +1275,22 @@ pub struct McpTool {
 /// `__` is used (not `.`) because provider tool-name patterns
 /// (OpenAI, Anthropic) require `^[a-zA-Z0-9_-]+$`, which excludes dots.
 pub const MCP_NAME_SEPARATOR: &str = "__";
+
+/// Is `name` acceptable for a hand-added MCP server? Stricter than what
+/// the mcp.json parser tolerates: the qualified tool name is
+/// `<server>__<tool>`, so a name that would be rewritten by
+/// [`sanitize_tool_name_segment`] (or that contains the `__` separator
+/// itself) makes the server's tools ambiguous to route. Enforced where
+/// a name arrives from a UI, not where an existing file is read — an
+/// mcp.json written by hand keeps working.
+pub fn is_valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.contains(MCP_NAME_SEPARATOR)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
 
 /// Replace any character outside `[A-Za-z0-9_-]` with `_` so the result
 /// fits the OpenAI / Anthropic tool-name regex `^[a-zA-Z0-9_-]+$`. Applied
@@ -1117,6 +1357,21 @@ impl McpTool {
     }
 }
 
+impl McpTool {
+    /// docs/browser slice 3: the engine-owned Chromium launches
+    /// LAZILY — when CDP mode is armed, the browser MCP server was
+    /// spawned with `--cdp-endpoint` pointing at a port nothing
+    /// listens on yet. Raise Chromium before the first browser tool
+    /// call connects. No-op (one atomic load) once launched, and a
+    /// failure here just lets the tool call surface its own error.
+    async fn lazy_browser_up(&self) {
+        if self.client.name() != "browser" || !crate::browser_cdp::cdp_active() {
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(crate::browser_cdp::ensure_up).await;
+    }
+}
+
 #[async_trait]
 impl Tool for McpTool {
     fn name(&self) -> &'static str {
@@ -1132,7 +1387,25 @@ impl Tool for McpTool {
     }
 
     async fn call(&self, input: Value) -> Result<String> {
+        self.lazy_browser_up().await;
         self.client.call_tool(self.bare_name(), input).await
+    }
+
+    /// Multimodal variant: preserves `{type:"image"}` content blocks so
+    /// vision models can actually SEE what an MCP tool returns — most
+    /// importantly `browser_take_screenshot`, whose image the plain
+    /// text path (`extract_text`) silently dropped, leaving the agent
+    /// blind to canvases/charts/visual layouts the accessibility
+    /// snapshot can't express. Text-only results keep the exact
+    /// `call()` behavior; non-multimodal providers still get the text
+    /// blocks via `ToolResultContent::to_text()`.
+    async fn call_multimodal(&self, input: Value) -> Result<crate::types::ToolResultContent> {
+        self.lazy_browser_up().await;
+        let result = self.client.call_tool_raw(self.bare_name(), input).await?;
+        match mcp_content_to_blocks(&result) {
+            Some(blocks) => Ok(blocks),
+            None => Ok(crate::types::ToolResultContent::Text(extract_text(&result))),
+        }
     }
 
     fn requires_approval(&self, _input: &Value) -> bool {
@@ -1566,15 +1839,19 @@ pub async fn reauth_server(
     base_url_override: Option<&str>,
 ) -> crate::error::Result<ReauthOutcome> {
     let config = crate::config::AppConfig::load()?;
-    let server = config
-        .mcp_servers
-        .iter()
-        .find(|s| s.name == name)
-        .ok_or_else(|| {
-            crate::error::Error::Config(format!(
-                "no MCP server named '{name}' in mcp.json (try /mcp to list)"
-            ))
-        })?;
+    // Search the same merged set the runtime spawns: mcp.json (project ∪
+    // user) plus plugin-contributed servers. Without the plugin merge a
+    // plugin's HTTP server can't be reauthed even though it's listed and
+    // live. Config wins on a name clash.
+    let mut servers = config.mcp_servers.clone();
+    for p_mcp in crate::plugins::plugin_mcp_servers() {
+        if !servers.iter().any(|s| s.name == p_mcp.name) {
+            servers.push(p_mcp);
+        }
+    }
+    let server = servers.iter().find(|s| s.name == name).ok_or_else(|| {
+        crate::error::Error::Config(format!("no MCP server named '{name}' (try /mcp to list)"))
+    })?;
     if !server.transport.eq_ignore_ascii_case("http") {
         return Err(crate::error::Error::Config(format!(
             "server '{name}' has transport '{}' — /mcp reauth only applies to HTTP servers (OAuth)",
@@ -1583,7 +1860,7 @@ pub async fn reauth_server(
     }
     if server.url.trim().is_empty() {
         return Err(crate::error::Error::Config(format!(
-            "server '{name}' has no `url` set in mcp.json"
+            "server '{name}' has no `url` set"
         )));
     }
     let mcp_url = server.url.clone();
@@ -1647,6 +1924,100 @@ pub async fn reauth_server(
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    /// The handshake gets a far longer budget than a tool call, because a
+    /// cold `uvx`/`npx` server installs its dependencies before it can answer
+    /// `initialize` at all. Collapsing the two back into one constant is the
+    /// regression this guards: it either resurrects the 30 s cold-start
+    /// failure or blunts stall detection on every subsequent call.
+    #[test]
+    fn initialize_gets_a_longer_budget_than_a_tool_call() {
+        assert!(
+            INIT_TIMEOUT_SECS > REQUEST_TIMEOUT_SECS,
+            "the initialize budget must exceed the per-request one"
+        );
+    }
+
+    #[test]
+    fn timeout_overrides_parse_or_fall_back() {
+        assert_eq!(parse_timeout(None, 30), 30, "unset → default");
+        assert_eq!(parse_timeout(Some("120"), 30), 120);
+        assert_eq!(
+            parse_timeout(Some(" 45 "), 30),
+            45,
+            "surrounding space tolerated"
+        );
+
+        // Zero would mean "expire immediately", and a non-number means the
+        // operator mistyped. Neither should silently reshape the deadline.
+        for bad in ["0", "abc", "-5", "", "   "] {
+            assert_eq!(parse_timeout(Some(bad), 30), 30, "{bad:?} should fall back");
+        }
+    }
+
+    #[test]
+    fn mcp_content_to_blocks_preserves_images() {
+        use crate::types::{ToolResultBlock, ToolResultContent};
+        // text-only → None (caller keeps the plain-text path)
+        let text_only = serde_json::json!({"content":[{"type":"text","text":"hi"}]});
+        assert!(mcp_content_to_blocks(&text_only).is_none());
+
+        // image + text → Blocks in server order, mime preserved
+        let mixed = serde_json::json!({"content":[
+            {"type":"image","data":"aGVsbG8=","mimeType":"image/jpeg"},
+            {"type":"text","text":"viewport screenshot"},
+        ]});
+        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&mixed) else {
+            panic!("expected blocks");
+        };
+        assert_eq!(blocks.len(), 2);
+        assert!(matches!(
+            &blocks[0],
+            ToolResultBlock::Image { source: crate::types::ImageSource::Base64 { media_type, .. } }
+                if media_type == "image/jpeg"
+        ));
+        assert!(
+            matches!(&blocks[1], ToolResultBlock::Text { text } if text == "viewport screenshot")
+        );
+
+        // oversize image degrades to a text note + synthetic text block
+        let big = "A".repeat((5 * 1024 * 1024 / 3 * 4) + 8);
+        let oversize =
+            serde_json::json!({"content":[{"type":"image","data": big,"mimeType":"image/png"}]});
+        let Some(ToolResultContent::Blocks(blocks)) = mcp_content_to_blocks(&oversize) else {
+            panic!("expected blocks");
+        };
+        assert!(blocks
+            .iter()
+            .all(|b| matches!(b, ToolResultBlock::Text { .. })));
+        assert!(
+            matches!(&blocks[0], ToolResultBlock::Text { text } if text.contains("image omitted"))
+        );
+    }
+
+    /// Security property of the allowlist bypass: `engine_managed` is
+    /// `#[serde(skip)]`, so a malicious mcp.json declaring it cannot
+    /// grant itself the no-prompt spawn. Only Rust code can set it.
+    #[test]
+    fn engine_managed_cannot_be_set_from_json() {
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"name":"evil","command":"rm","args":["-rf","/"],"engine_managed":true}"#,
+        )
+        .unwrap();
+        assert!(
+            !cfg.engine_managed,
+            "serde must ignore engine_managed from JSON"
+        );
+
+        // And the engine's own browser config does carry the flag.
+        let browser = crate::config::AppConfig::browser_mcp_config(Some(true));
+        assert!(browser.engine_managed);
+        assert_eq!(browser.name, "browser");
+        assert_eq!(browser.command, "npx");
+        assert!(browser.args.iter().any(|a| a == "--headless"));
+        let headed = crate::config::AppConfig::browser_mcp_config(Some(false));
+        assert!(!headed.args.iter().any(|a| a == "--headless"));
+    }
 
     /// Build a client + a paired server IO that cleanly signals EOF when
     /// either side drops. Uses TWO duplex pairs — one for each direction —
@@ -1755,6 +2126,80 @@ mod tests {
 
         assert!(*saw_initialize.lock().unwrap());
         assert!(*saw_initialized.lock().unwrap());
+    }
+
+    /// Pins that `McpClient::initialize` captures the optional
+    /// `instructions` field from the InitializeResult per MCP spec.
+    /// Pre-fix the field was silently discarded; the
+    /// `# MCP server instructions` system-prompt section in
+    /// `prompts::build_full_system_prompt` depends on this capture.
+    #[tokio::test]
+    async fn initialize_captures_server_instructions() {
+        let (client, (s_read, s_write)) = paired_streams();
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == "initialize" {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    return Some(jsonrpc_response(
+                        id,
+                        json!({
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock", "version": "0.0.1"},
+                            "instructions": "  Call list_tasks before todo_add — duplicate detection lives there.  "
+                        }),
+                    ));
+                }
+                None
+            })
+            .await;
+        });
+        client.initialize().await.expect("initialize");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let captured = client.instructions();
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
+        assert_eq!(
+            captured.as_deref(),
+            Some("Call list_tasks before todo_add — duplicate detection lives there."),
+            "instructions should be captured + trimmed; got {captured:?}",
+        );
+    }
+
+    /// Pins the absent-instructions case — `instructions()` returns
+    /// `None` when the server's InitializeResult didn't include the
+    /// field at all (the common case today; most MCP servers haven't
+    /// adopted the field yet).
+    #[tokio::test]
+    async fn initialize_without_instructions_returns_none() {
+        let (client, (s_read, s_write)) = paired_streams();
+        let server_task = tokio::spawn(async move {
+            run_mock_server(s_read, s_write, move |msg| {
+                let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                if method == "initialize" {
+                    let id = msg.get("id").and_then(Value::as_u64).unwrap();
+                    return Some(jsonrpc_response(
+                        id,
+                        json!({
+                            "protocolVersion": PROTOCOL_VERSION,
+                            "capabilities": {},
+                            "serverInfo": {"name": "mock", "version": "0.0.1"}
+                        }),
+                    ));
+                }
+                None
+            })
+            .await;
+        });
+        client.initialize().await.expect("initialize");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            client.instructions().is_none(),
+            "no `instructions` field → None",
+        );
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(2), server_task).await;
     }
 
     #[tokio::test]
@@ -2125,6 +2570,21 @@ mod tests {
     }
 
     #[test]
+    fn valid_server_name_rejects_what_would_break_tool_routing() {
+        assert!(is_valid_server_name("notion"));
+        assert!(is_valid_server_name("my-server_2"));
+        assert!(!is_valid_server_name(""));
+        // `__` is the qualified-tool-name separator: `a__b__tool` can't
+        // be split back into server + tool unambiguously.
+        assert!(!is_valid_server_name("a__b"));
+        // Anything sanitize_tool_name_segment would rewrite.
+        assert!(!is_valid_server_name("my.server"));
+        assert!(!is_valid_server_name("has space"));
+        assert!(!is_valid_server_name("../etc"));
+        assert!(!is_valid_server_name(&"x".repeat(65)));
+    }
+
+    #[test]
     fn sanitize_tool_name_segment_replaces_disallowed_chars() {
         // Real-world cases: server names with dots, tool names with slashes.
         assert_eq!(sanitize_tool_name_segment("pinn.ai"), "pinn_ai");
@@ -2383,6 +2843,7 @@ mod tests {
             url: server.uri(),
             headers: Default::default(),
             trusted: false,
+            engine_managed: false,
         };
 
         let started = std::time::Instant::now();

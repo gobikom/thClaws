@@ -1,10 +1,10 @@
 # Providers — the router
 
-Every LLM call funnels through `crate::providers`. The layer's contract is one trait — `Provider` — that exposes a single `stream(StreamRequest) -> EventStream` method and a closed enum — `ProviderKind` — that catalogues the 17 supported backends. A model string like `claude-sonnet-4-6` or `openrouter/anthropic/claude-opus-4-6` enters at the top, gets prefix-detected to a `ProviderKind`, then `build_provider(&config)` returns an `Arc<dyn Provider>` configured with the right URL, auth, and model-prefix-strip rules. The Agent loop sees only the trait — wire-format differences (Anthropic SSE event types vs OpenAI `data:` chunks vs Ollama NDJSON vs Gemini's nested `parts`) are normalized into a small `ProviderEvent` vocabulary, which `assemble.rs` then folds into `ContentBlock`s the agent persists.
+Every LLM call funnels through `crate::providers`. The layer's contract is one trait — `Provider` — that exposes a single `stream(StreamRequest) -> EventStream` method and a closed enum — `ProviderKind` — that catalogues the 25 supported backends. A model string like `claude-sonnet-4-6` or `openrouter/anthropic/claude-opus-4-6` enters at the top, gets prefix-detected to a `ProviderKind`, then `build_provider(&config)` returns an `Arc<dyn Provider>` configured with the right URL, auth, and model-prefix-strip rules. The Agent loop sees only the trait — wire-format differences (Anthropic SSE event types vs OpenAI `data:` chunks vs Ollama NDJSON vs Gemini's nested `parts`) are normalized into a small `ProviderEvent` vocabulary, which `assemble.rs` then folds into `ContentBlock`s the agent persists.
 
 This doc is the routing/dispatch layer. Each wire-format family has its own deep-dive manual:
 - [`provider-anthropic.md`](provider-anthropic.md) — Messages API SSE (3 variants: Anthropic, OllamaAnthropic, AzureAIFoundry)
-- [`provider-openai.md`](provider-openai.md) — Chat Completions SSE (9 variants: OpenAI, OpenRouter, AgenticPress, DashScope, ZAi, LMStudio, OpenAICompat, DeepSeek, ThaiLLM)
+- [`provider-openai.md`](provider-openai.md) — Chat Completions SSE (16 variants: OpenAI, OpenRouter, TokenRouter, DashScope, QwenCloud, ZAi, LMStudio, OpenAICompat, DeepSeek, ThaiLLM, Nvidia, Minimax, Moonshot, XAi, Groq, OpenCodeGo)
 - [`provider-responses.md`](provider-responses.md) — Responses API for codex/o-series (1 variant: OpenAIResponses)
 - [`provider-gemini.md`](provider-gemini.md) — Google generativelanguage SSE (1 variant: Gemini)
 - [`provider-ollama.md`](provider-ollama.md) — `/api/chat` NDJSON (2 variants: Ollama, OllamaCloud)
@@ -96,17 +96,19 @@ Cache fields are `Option` because only Anthropic reports them today. `Usage::acc
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
-    AgenticPress,
     Anthropic,
     AgentSdk,
     OpenAI,
     OpenAIResponses,
+    ChatGptCodex,
     OpenRouter,
+    TokenRouter,
     Gemini,
     Ollama,
     OllamaAnthropic,
     OllamaCloud,
     DashScope,
+    QwenCloud,
     ZAi,
     LMStudio,
     AzureAIFoundry,
@@ -115,10 +117,14 @@ pub enum ProviderKind {
     ThaiLLM,
     Nvidia,
     Minimax,
+    OpenCodeGo,
+    Moonshot,
+    XAi,
+    Groq,
 }
 ```
 
-19 variants. `ALL: &'static [Self]` lists them in display order for the Settings UI. Every helper method below (`name`, `default_model`, `endpoint_env`, `default_endpoint`, `endpoint_user_configurable`, `api_key_env`, `resolve_alias_for_provider`) is a `match` over the full enum — adding a variant means updating every method, and the compiler enforces it.
+25 variants. (`AgenticPress` was removed.) `ALL: &'static [Self]` lists them in display order for the Settings UI. Every helper method below (`name`, `default_model`, `endpoint_env`, `default_endpoint`, `endpoint_user_configurable`, `api_key_env`, `resolve_alias_for_provider`) is a `match` over the full enum — adding a variant means updating every method, and the compiler enforces it.
 
 ### Catalogue table
 
@@ -128,21 +134,25 @@ pub enum ProviderKind {
 | `AgentSdk` | subprocess | `agent/claude-sonnet-4-6` | `agent/` | (uses Claude Code auth) | — | — | no |
 | `AzureAIFoundry` | Anthropic Messages | `azure/<deployment>` | `azure/` | `AZURE_AI_FOUNDRY_API_KEY` | `AZURE_AI_FOUNDRY_ENDPOINT` | https://{resource}.services.ai.azure.com | yes |
 | `OllamaAnthropic` | Anthropic Messages | `oa/qwen3-coder` | `oa/` | none | `OLLAMA_BASE_URL` | http://localhost:11434 | yes |
-| `OpenAI` | OpenAI Chat | `gpt-4o` | `gpt-`/`o1-`/`o3-`/`o4-` | `OPENAI_API_KEY` | — | api.openai.com (fixed) | no |
+| `OpenAI` | OpenAI Chat | `gpt-4.1` | `gpt-`/`o1-`/`o3-`/`o4-` | `OPENAI_API_KEY` | — | api.openai.com (fixed) | no |
 | `OpenAIResponses` | OpenAI Responses | `codex/gpt-5.2-codex` | `codex/` (or contains `codex`) | `OPENAI_API_KEY` | — | api.openai.com (fixed) | no |
-| `AgenticPress` | OpenAI Chat | `ap/gemma4-12b` | `ap/` | `AGENTIC_PRESS_LLM_API_KEY` | — | llm.artech.cloud (fixed) | no |
-| `OpenRouter` | OpenAI Chat | `openrouter/anthropic/claude-sonnet-4-6` | `openrouter/` | `OPENROUTER_API_KEY` | — | openrouter.ai (fixed) | no |
-| `DashScope` | OpenAI Chat | `qwen-max` | `qwen`/`qwq-` | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | dashscope.aliyuncs.com/compatible-mode/v1 | no |
-| `QwenCloud` | OpenAI Chat | `qc/qwen-max` | `qc/` | `DASHSCOPE_API_KEY` | `QWENCLOUD_BASE_URL` | dashscope-intl.aliyuncs.com/compatible-mode/v1 | no |
-| `ChatGptCodex` | OpenAI Responses | `chatgpt-codex/gpt-5.4` | `chatgpt-codex/` (checked BEFORE `codex/`) | — (OAuth via Codex CLI auto-imported from `~/.codex/auth.json`) | — | chatgpt.com/backend-api/codex/responses (fixed, undocumented) | no |
-| `ZAi` | OpenAI Chat | `zai/glm-4.6` | `zai/` | `ZAI_API_KEY` | `ZAI_BASE_URL` | api.z.ai/api/coding/paas/v4 | no |
+| `ChatGptCodex` | OpenAI Responses | `chatgpt-codex/gpt-5.4` | `chatgpt-codex/` (checked BEFORE `codex/`) | — (OAuth via Codex CLI auto-imported from `~/.codex/auth.json`) | — | chatgpt.com/backend-api/codex/responses (fixed) | no |
+| `OpenRouter` | OpenAI Chat | `openrouter/qwen/qwen3.7-plus` | `openrouter/` | `OPENROUTER_API_KEY` | — | openrouter.ai (fixed) | no |
+| `TokenRouter` | OpenAI Chat | `tokenrouter/anthropic/claude-sonnet-4.5` | `tokenrouter/` | `TOKENROUTER_API_KEY` | `TOKENROUTER_BASE_URL` | tokenrouter.com (fixed) | no |
+| `DashScope` | OpenAI Chat | `dashscope/qwen3.7-max` | `dashscope/`/`qwen`/`qwq-` | `DASHSCOPE_API_KEY` | `DASHSCOPE_BASE_URL` | dashscope.aliyuncs.com/compatible-mode/v1 | no |
+| `QwenCloud` | OpenAI Chat | `qc/qwen-max` | `qc/` | `QWENCLOUD_API_KEY` | `QWENCLOUD_BASE_URL` | dashscope-intl.aliyuncs.com/compatible-mode/v1 | no |
+| `ZAi` | OpenAI Chat | `zai/glm-5.2` | `zai/` | `ZAI_API_KEY` | `ZAI_BASE_URL` | api.z.ai/api/coding/paas/v4 | no |
 | `LMStudio` | OpenAI Chat | `lmstudio/llama-3.2-3b-instruct` | `lmstudio/` | none | `LMSTUDIO_BASE_URL` | localhost:1234/v1 | yes |
 | `OpenAICompat` | OpenAI Chat | `oai/gpt-4o-mini` | `oai/` | `OPENAI_COMPAT_API_KEY` | `OPENAI_COMPAT_BASE_URL` | localhost:8000/v1 | yes |
 | `DeepSeek` | OpenAI Chat | `deepseek-v4-flash` | `deepseek-` | `DEEPSEEK_API_KEY` | `DEEPSEEK_BASE_URL` | api.deepseek.com/v1 | no |
 | `ThaiLLM` | OpenAI Chat | `thaillm/OpenThaiGPT-ThaiLLM-8B-Instruct-v7.2` | `thaillm/` | `THAILLM_API_KEY` | `THAILLM_BASE_URL` | thaillm.or.th/api/v1 | no |
 | `Nvidia` | OpenAI Chat | `nvidia/nvidia/nemotron-3-super-120b-a12b` | `nvidia/` | `NVIDIA_API_KEY` | `NVIDIA_BASE_URL` | integrate.api.nvidia.com/v1 | no |
-| `Minimax` | OpenAI Chat | `minimax/MiniMax-M2` | `minimax/` | `MINIMAX_API_KEY` | `MINIMAX_BASE_URL` | api.minimax.io/v1 | no |
-| `Gemini` | Google Gemini | `gemini-2.5-flash` | `gemini-`/`gemma-` | `GEMINI_API_KEY` | — | generativelanguage.googleapis.com (fixed) | no |
+| `Minimax` | OpenAI Chat | `minimax/MiniMax-M3` | `minimax/` | `MINIMAX_API_KEY` | `MINIMAX_BASE_URL` | api.minimax.io/v1 | no |
+| `Moonshot` | OpenAI Chat | `moonshot/kimi-k2.6` | `moonshot/` | `MOONSHOT_API_KEY` | `MOONSHOT_BASE_URL` | api.moonshot.ai/v1 | no |
+| `XAi` | OpenAI Chat | `xai/grok-4.3` | `xai/` | `XAI_API_KEY` | `XAI_BASE_URL` | api.x.ai/v1 | no |
+| `Groq` | OpenAI Chat | `groq/llama-3.3-70b-versatile` | `groq/` | `GROQ_API_KEY` | `GROQ_BASE_URL` | api.groq.com/openai/v1 | no |
+| `OpenCodeGo` | OpenAI Chat | `opencode-go/deepseek-v4-flash` | `opencode-go/` | `OPENCODE_GO_API_KEY` | `OPENCODE_GO_BASE_URL` | opencode.ai (fixed) | no |
+| `Gemini` | Google Gemini | `gemini-3.5-flash` | `gemini-`/`gemma-` | `GEMINI_API_KEY` | — | generativelanguage.googleapis.com (fixed) | no |
 | `Ollama` | Ollama NDJSON | `ollama/llama3.2` | `ollama/` | none | `OLLAMA_BASE_URL` | http://localhost:11434 | yes |
 | `OllamaCloud` | Ollama NDJSON | `ollama-cloud/deepseek-v4-flash` | `ollama-cloud/` | `OLLAMA_CLOUD_API_KEY` | — | ollama.com (fixed) | no |
 
@@ -156,7 +166,7 @@ pub enum ProviderKind {
 pub fn detect(model: &str) -> Option<Self> {
     let model = &Self::resolve_alias(model);
     if model.starts_with("openrouter/") { Some(Self::OpenRouter) }
-    else if model.starts_with("ap/") { Some(Self::AgenticPress) }
+    else if model.starts_with("tokenrouter/") { Some(Self::TokenRouter) }
     else if model.starts_with("agent/") { Some(Self::AgentSdk) }
     else if model.starts_with("claude-") { Some(Self::Anthropic) }
     else if model.starts_with("chatgpt-codex/") { Some(Self::ChatGptCodex) }  // BEFORE codex/
@@ -166,10 +176,17 @@ pub fn detect(model: &str) -> Option<Self> {
          || model.starts_with("o4-") { Some(Self::OpenAI) }
     else if model.starts_with("gemini-") || model.starts_with("gemma-") { Some(Self::Gemini) }
     else if model.starts_with("qc/") { Some(Self::QwenCloud) }
+    else if model.starts_with("dashscope/") { Some(Self::DashScope) }  // canonical, before bare qwen
     else if model.starts_with("qwen") || model.starts_with("qwq-") { Some(Self::DashScope) }
     else if model.starts_with("deepseek-") { Some(Self::DeepSeek) }
     else if model.starts_with("thaillm/") { Some(Self::ThaiLLM) }
     else if model.starts_with("zai/") { Some(Self::ZAi) }
+    else if model.starts_with("moonshot/") { Some(Self::Moonshot) }
+    else if model.starts_with("xai/") { Some(Self::XAi) }
+    else if model.starts_with("groq/") { Some(Self::Groq) }
+    else if model.starts_with("nvidia/") { Some(Self::Nvidia) }
+    else if model.starts_with("minimax/") { Some(Self::Minimax) }
+    else if model.starts_with("opencode-go/") { Some(Self::OpenCodeGo) }
     else if model.starts_with("oai/") { Some(Self::OpenAICompat) }
     else if model.starts_with("lmstudio/") { Some(Self::LMStudio) }
     else if model.starts_with("oa/") { Some(Self::OllamaAnthropic) }
@@ -210,11 +227,11 @@ Case-insensitive lookup; unknown input passes through with original casing intac
 
 Used by `SpawnTeammate` so `agent_def.model: sonnet` keeps the team on the project's chosen provider instead of surprise-switching. Returns `None` when the alias doesn't belong in the given provider's namespace:
 
-| Alias | Anthropic | Gemini | OpenRouter | AgenticPress | ThaiLLM | Other |
-|---|---|---|---|---|---|---|
-| `sonnet` | `claude-sonnet-4-6` | `None` | `openrouter/anthropic/claude-sonnet-4-6` | `ap/claude-sonnet-4-6` | `None` | `None` |
-| `flash` | `None` | `gemini-2.5-flash` | `openrouter/google/gemini-2.5-flash` | `ap/gemini-2.5-flash` | `None` | `None` |
-| `openthaigpt` | `None` | `None` | `None` | `None` | `thaillm/OpenThaiGPT-...` | `None` |
+| Alias | Anthropic | Gemini | OpenRouter | ThaiLLM | Other |
+|---|---|---|---|---|---|
+| `sonnet` | `claude-sonnet-4-6` | `None` | `openrouter/anthropic/claude-sonnet-4-6` | `None` | `None` |
+| `flash` | `None` | `gemini-2.5-flash` | `openrouter/google/gemini-2.5-flash` | `None` | `None` |
+| `openthaigpt` | `None` | `None` | `None` | `thaillm/OpenThaiGPT-...` | `None` |
 
 `None` = "not in my namespace; caller should fall back to default config rather than surprise-switch."
 
@@ -222,7 +239,7 @@ Used by `SpawnTeammate` so `agent_def.model: sonnet` keeps the team on the proje
 
 ## 4. `build_provider(&AppConfig) -> Result<Arc<dyn Provider>>` — the dispatch
 
-Lives in `repl.rs:1195` (NOT in `providers/mod.rs` — it depends on `AppConfig` which would create a cycle). Three-stage dispatch:
+Lives in `repl.rs` (NOT in `providers/mod.rs` — it depends on `AppConfig` which would create a cycle). Three-stage dispatch:
 
 ### Stage A: Gateway override (EE)
 
@@ -259,7 +276,7 @@ match kind {
     ProviderKind::OpenAI => OpenAIProvider::new(api_key),       // fixed URL
     ProviderKind::OpenAIResponses => OpenAIResponsesProvider::new(api_key),
     ProviderKind::Gemini => GeminiProvider::new(api_key),
-    ProviderKind::AgenticPress => OpenAIProvider with llm.artech.cloud + strip_prefix("ap/"),
+
     ProviderKind::OpenRouter => OpenAIProvider with openrouter.ai + strip_prefix("openrouter/"),
     ProviderKind::DashScope => OpenAIProvider with $DASHSCOPE_BASE_URL,
     ProviderKind::ZAi => OpenAIProvider with $ZAI_BASE_URL + strip_prefix("zai/"),
@@ -291,7 +308,7 @@ Used at REPL startup so a missing key doesn't crash the app.
 1. Try `build_provider(config)` with the user's configured model. Success → return.
 2. Walk a preference order:
    ```
-   Anthropic → OpenAI → AgenticPress → OpenRouter → Gemini → DashScope →
+   Anthropic → OpenAI → OpenRouter → Gemini → DashScope →
    ZAi → ThaiLLM → Ollama → OllamaAnthropic → OllamaCloud
    ```
    For each, swap `config.model = kind.default_model()` and try again. First success wins.
@@ -388,8 +405,8 @@ Some providers (notably Gemini, which echoes the `?key=...` query param into 4xx
 
 ```
 crates/core/src/providers/
-├── mod.rs (754 LOC)
-│   ├── ProviderKind                                   17 variants + ALL slice
+├── mod.rs (~1990 LOC)
+│   ├── ProviderKind                                   25 variants + ALL slice
 │   │   ├── name / default_model / api_key_env
 │   │   ├── endpoint_env / default_endpoint /
 │   │   │   endpoint_user_configurable
@@ -426,7 +443,7 @@ crates/core/src/repl.rs
 ## 10. Testing
 
 `providers::tests` — alias resolution + detect:
-- `resolve_alias_for_provider_stays_in_namespace` — sonnet on Anthropic stays `claude-sonnet-4-6`; sonnet on OpenRouter becomes `openrouter/anthropic/claude-sonnet-4-6`; sonnet on AgenticPress becomes `ap/claude-sonnet-4-6`; sonnet on Gemini/OpenAI/Ollama/DashScope/DeepSeek/ThaiLLM returns `None`.
+- `resolve_alias_for_provider_stays_in_namespace` — sonnet on Anthropic stays `claude-sonnet-4-6`; sonnet on OpenRouter becomes `openrouter/anthropic/claude-sonnet-4-6`; sonnet on Gemini/OpenAI/Ollama/DashScope/DeepSeek/ThaiLLM returns `None`.
 - `alias_lookup_is_case_insensitive_for_thaillm_and_anthropic` — `OpenThaiGPT`, `openthaigpt`, `OPENTHAIGPT`, `Sonnet`, `FLASH` all resolve; `Custom-Model-V2` passes through with original casing.
 - `alias_for_provider_only_resolves_within_correct_provider` — `openthaigpt` resolves only when current is `ThaiLLM`; `OpenThaiGPT` on Anthropic returns `None`.
 - `detect_thaillm_prefix_routes_to_thaillm_provider` — full round-trip + env var + endpoint + name.

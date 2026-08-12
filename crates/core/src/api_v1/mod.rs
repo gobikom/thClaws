@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::Router;
 
 pub mod agent;
+pub mod artifacts;
 pub mod callback;
 pub mod chat;
 pub mod deploy;
@@ -54,6 +55,19 @@ pub fn router() -> Router {
         .route("/v1/models", get(models::list_models))
         .route("/v1/chat/completions", post(chat::chat_completions))
         .route("/agent/run", post(agent::agent_run))
+        // Session artifacts (job-artifacts): frozen, hash-fixed outputs of a
+        // run + input placement for external orchestrators. Bearer-gated
+        // like the rest of /v1 — the whole point.
+        .route("/v1/sessions/{sid}/artifacts", get(artifacts::get_manifest))
+        .route(
+            "/v1/sessions/{sid}/artifacts/{aid}",
+            get(artifacts::get_artifact),
+        )
+        .route(
+            "/v1/inputs",
+            post(artifacts::post_inputs)
+                .layer(DefaultBodyLimit::max(artifacts::INPUTS_BODY_LIMIT_BYTES)),
+        )
         .route("/v1/agent/info", get(info::get_info))
         .route("/v1/restart", post(deploy::restart))
         // OAuth callback is intentionally public — the provider's
@@ -102,6 +116,38 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthOk {
             )
                 .into_response())
         }
+    }
+}
+
+/// Header-level Bearer check for surfaces OUTSIDE `/v1` that opt into the
+/// same token policy — Tier 1 of job-artifacts: `THCLAWS_SYNC_REQUIRE_AUTH=1`
+/// wraps `/workspace/sync/*` with this so an external orchestrator can use
+/// export/push holding only the API token, no tunnel/ForwardAuth needed.
+pub fn check_bearer_headers(headers: &axum::http::HeaderMap) -> Result<(), Response> {
+    let expected = match auth_token() {
+        AuthMode::Disabled => {
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                "sync auth required but THCLAWS_API_TOKEN is unset",
+            )
+                .into_response());
+        }
+        AuthMode::Bypass => return Ok(()),
+        AuthMode::Token(t) => t,
+    };
+    let header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let provided = header.strip_prefix("Bearer ").unwrap_or("");
+    if constant_time_eq(provided.as_bytes(), expected.as_bytes()) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(errors::OpenAiError::invalid_api_key()),
+        )
+            .into_response())
     }
 }
 

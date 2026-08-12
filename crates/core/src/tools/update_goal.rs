@@ -112,7 +112,10 @@ impl Tool for MarkGoalCompleteTool {
          Optionally include a `reason` summary surfaced to the user. \
          Ending the loop on insufficient evidence is the worst failure \
          mode — when uncertain, use RecordGoalProgress to checkpoint and \
-         keep working instead."
+         keep working instead. NOTE: if the goal was started with \
+         `--require <path>` artifacts, the engine verifies each one exists \
+         on disk and will REJECT this call (goal stays Active) until they \
+         all do — so make sure the real files are in place first."
     }
 
     fn input_schema(&self) -> Value {
@@ -143,6 +146,30 @@ impl Tool for MarkGoalCompleteTool {
             .and_then(Value::as_str)
             .map(|s| s.to_string());
         let now = require_active_goal()?;
+
+        // Engine-level completion gate. If the goal declared required
+        // artifacts (`/goal start ... --require <path>`), every one must
+        // exist on disk before we accept Complete. This is the hard
+        // backstop behind the agent's prompt-level "done" convention: a
+        // missing file is unfakeable, so the goal stays ACTIVE and the
+        // `--auto` loop keeps working (the hard cap still bounds it). The
+        // model cannot talk its way past this — it must actually produce
+        // the artifacts.
+        let missing = crate::goal_state::current()
+            .map(|g| g.missing_required_paths())
+            .unwrap_or_default();
+        if !missing.is_empty() {
+            return Ok(format!(
+                "NOT marked complete — the goal stays ACTIVE. {} required artifact(s) are \
+                 still missing on disk: {}. Produce every required path (e.g. stage the \
+                 preview / write the audit stamp), then call MarkGoalComplete again. This is \
+                 an engine check against the real filesystem, not a suggestion — it cannot be \
+                 skipped.",
+                missing.len(),
+                missing.join(", ")
+            ));
+        }
+
         let changed = crate::goal_state::apply(|g| {
             g.status = crate::goal_state::GoalStatus::Complete;
             g.last_audit = Some(audit.clone());
@@ -300,6 +327,41 @@ mod tests {
         assert!(g.completed_at.is_some());
         assert_eq!(g.last_message.as_deref(), Some("shipped"));
         assert!(g.last_audit.as_deref().unwrap().contains("verified"));
+        reset();
+    }
+
+    #[tokio::test]
+    async fn mark_complete_rejected_until_required_artifacts_exist() {
+        // Engine-level completion gate: a goal started with `--require`
+        // cannot be marked complete until every required file exists on
+        // disk — no matter what the audit string claims.
+        let _g = lock();
+        reset();
+        let dir = tempfile::tempdir().unwrap();
+        let stamp = dir.path().join("audit-pass");
+        let req = stamp.to_string_lossy().into_owned();
+        goal_state::set(Some(
+            GoalState::new("build feature".into(), None, None, false)
+                .with_require_paths(vec![req.clone()]),
+        ));
+
+        // Artifact absent → REFUSED, goal stays Active.
+        let r = MarkGoalCompleteTool
+            .call(json!({"audit": "I believe it is done"}))
+            .await
+            .unwrap();
+        assert!(r.contains("NOT marked complete"), "got: {r}");
+        assert!(r.contains(&req), "rejection names the missing path");
+        assert_eq!(goal_state::current().unwrap().status, GoalStatus::Active);
+
+        // Produce the artifact → now it is accepted.
+        std::fs::write(&stamp, b"audit-pass").unwrap();
+        let r2 = MarkGoalCompleteTool
+            .call(json!({"audit": "stamp now present"}))
+            .await
+            .unwrap();
+        assert!(r2.contains("complete"), "got: {r2}");
+        assert_eq!(goal_state::current().unwrap().status, GoalStatus::Complete);
         reset();
     }
 

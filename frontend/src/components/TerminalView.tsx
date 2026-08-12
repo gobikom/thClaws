@@ -3,6 +3,7 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import { send, subscribe } from "../hooks/useIPC";
+import { promptHistory, recordPrompt } from "../hooks/promptHistory";
 import { useTheme } from "../hooks/useTheme";
 import {
   SlashCommandPopup,
@@ -64,6 +65,26 @@ function b64decode(s: string): Uint8Array {
   return out;
 }
 
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // mirror ChatView / uploads.rs
+// A pasted text blob at/above this length is routed to an _uploads/ file (path
+// injected) instead of the composer/line — matches ChatView. ~2k chars.
+const PASTE_TO_FILE_THRESHOLD = 2000;
+
+/// Raw base64 of a file's bytes (strips the `data:<mime>;base64,` prefix the
+/// FileReader adds) — matches the `file_upload` IPC contract.
+function fileToBase64(file: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onerror = () => reject(new Error("read failed"));
+    r.onload = () => {
+      const s = String(r.result);
+      const comma = s.indexOf(",");
+      resolve(comma >= 0 ? s.slice(comma + 1) : s);
+    };
+    r.readAsDataURL(file);
+  });
+}
+
 export function TerminalView({ active, modalOpen }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -98,6 +119,36 @@ export function TerminalView({ active, modalOpen }: Props) {
   // Bridge React clicks back into the xterm closure where lineBuffer
   // lives. Set inside the mount effect; called from the popup's onSelect.
   const acceptSlashRef = useRef<(cmd: SlashCommandInfo) => void>(() => {});
+  // Bridge for injecting arbitrary text (a dropped file's path) into the live
+  // line buffer at the cursor — set inside the mount effect, called from the
+  // drag-drop `file_upload_result` handler.
+  const insertTextRef = useRef<(text: string) => void>(() => {});
+  // Write a dim one-line notice to the terminal (the terminal has no toast).
+  const noticeRef = useRef<(msg: string) => void>(() => {});
+  // IDs of our in-flight drag-drop uploads (Files tab shares the IPC).
+  const droppedUploadIds = useRef<Set<string>>(new Set());
+
+  // Save a dropped/pasted file to _uploads/ (backend file_upload IPC, works
+  // desktop + --serve) and, on the result, inject its path into the line
+  // buffer — so it feeds /summarize · /translate · /extract.
+  const uploadDroppedFile = async (file: File) => {
+    if (file.size > MAX_UPLOAD_BYTES) {
+      noticeRef.current(
+        `${file.name || "paste"} is ${(file.size / 1024 / 1024).toFixed(1)} MB (max ${MAX_UPLOAD_BYTES / 1024 / 1024} MB) — skipped`,
+      );
+      return;
+    }
+    let data: string;
+    try {
+      data = await fileToBase64(file);
+    } catch {
+      return;
+    }
+    const id = crypto.randomUUID();
+    droppedUploadIds.current.add(id);
+    const safeName = (file.name.split(/[/\\]/).pop() || "file").trim() || "file";
+    send({ type: "file_upload", id, path: `_uploads/${safeName}`, data });
+  };
 
   useEffect(() => {
     send({ type: "slash_commands_list" });
@@ -116,7 +167,9 @@ export function TerminalView({ active, modalOpen }: Props) {
 
     const term = new Terminal({
       fontFamily: "Menlo, Monaco, 'Courier New', monospace",
-      fontSize: 13,
+      // 12px below the `sm` breakpoint buys a few more columns on a
+      // phone (wrapped logs / code read better wide); 13px on desktop.
+      fontSize: window.innerWidth < 640 ? 12 : 13,
       cursorBlink: true,
       scrollback: 10000,
       theme: TERMINAL_PALETTES[themeModeRef.current],
@@ -157,12 +210,11 @@ export function TerminalView({ active, modalOpen }: Props) {
     // Reset to true on chat_done (next prompt is rendered) and on
     // local submit (line erased, no prompt visible until next turn).
     let promptShowing = false;
-    // Prompt-history ring for Up/Down arrow recall (bash-style). The
-    // array grows on every successful submit; `historyIndex === -1`
-    // means "not navigating — lineBuffer is the user's own typing".
-    // Anything else is an index into `history`, oldest at 0, newest
-    // at `history.length - 1`.
-    const history: string[] = [];
+    // Prompt-history ring for Up/Down arrow recall (bash-style), shared with
+    // the Chat tab and persisted across restarts (see hooks/promptHistory).
+    // `historyIndex === -1` means "not navigating — lineBuffer is the user's
+    // own typing"; anything else indexes `history`, oldest 0, newest last.
+    const history = promptHistory();
     let historyIndex = -1;
     // Snapshot of whatever the user had been typing before they
     // started pressing Up, so Down past the newest entry restores it
@@ -221,21 +273,37 @@ export function TerminalView({ active, modalOpen }: Props) {
     };
     acceptSlashRef.current = acceptSlashCommand;
 
-    // Record a successfully-submitted prompt in the recall ring.
-    // Skips exact duplicates of the most recent entry (Ctrl+↑ in bash
-    // etc. — no value in cycling through "ls ls ls"). Also resets the
-    // navigation cursor so the next Up arrow starts from the newest.
-    const HISTORY_MAX = 200;
-    const pushHistory = (entry: string) => {
-      const trimmed = entry.trim();
-      if (trimmed.length === 0) return;
-      if (history.length > 0 && history[history.length - 1] === trimmed) {
-        historyIndex = -1;
-        savedDraft = "";
-        return;
+    // Insert arbitrary text (a dropped file's path) at the cursor, exactly as
+    // if typed — redraws the line + reopens the slash popup if relevant.
+    insertTextRef.current = (text: string) => {
+      // Leading-space guard: don't fuse the path onto the preceding token
+      // (typing `/summarize` then dropping must not yield `/summarize_uploads/x`).
+      const sep = cursorPos > 0 && lineBuffer[cursorPos - 1] !== " " ? " " : "";
+      const ins = sep + text;
+      lineBuffer = lineBuffer.slice(0, cursorPos) + ins + lineBuffer.slice(cursorPos);
+      cursorPos += ins.length;
+      // Only repaint when the input line is actually on screen — repainting
+      // mid-stream (promptShowing=false) would clobber the streaming output;
+      // the buffer is still updated and renders on the next prompt/keystroke.
+      if (promptShowing) {
+        redrawLine();
+        recomputeSlash();
       }
-      history.push(trimmed);
-      if (history.length > HISTORY_MAX) history.shift();
+      term.focus();
+    };
+
+    // Dim one-line notice (no toast surface in the terminal). Redraws the
+    // input line after so the caret/prompt stays consistent.
+    noticeRef.current = (msg: string) => {
+      term.write(`\r\n\x1b[2m${msg}\x1b[0m\r\n`);
+      if (promptShowing) redrawLine();
+    };
+
+    // Record a successfully-submitted prompt in the shared recall ring
+    // (trim + consecutive-dup collapse + persistence live in recordPrompt),
+    // then reset the navigation cursor so the next Up starts from the newest.
+    const pushHistory = (entry: string) => {
+      recordPrompt(entry);
       historyIndex = -1;
       savedDraft = "";
     };
@@ -292,6 +360,19 @@ export function TerminalView({ active, modalOpen }: Props) {
     term.attachCustomKeyEventHandler((e: KeyboardEvent) => {
       const isMac = navigator.platform.startsWith("Mac");
       const mod = isMac ? e.metaKey : e.ctrlKey && e.shiftKey;
+      // Browser-mode (--serve): navigator.clipboard reaches the user's real
+      // clipboard; in wry desktop it's blocked so copy/paste route via IPC.
+      const inBrowserMode =
+        typeof window !== "undefined" && !window.ipc && !!navigator.clipboard;
+      const copyToClipboard = (text: string) => {
+        if (inBrowserMode) {
+          navigator.clipboard.writeText(text).catch((err) => {
+            console.warn("[clipboard] writeText failed:", err);
+          });
+        } else {
+          send({ type: "clipboard_write", text });
+        }
+      };
 
       // Slash-command popup: when open, intercept navigation/accept/
       // dismiss keys so xterm doesn't also process them as input. Only
@@ -323,6 +404,7 @@ export function TerminalView({ active, modalOpen }: Props) {
             term.write("\x1b[2K\r");
             writePrompt();
             lineBuffer = "";
+            cursorPos = 0;
             recomputeSlash();
             return false;
           }
@@ -383,6 +465,16 @@ export function TerminalView({ active, modalOpen }: Props) {
         e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey &&
         (e.key === "c" || e.key === "C")
       ) {
+        // Smart Ctrl+C (Windows-Terminal / VS-Code style): when text is
+        // selected, copy it instead of interrupting. Only with an empty
+        // selection does Ctrl+C fall through to cancelling the turn — so a
+        // plain Ctrl+C still stops the agent, but Ctrl+C over a selection
+        // copies (matching Cmd+C on Mac and Ctrl+Shift+C elsewhere).
+        const sel = term.getSelection();
+        if (sel) {
+          copyToClipboard(sel);
+          return false;
+        }
         if (lineBuffer.length > 0) {
           term.write("\x1b[2K\r");
           lineBuffer = "";
@@ -411,15 +503,16 @@ export function TerminalView({ active, modalOpen }: Props) {
       // Apply pasted text to the line buffer. Shared between the IPC
       // (wry desktop) and navigator.clipboard (browser --serve) paths
       // so both produce identical line-buffer / multi-line behaviour.
-      const MAX_PASTE_BYTES = 1 * 1024 * 1024;
       const applyPastedText = (text: string) => {
-        if (text.length > MAX_PASTE_BYTES) {
-          console.warn(
-            `[paste] clipboard too large (${text.length} bytes); ignoring`,
-          );
+        if (text.length === 0) return;
+        // Large paste → save to _uploads/ and inject the path (overrides the
+        // multi-line auto-submit), so a pasted article / log feeds /summarize ·
+        // /translate · /extract without bloating the prompt. Same threshold +
+        // backend as ChatView / drag-drop; uploadDroppedFile caps at 25 MB.
+        if (text.length >= PASTE_TO_FILE_THRESHOLD) {
+          void uploadDroppedFile(new File([text], "pasted.txt", { type: "text/plain" }));
           return;
         }
-        if (text.length === 0) return;
         if (/\r?\n/.test(text)) {
           // Multi-line paste: submit the whole thing as ONE shell_input.
           // Erase any local echo; the backend's UserPrompt event will
@@ -446,26 +539,12 @@ export function TerminalView({ active, modalOpen }: Props) {
         }
       };
 
-      // Browser-mode detection — true under `--serve` in a real browser
-      // (no wry IPC bridge). In that mode arboard on the SERVER would
-      // touch the wrong machine's clipboard; navigator.clipboard goes
-      // to the user's actual clipboard. In wry desktop mode `window.ipc`
-      // is present and navigator.clipboard is blocked, so we keep the
-      // existing arboard-via-IPC path. Fixes #96.
-      const inBrowserMode =
-        typeof window !== "undefined" && !window.ipc && !!navigator.clipboard;
-
-      // Copy
+      // Copy — Cmd+C (Mac) / Ctrl+Shift+C (Linux/Win). Plain Ctrl+C is
+      // handled above (copy-if-selection, else cancel).
       if (mod && e.key === "c" && e.type === "keydown") {
         const sel = term.getSelection();
         if (sel) {
-          if (inBrowserMode) {
-            navigator.clipboard.writeText(sel).catch((err) => {
-              console.warn("[clipboard] writeText failed:", err);
-            });
-          } else {
-            send({ type: "clipboard_write", text: sel });
-          }
+          copyToClipboard(sel);
           return false;
         }
         if (!isMac) return false;
@@ -490,7 +569,11 @@ export function TerminalView({ active, modalOpen }: Props) {
           if (msg.type === "clipboard_text") {
             unsub();
             if (!msg.ok) return;
-            const MAX_PASTE_B64 = Math.ceil((MAX_PASTE_BYTES * 4) / 3);
+            // Cap on the upload ceiling (not the old 1 MB), so a desktop paste
+            // of 1–25 MB reaches applyPastedText and gets routed to a file
+            // instead of being silently dropped. >25 MB is skipped by
+            // uploadDroppedFile anyway.
+            const MAX_PASTE_B64 = Math.ceil((MAX_UPLOAD_BYTES * 4) / 3);
             let text = "";
             if (typeof msg.text_b64 === "string") {
               if (msg.text_b64.length > MAX_PASTE_B64) {
@@ -517,6 +600,16 @@ export function TerminalView({ active, modalOpen }: Props) {
     });
 
     term.onData((data) => {
+      // A single onData chunk at/above the paste threshold is a paste, not a
+      // keystroke — save it to _uploads/ and inject the path (same as Cmd+V /
+      // drag-drop) so a large right-click / middle-click / bracketed paste
+      // isn't submitted whole. Small multi-line pastes still fall through to
+      // the block-submit branch below. (applyPastedText lives in the keydown
+      // handler's scope, so we call uploadDroppedFile directly here.)
+      if (data.length >= PASTE_TO_FILE_THRESHOLD) {
+        void uploadDroppedFile(new File([data], "pasted.txt", { type: "text/plain" }));
+        return;
+      }
       // Up / Down arrows: walk through the prompt history just like
       // bash. xterm delivers arrow keys as the escape sequences below
       // in a single onData call, so matching the raw string is enough.
@@ -805,6 +898,7 @@ export function TerminalView({ active, modalOpen }: Props) {
         term.clear();
         writePrompt();
         lineBuffer = "";
+        cursorPos = 0;
         pendingAskId = null;
       } else if (
         msg.type === "terminal_history_replaced" &&
@@ -862,12 +956,39 @@ export function TerminalView({ active, modalOpen }: Props) {
     t.options.theme = TERMINAL_PALETTES[themeMode];
   }, [themeMode]);
 
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (msg.type !== "file_upload_result") return;
+      const rid = typeof msg.id === "string" ? (msg.id as string) : "";
+      if (!droppedUploadIds.current.has(rid)) return;
+      droppedUploadIds.current.delete(rid);
+      if (msg.ok && typeof msg.path === "string") {
+        insertTextRef.current(`${msg.path as string} `);
+      }
+    });
+    return unsub;
+  }, []);
+
   return (
     <div
       className="relative h-full w-full"
       style={{ background: "var(--terminal-bg)" }}
+      onDragOver={(e) => e.preventDefault()}
+      onDrop={(e) => {
+        e.preventDefault();
+        const files = e.dataTransfer?.files;
+        if (!files) return;
+        for (const f of Array.from(files)) void uploadDroppedFile(f);
+      }}
     >
-      <div ref={ref} className="h-full w-full p-1.5" />
+      {/* Explicit tap-to-focus so a touch reliably brings up the mobile
+          keyboard (and reinforces focus in the wry webview), matching
+          ShellTab. Focusing an already-focused terminal is a no-op. */}
+      <div
+        ref={ref}
+        className="h-full w-full p-1.5"
+        onClick={() => termRef.current?.focus()}
+      />
       {streaming && (
         // Floating Stop button overlay — sits top-right while the
         // agent is generating, fires shell_cancel on click. Mirrors

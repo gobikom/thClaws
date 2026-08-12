@@ -58,6 +58,12 @@ version, and enabled flag.
 
 ## Marketplace
 
+Plugins are one of the four types in the unified thClaws marketplace
+(skills · MCP · plugins · subagents — see
+[Chapter 12](ch12-skills.md)). In the GUI, **`/marketplace`** opens a
+browser modal with a **Plugins** tab; the text commands below work
+everywhere.
+
 `/plugin marketplace` browses the curated catalog at
 [`thClaws/marketplace`](https://github.com/thClaws/marketplace), same
 shape as the skill marketplace. Three discovery commands plus a

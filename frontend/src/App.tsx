@@ -1,10 +1,29 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Terminal, MessageSquare, FolderTree, Users, FolderOpen, Folder, Settings } from "lucide-react";
+import {
+  Terminal,
+  MessageSquare,
+  FolderTree,
+  Users,
+  FolderOpen,
+  Folder,
+  Settings,
+  Sparkles,
+  Layout,
+  Maximize2,
+  Globe,
+  Menu,
+} from "lucide-react";
 import { TerminalView } from "./components/TerminalView";
 import { ChatView } from "./components/ChatView";
 import { FilesView } from "./components/FilesView";
 import { TeamView } from "./components/TeamView";
+import { UITab } from "./components/UITab";
+import { ShellTab } from "./components/ShellTab";
+import { BrowserView } from "./components/BrowserView";
 import { LoginButton } from "./components/LoginButton";
+import { RunningChip } from "./components/RunningChip";
+import { useBusyState } from "./hooks/useBusyState";
+import { useTheme } from "./hooks/useTheme";
 import { Sidebar } from "./components/Sidebar";
 import { PlanSidebar } from "./components/PlanSidebar";
 import { GoalSidebar } from "./components/GoalSidebar";
@@ -26,12 +45,17 @@ import { InstructionsEditorModal } from "./components/InstructionsEditorModal";
 import { SecretsBackendDialog } from "./components/SecretsBackendDialog";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { ScheduleAddModal } from "./components/ScheduleAddModal";
-import { ModelPickerModal, type PickerModel } from "./components/ModelPickerModal";
+import { AgentEditorModal } from "./components/AgentEditorModal";
+import { MarketplaceModal } from "./components/MarketplaceModal";
+import {
+  ModelPickerModal,
+  type PickerModel,
+} from "./components/ModelPickerModal";
 import { ContextWarningBanner } from "./components/ContextWarningBanner";
 import { useEditingShortcuts } from "./hooks/useEditingShortcuts";
 import { send, subscribe } from "./hooks/useIPC";
 
-type Tab = "terminal" | "chat" | "files" | "team";
+type Tab = "terminal" | "chat" | "files" | "team" | "ui" | "shell" | "browser";
 
 // Fires `frontend_ready` once on mount. Mounted only after both
 // startup modals (working-directory + secrets-backend) dismiss, so
@@ -49,6 +73,16 @@ const ALL_TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
   { id: "terminal", label: "Terminal", icon: <Terminal size={14} /> },
   { id: "files", label: "Files", icon: <FolderTree size={14} /> },
   { id: "team", label: "Team", icon: <Users size={14} /> },
+  // dev-plan/33 Tier 2: GUI Shell picker (iframe-loaded installable
+  // domain frontends). Renamed from "Shell" → "UI" once the new
+  // PTY-backed Shell tab took the name.
+  { id: "ui", label: "UI", icon: <Sparkles size={14} /> },
+  // PTY-backed live shell. Spawns `$SHELL` (or fallback) and pipes
+  // stdio through xterm.js.
+  { id: "shell", label: "Shell", icon: <Layout size={14} /> },
+  // docs/browser Phase 1: status + activity for the engine-managed
+  // Playwright MCP browser. Shown only when `browserEnabled` is set.
+  { id: "browser", label: "Browser", icon: <Globe size={14} /> },
 ];
 
 // ── Startup modal ────────────────────────────────────────────────────
@@ -56,7 +90,98 @@ const ALL_TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
 // directory; on "Start" the backend sets cwd + re-inits sandbox, and
 // only then does the PTY spawn and the tabs become active.
 
-function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
+/**
+ * Host-owned escape hatch for full-screen UI mode. The host hides all
+ * its chrome in full-screen, so this guarantees the user can always
+ * get back out. It is deliberately NON-OCCLUDING:
+ *
+ *   - On entering full-screen, a brief auto-dismissing toast names the
+ *     keyboard escape (⌘⇧U / Ctrl⇧U) — discoverability without
+ *     permanently covering shell content.
+ *   - The clickable exit chip is hidden until the pointer enters the
+ *     top-right hot corner (like full-screen video controls), so it
+ *     never sits on top of the shell during normal use.
+ *   - If the shell declares it renders its own exit control
+ *     (`thclaws.ui.claimExitControl()` → `claimed`), the host chip is
+ *     suppressed entirely; the toast + keyboard escape remain as the
+ *     safety net.
+ *
+ * The keyboard escape lives in App's keydown handler and always works
+ * regardless of this component.
+ */
+function FullscreenExitChrome({
+  onExit,
+  claimed,
+}: {
+  onExit: () => void;
+  claimed: boolean;
+}) {
+  const isMac =
+    typeof navigator !== "undefined" && navigator.platform.startsWith("Mac");
+  const kbd = isMac ? "⌘⇧U" : "Ctrl⇧U";
+  // Toast shows on mount (= on entering full-screen) and fades after a
+  // few seconds.
+  const [toast, setToast] = useState(true);
+  // Chip only appears while the pointer is in the top-right hot corner.
+  const [nearCorner, setNearCorner] = useState(false);
+
+  useEffect(() => {
+    const t = setTimeout(() => setToast(false), 4000);
+    return () => clearTimeout(t);
+  }, []);
+
+  useEffect(() => {
+    if (claimed) return; // shell owns the control — no hot-corner chip
+    const onMove = (e: MouseEvent) => {
+      const inCorner = e.clientX >= window.innerWidth - 120 && e.clientY <= 120;
+      setNearCorner(inCorner);
+    };
+    window.addEventListener("mousemove", onMove);
+    return () => window.removeEventListener("mousemove", onMove);
+  }, [claimed]);
+
+  return (
+    <>
+      {toast && (
+        <div
+          className="fixed top-3 left-1/2 -translate-x-1/2 z-50 px-3 py-1.5 rounded-full text-[11px] font-medium pointer-events-none transition-opacity duration-500"
+          style={{
+            background: "var(--bg-secondary)",
+            color: "var(--text-secondary)",
+            border: "1px solid var(--border)",
+            backdropFilter: "blur(4px)",
+            boxShadow: "0 2px 8px rgba(0,0,0,0.18)",
+          }}
+        >
+          Press <span className="font-mono">{kbd}</span> to exit full screen
+        </div>
+      )}
+      {!claimed && (
+        <button
+          onClick={onExit}
+          title={`Exit full-screen UI (${kbd})`}
+          className="fixed top-2 right-2 z-50 px-2 py-1 rounded text-[10px] font-mono transition-opacity duration-200"
+          style={{
+            background: "var(--bg-secondary)",
+            color: "var(--text-secondary)",
+            border: "1px solid var(--border)",
+            backdropFilter: "blur(4px)",
+            opacity: nearCorner ? 1 : 0,
+            pointerEvents: nearCorner ? "auto" : "none",
+          }}
+        >
+          {kbd}
+        </button>
+      )}
+    </>
+  );
+}
+
+function StartupModal({
+  onStart,
+}: {
+  onStart: (cwd: string, initialTab?: Tab) => void;
+}) {
   const [cwd, setCwd] = useState("");
   const [error, setError] = useState("");
   const [showModal, setShowModal] = useState<boolean | null>(null);
@@ -78,8 +203,16 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
         if (Array.isArray(msg.recent_dirs)) {
           setRecentDirs(msg.recent_dirs as string[]);
         }
+        // Backend resolves guiShell.tabDefault to "ui" when set so the
+        // workspace lands on the GUI shell instead of always defaulting
+        // to Terminal. Pass through to onStart so App.tsx can seed
+        // useState<Tab> before the main UI mounts.
+        const initialTab =
+          typeof msg.initial_tab === "string"
+            ? (msg.initial_tab as Tab)
+            : undefined;
         if (msg.needs_modal === false) {
-          onStart(msg.path as string);
+          onStart(msg.path as string, initialTab);
         } else {
           setShowModal(true);
         }
@@ -144,7 +277,10 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
     return (
       <div
         className="fixed inset-0 flex items-center justify-center p-6"
-        style={{ background: "var(--bg-primary)", color: "var(--text-primary)" }}
+        style={{
+          background: "var(--bg-primary)",
+          color: "var(--text-primary)",
+        }}
       >
         <div
           className="rounded-lg shadow-2xl p-6 max-w-xl w-full"
@@ -156,11 +292,14 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
           <h2 className="text-sm font-semibold mb-3">
             thClaws couldn't reach its backend
           </h2>
-          <p className="text-xs mb-3" style={{ color: "var(--text-secondary)" }}>
-            The frontend loaded, but no reply came back from the Rust side
-            after 3 seconds. Usually means the WebView↔Rust IPC bridge
-            failed to initialise — common on older macOS x86 builds or
-            when a dependency is blocked by security software.
+          <p
+            className="text-xs mb-3"
+            style={{ color: "var(--text-secondary)" }}
+          >
+            The frontend loaded, but no reply came back from the Rust side after
+            3 seconds. Usually means the WebView↔Rust IPC bridge failed to
+            initialise — common on older macOS x86 builds or when a dependency
+            is blocked by security software.
           </p>
           <ul
             className="text-[11px] list-disc pl-5 space-y-1 mb-3"
@@ -173,12 +312,17 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
             <li>
               Platform: <code className="font-mono">{navigator.platform}</code>
             </li>
-            <li>UserAgent: <code className="font-mono">{navigator.userAgent.slice(0, 80)}…</code></li>
+            <li>
+              UserAgent:{" "}
+              <code className="font-mono">
+                {navigator.userAgent.slice(0, 80)}…
+              </code>
+            </li>
           </ul>
           <p className="text-[11px]" style={{ color: "var(--text-secondary)" }}>
-            Try running with <code className="font-mono">THCLAWS_DEVTOOLS=1 thclaws</code>,
-            then right-click → Inspect to see the console. File an issue
-            at{" "}
+            Try running with{" "}
+            <code className="font-mono">THCLAWS_DEVTOOLS=1 thclaws</code>, then
+            right-click → Inspect to see the console. File an issue at{" "}
             <code className="font-mono">github.com/thClaws/thClaws/issues</code>{" "}
             with the console output and these details.
           </p>
@@ -200,7 +344,10 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
     >
       <div
         className="rounded-lg shadow-2xl p-6 max-w-lg w-full mx-4"
-        style={{ background: "var(--bg-secondary)", border: "1px solid var(--border)" }}
+        style={{
+          background: "var(--bg-secondary)",
+          border: "1px solid var(--border)",
+        }}
       >
         <div className="flex items-center gap-2 mb-4">
           <FolderOpen size={20} style={{ color: "var(--accent)" }} />
@@ -211,10 +358,7 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
             Working Directory
           </h2>
         </div>
-        <p
-          className="text-xs mb-3"
-          style={{ color: "var(--text-secondary)" }}
-        >
+        <p className="text-xs mb-3" style={{ color: "var(--text-secondary)" }}>
           thClaws will operate inside this directory. All file tools are
           sandboxed to it. Change it now if needed.
         </p>
@@ -229,8 +373,13 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
               border: "1px solid var(--border)",
             }}
             value={cwd}
-            onChange={(e) => { setCwd(e.target.value); setError(""); }}
-            onKeyDown={(e) => { if (e.key === "Enter") handleStart(); }}
+            onChange={(e) => {
+              setCwd(e.target.value);
+              setError("");
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") handleStart();
+            }}
           />
           <button
             className="px-3 py-2 rounded text-xs font-medium shrink-0"
@@ -239,7 +388,10 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
               color: "var(--text-secondary)",
               border: "1px solid var(--border)",
             }}
-            onClick={() => { setPicking(true); send({ type: "pick_directory", start: cwd }); }}
+            onClick={() => {
+              setPicking(true);
+              send({ type: "pick_directory", start: cwd });
+            }}
             disabled={picking}
             title="Browse for directory"
           >
@@ -247,7 +399,10 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
           </button>
         </div>
         {error && (
-          <p className="text-xs mb-2" style={{ color: "var(--danger, #e06c75)" }}>
+          <p
+            className="text-xs mb-2"
+            style={{ color: "var(--danger, #e06c75)" }}
+          >
             {error}
           </p>
         )}
@@ -260,21 +415,26 @@ function StartupModal({ onStart }: { onStart: (cwd: string) => void }) {
               Recent
             </p>
             <div className="flex flex-col gap-1">
-              {recentDirs.filter((d) => d !== cwd).map((dir) => (
-                <button
-                  key={dir}
-                  className="text-left px-2.5 py-1.5 rounded text-xs font-mono truncate hover:brightness-125 transition-colors"
-                  style={{
-                    background: "var(--bg-tertiary)",
-                    color: "var(--text-primary)",
-                    border: "1px solid var(--border)",
-                  }}
-                  onClick={() => { setCwd(dir); setError(""); }}
-                  title={dir}
-                >
-                  {dir}
-                </button>
-              ))}
+              {recentDirs
+                .filter((d) => d !== cwd)
+                .map((dir) => (
+                  <button
+                    key={dir}
+                    className="text-left px-2.5 py-1.5 rounded text-xs font-mono truncate hover:brightness-125 transition-colors"
+                    style={{
+                      background: "var(--bg-tertiary)",
+                      color: "var(--text-primary)",
+                      border: "1px solid var(--border)",
+                    }}
+                    onClick={() => {
+                      setCwd(dir);
+                      setError("");
+                    }}
+                    title={dir}
+                  >
+                    {dir}
+                  </button>
+                ))}
             </div>
           </div>
         )}
@@ -304,6 +464,140 @@ export default function App() {
   // to paste.
   useEditingShortcuts();
 
+  // Lets a full-screen GUI shell flip the app theme from its own navbar
+  // (the host's theme switch is hidden in full-screen). Persists + syncs
+  // app-wide, same as Settings → Theme.
+  const { setMode } = useTheme();
+
+  // dev-plan/36 — auto-attach to the right session on tab open. Two
+  // cases, handled by a SINGLE auto-load that fires ONCE per mount:
+  //
+  //   1. Agent is currently busy → load the busy session so the chat
+  //      view streams the live `[i/N]` progress (the original
+  //      dev-plan/36 Tier 1 goal).
+  //   2. Agent is idle but the user previously worked on a session
+  //      (closed tab after a batch finished, came back to review) →
+  //      load the most-recent non-empty session so they land in
+  //      their work instead of a blank new turn.
+  //
+  // Loads go through the `session_load` IPC (same path the sidebar's
+  // click-to-load uses) so the engine swaps `state.session`, fires a
+  // `chat_history_replaced` event, and the chat view repaints.
+  // `shell_input "/load <id>"` would also work but races worker
+  // readiness; `session_load` is the proper typed handler.
+  const busyState = useBusyState();
+  const [knownSessions, setKnownSessions] = useState<
+    Array<{ id: string; messages: number; title?: string | null }>
+  >([]);
+  // Was the agent ALREADY busy when this surface opened? `gui_busy_result`
+  // is the reply to the query useBusyState fires on mount, so the first one
+  // is the authoritative snapshot for "state at open". `null` until it
+  // lands — busyState itself starts optimistically idle, which is not the
+  // same thing.
+  const busyAtOpenRef = useRef<boolean | null>(null);
+  // Session the worker considers current, from `sessions_list.current_id`.
+  const currentSessionIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    const unsub = subscribe((msg: any) => {
+      if (msg?.type === "initial_state" || msg?.type === "sessions_list") {
+        if (Array.isArray(msg.sessions)) setKnownSessions(msg.sessions);
+        // `current_id` is "" until a session is actually current — that
+        // is "unknown", not "some other session", and treating it as the
+        // latter is what made the guard below miss.
+        if (typeof msg.current_id === "string" && msg.current_id) {
+          currentSessionIdRef.current = msg.current_id;
+        }
+      }
+      if (msg?.type === "gui_busy_result" && busyAtOpenRef.current === null) {
+        busyAtOpenRef.current = !!msg.busy;
+      }
+    });
+    // useIPC opens the WS at module-load and fires frontend_ready in
+    // ws.onopen — both events can complete BEFORE this useEffect
+    // runs (App may re-render mid-flow via StartupModal). If the
+    // initial_state was already dispatched, our subscribe missed it
+    // and `knownSessions` stays empty forever. Re-fire frontend_ready
+    // here so the engine sends a fresh snapshot AFTER our subscribe
+    // is in place. The engine's handler is idempotent — just rebuilds
+    // the same snapshot from the current SessionStore.
+    send({ type: "frontend_ready" });
+    return unsub;
+  }, []);
+  const autoLoadedRef = useRef(false);
+  // Did a turn start while this surface was already open? Then the
+  // conversation on screen is ours and there is nothing to auto-resume
+  // into — see the note on case 1.
+  const sawOwnTurnRef = useRef(false);
+  if (busyState.busy && busyAtOpenRef.current === false) {
+    sawOwnTurnRef.current = true;
+  }
+  useEffect(() => {
+    if (autoLoadedRef.current) return;
+    // Case 1 — agent busy. Attach ONLY to a turn that was already running
+    // when this surface opened, or one running in a different session.
+    //
+    // A turn that starts while we're watching is our own: the transcript
+    // is live on screen and there is nothing to re-attach to. Loading it
+    // anyway makes the engine replay STORED history over the top, and the
+    // store holds only user/assistant/tool messages — so the streaming
+    // thinking block and the per-turn `[tokens: …]` footer of that turn
+    // were wiped the moment it finished. It looked like the usage footer
+    // had been dropped, but only ever on the FIRST message of a session
+    // (`autoLoadedRef` then disarms this for the rest of the mount).
+    if (busyState.busy && busyState.sessionId) {
+      if (busyAtOpenRef.current === null) return; // snapshot not in yet
+      const ourOwnTurn =
+        !busyAtOpenRef.current &&
+        (!currentSessionIdRef.current ||
+          currentSessionIdRef.current === busyState.sessionId);
+      if (ourOwnTurn) {
+        autoLoadedRef.current = true;
+        return;
+      }
+      autoLoadedRef.current = true;
+      send({ type: "session_load", id: busyState.sessionId });
+      return;
+    }
+    // Case 2 — pick the most recent non-empty session from the list.
+    // The engine sends sessions sorted most-recent-first (per
+    // SessionStore::list ordering). Skip empty ones so a freshly-
+    // spawned default session doesn't shadow a real prior session.
+    //
+    // Desktop is excluded: a fresh app launch should land on the clean
+    // session the worker just minted, NOT silently inherit the previous
+    // conversation's history (otherwise `session_load` runs the engine's
+    // LoadSession → agent.set_history(previous), and the agent answers
+    // "what were we talking about?" from the old chat even though the UI
+    // shows a new session). Case 1 still reconnects to an actively-busy
+    // agent. This auto-resume stays for the --serve/web surface, where
+    // reopening a browser tab reconnects to a still-running engine.
+    if (typeof window !== "undefined" && window.ipc) return;
+    // Auto-resume is a TAB-OPEN behaviour. Once the user has taken a turn
+    // here there is nothing to resume into, and the session list only
+    // reaches us AFTER that first turn is saved — so this used to fire
+    // right then, reloading the session we were already in. The reload
+    // repaints from stored history, which drops the turn's thinking block
+    // and its `[tokens: …]` footer: the reported "usage line disappears,
+    // but only on the first message".
+    if (sawOwnTurnRef.current) {
+      autoLoadedRef.current = true;
+      return;
+    }
+    if (!knownSessions.length) return;
+    const target = knownSessions.find((s) => (s.messages ?? 0) > 0);
+    if (!target) return;
+    // Already in it — a load would only cost us the live transcript.
+    if (
+      currentSessionIdRef.current &&
+      target.id === currentSessionIdRef.current
+    ) {
+      autoLoadedRef.current = true;
+      return;
+    }
+    autoLoadedRef.current = true;
+    send({ type: "session_load", id: target.id });
+  }, [busyState.busy, busyState.sessionId, knownSessions]);
+
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (!navigator.platform.startsWith("Mac")) return;
@@ -315,7 +609,8 @@ export default function App() {
       send({ type: "app_close" });
     };
     window.addEventListener("keydown", onKeyDown, { capture: true });
-    return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", onKeyDown, { capture: true });
   }, []);
 
   // Global "stop the agent" hotkey: Cmd+. on macOS, Ctrl+. elsewhere.
@@ -339,19 +634,98 @@ export default function App() {
       send({ type: "shell_cancel" });
     };
     window.addEventListener("keydown", onKeyDown, { capture: true });
-    return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
+    return () =>
+      window.removeEventListener("keydown", onKeyDown, { capture: true });
   }, []);
+
+  // ⌘⇧U / Ctrl⇧U — toggle full-screen UI tab. Mirrors the
+  // `--serve --gui-shell <id>` experience (chrome-free, just the
+  // shell) without restarting the server. Entering also forces the
+  // active tab to "ui" so the toggle is meaningful from any tab; the
+  // iframe stays mounted across the swap so the shell session
+  // doesn't reset.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const isMac = navigator.platform.startsWith("Mac");
+      const modOk = isMac
+        ? e.metaKey && !e.ctrlKey && !e.altKey && e.shiftKey
+        : e.ctrlKey && !e.metaKey && !e.altKey && e.shiftKey;
+      if (!modOk) return;
+      if (e.key.toLowerCase() !== "u") return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      setFullscreen((prev) => {
+        if (!prev) setActiveTab("ui");
+        return !prev;
+      });
+    };
+    // Iframe focus would swallow the hotkey before parent sees it —
+    // the gui-shell bridge re-emits matching ⌘⇧U presses as a
+    // postMessage so this handler runs regardless of where focus lives.
+    const onMessage = (e: MessageEvent) => {
+      const data = e.data;
+      if (!data || data.ns !== "thclaws-shell") return;
+      // Shell declared it provides its own exit control → suppress the
+      // host's fallback chip (toast + keyboard escape still apply).
+      if (data.type === "ui" && data.key === "exit-control-claimed") {
+        setExitControlClaimed(true);
+        return;
+      }
+      // Shell asked to switch the app theme (its navbar theme toggle).
+      if (data.type === "ui" && data.key === "set-theme") {
+        if (data.mode === "light" || data.mode === "dark") setMode(data.mode);
+        return;
+      }
+      if (data.type !== "hotkey") return;
+      // Explicit exit (shell's own exit button) vs toggle (⌘⇧U).
+      if (data.key === "exit-fullscreen-ui") {
+        setFullscreen(false);
+        return;
+      }
+      if (data.key !== "toggle-fullscreen-ui") return;
+      setFullscreen((prev) => {
+        if (!prev) setActiveTab("ui");
+        return !prev;
+      });
+    };
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+    window.addEventListener("message", onMessage);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown, { capture: true });
+      window.removeEventListener("message", onMessage);
+    };
+  }, [setMode]);
 
   const [started, setStarted] = useState(false);
   const [currentCwd, setCurrentCwd] = useState("");
-  const [activeTab, setActiveTab] = useState<Tab>("terminal");
+  // Default tab is chat; backend overrides via `initial_tab` on
+  // current_cwd when `guiShell.tabDefault` is set in settings.json so
+  // the workspace lands on the GUI shell instead.
+  const [activeTab, setActiveTab] = useState<Tab>("chat");
+  // Full-screen UI mode — hides tab strip, sidebar, status bar so the
+  // GUI shell fills the viewport (the cloud equivalent of running
+  // `thclaws --serve --gui-shell <id>`). Auto-enters when the backend
+  // signals an initial UI tab; toggle with ⌘⇧U / Ctrl⇧U.
+  const [fullscreen, setFullscreen] = useState(false);
+  // Set when the active GUI shell declares (via
+  // thclaws.ui.claimExitControl) that it renders its own exit control,
+  // so the host suppresses its fallback chip. Reset on leaving
+  // full-screen so a subsequent non-claiming shell gets the chip back.
+  const [exitControlClaimed, setExitControlClaimed] = useState(false);
+  // Drop the claim on leaving full-screen — the next shell (or the
+  // next full-screen session) must re-declare it. The reference shell
+  // re-claims in its `onFullscreen(active=true)` handler.
+  useEffect(() => {
+    if (!fullscreen) setExitControlClaimed(false);
+  }, [fullscreen]);
   const [showSettings, setShowSettings] = useState(false);
   const [showSettingsMenu, setShowSettingsMenu] = useState(false);
   const [showLineConnect, setShowLineConnect] = useState(false);
   const [showTelegramConnect, setShowTelegramConnect] = useState(false);
   const [showMessengerConnect, setShowMessengerConnect] = useState(false);
-  const [instructionsScope, setInstructionsScope] =
-    useState<"global" | "folder" | null>(null);
+  const [instructionsScope, setInstructionsScope] = useState<
+    "global" | "folder" | null
+  >(null);
   const closeInstructions = useCallback(() => setInstructionsScope(null), []);
 
   // M6.39.9: KMS browser + viewer state. `browsingKms` is the
@@ -383,7 +757,9 @@ export default function App() {
       if (msg.type !== "model_picker_open") return;
       const provider = typeof msg.provider === "string" ? msg.provider : "";
       const current = typeof msg.current === "string" ? msg.current : "";
-      const models = Array.isArray(msg.models) ? (msg.models as PickerModel[]) : [];
+      const models = Array.isArray(msg.models)
+        ? (msg.models as PickerModel[])
+        : [];
       if (provider && models.length > 0) {
         setModelPicker({ provider, current, models });
       }
@@ -393,8 +769,9 @@ export default function App() {
   // Secrets-backend gate: we ask once at first launch so the app
   // never touches the OS keychain behind the user's back. `null` ==
   // not picked yet → show the chooser before the main UI.
-  const [secretsBackend, setSecretsBackend] =
-    useState<"keychain" | "dotenv" | null>(null);
+  const [secretsBackend, setSecretsBackend] = useState<
+    "keychain" | "dotenv" | "hosted" | null
+  >(null);
   const [secretsBackendChecked, setSecretsBackendChecked] = useState(false);
   const settingsButtonRef = useRef<HTMLButtonElement | null>(null);
 
@@ -404,7 +781,9 @@ export default function App() {
       if (msg.type === "secrets_backend") {
         const value = (msg.backend as string | null) ?? null;
         setSecretsBackend(
-          value === "keychain" || value === "dotenv" ? value : null,
+          value === "keychain" || value === "dotenv" || value === "hosted"
+            ? value
+            : null,
         );
         setSecretsBackendChecked(true);
       }
@@ -413,7 +792,34 @@ export default function App() {
     return unsub;
   }, []);
 
+  // Desktop SSO sign-in button is gated by `ssoSignInEnabled` in
+  // .thclaws/settings.json (default false → hidden). Read-only; there's no GUI
+  // toggle while the sign-in feature is unfinished. Stays false until the
+  // backend answers, so the button never flashes on before the gate is known.
+  const [ssoSignInEnabled, setSsoSignInEnabled] = useState(false);
+  useEffect(() => {
+    const unsub = subscribe((msg) => {
+      if (msg.type === "sso_sign_in_enabled") {
+        setSsoSignInEnabled(msg.enabled === true);
+      }
+    });
+    send({ type: "sso_sign_in_enabled_get" });
+    return unsub;
+  }, []);
+
   const [teamEnabled, setTeamEnabled] = useState(false);
+  // Opt-in flag for the PTY-backed Shell tab. Default off — the tab
+  // gives the user an unsandboxed live shell with no agent-side
+  // permission gating, so it stays hidden until the project flips
+  // `shellTabEnabled: true` in .thclaws/settings.json.
+  const [shellTabEnabled, setShellTabEnabled] = useState(false);
+  // Engine-managed Playwright browser (docs/browser Phase 1). The tab
+  // only appears when `browserEnabled` is set in settings.json.
+  const [browserEnabled, setBrowserEnabled] = useState(false);
+  // Mobile-only: the sidebar is an off-canvas drawer below the `sm`
+  // breakpoint (toggled by the hamburger in the tab bar). On `sm:`+ it's
+  // the normal inline column, so this flag is ignored there.
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useEffect(() => {
     const unsub = subscribe((msg) => {
@@ -423,31 +829,83 @@ export default function App() {
       ) {
         setTeamEnabled(msg.enabled as boolean);
       } else if (
-        msg.type === "initial_state" &&
-        typeof msg.team_enabled === "boolean"
+        (msg.type === "shell_tab_enabled" ||
+          msg.type === "shell_tab_enabled_result") &&
+        typeof msg.enabled === "boolean"
       ) {
-        // #95(c): the explicit `team_enabled_get` below races the WS
-        // CONNECTING state on first mount in --serve mode — wsSend
-        // drops the message if the socket isn't OPEN yet. initial_state
-        // fires on every WS (re)connect from the backend, so picking it
-        // up here heals the Team-tab-hidden race without requiring the
-        // user to open Settings to incidentally re-trigger the get.
-        setTeamEnabled(msg.team_enabled as boolean);
+        setShellTabEnabled(msg.enabled as boolean);
+      } else if (
+        msg.type === "browser_status" &&
+        typeof msg.enabled === "boolean"
+      ) {
+        setBrowserEnabled(msg.enabled as boolean);
+      } else if (msg.type === "settings_changed") {
+        // Backend re-loaded .thclaws/settings.json (file watcher or
+        // explicit `settings_reload` IPC). Re-fetch every settings-
+        // derived flag so tab visibility + similar UI bits move
+        // without a page refresh. Cheap — the responses come back
+        // through this same subscribe above.
+        send({ type: "team_enabled_get" });
+        send({ type: "shell_tab_enabled_get" });
+        send({ type: "browser_status_get" });
+      } else if (msg.type === "initial_state") {
+        // #95(c) + #168: the explicit `*_get` requests below race the WS
+        // CONNECTING state on first mount in --serve mode — wsSend drops
+        // the message if the socket isn't OPEN yet (far more likely over
+        // a high-latency tunnel like ngrok, which hid these tabs there
+        // but not on localhost). initial_state fires on every WS
+        // (re)connect from the backend, so reading the tab-visibility
+        // flags here self-heals the Team/Shell/Browser tabs regardless
+        // of WS timing — no need to re-trigger the get via Settings.
+        if (typeof msg.team_enabled === "boolean") {
+          setTeamEnabled(msg.team_enabled as boolean);
+        }
+        if (typeof msg.shell_tab_enabled === "boolean") {
+          setShellTabEnabled(msg.shell_tab_enabled as boolean);
+        }
+        if (typeof msg.browser_enabled === "boolean") {
+          setBrowserEnabled(msg.browser_enabled as boolean);
+        }
       }
     });
     send({ type: "team_enabled_get" });
+    send({ type: "shell_tab_enabled_get" });
+    send({ type: "browser_status_get" });
     return unsub;
   }, []);
 
-  const modalOpen = showSettings || instructionsScope !== null || modelPicker !== null;
-  const effectiveTab = (!teamEnabled && activeTab === "team") ? "chat" as Tab : activeTab;
+  const modalOpen =
+    showSettings || instructionsScope !== null || modelPicker !== null;
+  const effectiveTab =
+    !teamEnabled && activeTab === "team"
+      ? ("chat" as Tab)
+      : !shellTabEnabled && activeTab === "shell"
+        ? ("chat" as Tab)
+        : !browserEnabled && activeTab === "browser"
+          ? ("chat" as Tab)
+          : activeTab;
 
-  const TABS = teamEnabled ? ALL_TABS : ALL_TABS.filter((t) => t.id !== "team");
+  let TABS = teamEnabled ? ALL_TABS : ALL_TABS.filter((t) => t.id !== "team");
+  if (!shellTabEnabled) TABS = TABS.filter((t) => t.id !== "shell");
+  if (!browserEnabled) TABS = TABS.filter((t) => t.id !== "browser");
 
   if (!started) {
     return (
       <>
-        <StartupModal onStart={(cwd) => { setCurrentCwd(cwd); setStarted(true); }} />
+        <StartupModal
+          onStart={(cwd, initialTab) => {
+            setCurrentCwd(cwd);
+            if (initialTab) {
+              setActiveTab(initialTab);
+              // guiShell.tabDefault is pinned → enter full-screen UI
+              // automatically so the workspace opens like a dedicated
+              // gui-shell server (`thclaws --serve --gui-shell <id>`).
+              // Toggle off any time with ⌘⇧U / Ctrl⇧U.
+              if (initialTab === "ui") setFullscreen(true);
+            }
+            setStarted(true);
+          }}
+        />
         <ApprovalModal />
       </>
     );
@@ -468,55 +926,146 @@ export default function App() {
     );
   }
 
+  // Full-screen UI mode forces the UI tab regardless of which tab
+  // the user last had active — the whole point is to hide chrome and
+  // surface only the shell.
+  const renderTab = fullscreen ? "ui" : effectiveTab;
+
   return (
-    <div className="flex flex-col h-screen">
+    // h-[100dvh] (dynamic viewport height), not h-screen (100vh): on mobile
+    // Chrome/Safari 100vh is the *large* viewport (address bar hidden), so
+    // when the address bar is visible the container overshoots and the top
+    // tab bar / bottom input get clipped behind the browser chrome. dvh
+    // tracks the actual visible height as the bar shows/hides (issue #168;
+    // Chrome 108+ / Safari 15.4+ — all current mobile devices).
+    //
+    // `fixed inset-x-0 top-0`: anchor to the viewport top so a stray document
+    // scroll can't push the root off-screen. `overflow-clip` (NOT hidden):
+    // an `overflow:hidden` box is still PROGRAMMATICALLY scrollable, so a
+    // descendant `scrollIntoView` (the chat auto-scroll after a gui-shell tab
+    // swap) could scroll this container down by the tab-bar height — the tab
+    // bar then rendered above the viewport with an equal empty gap below
+    // (navbar "gone"). `clip` makes the box unscrollable, so nothing can shift.
+    <div className="fixed inset-x-0 top-0 flex flex-col h-[100dvh] overflow-clip">
       <FrontendReadyBeacon />
-      {/* Tab bar */}
-      <div
-        className="flex items-center gap-0 border-b select-none shrink-0"
-        style={{
-          background: "var(--bg-secondary)",
-          borderColor: "var(--border)",
-        }}
-      >
-        {TABS.map((tab) => (
+      {fullscreen && (
+        <FullscreenExitChrome
+          onExit={() => setFullscreen(false)}
+          claimed={exitControlClaimed}
+        />
+      )}
+      {/* Tab bar — hidden in full-screen UI mode */}
+      {!fullscreen && (
+        <div
+          className="flex items-center gap-0 border-b select-none shrink-0"
+          style={{
+            background: "var(--bg-secondary)",
+            borderColor: "var(--border)",
+          }}
+        >
+          {/* Hamburger — opens the sidebar drawer on mobile only. */}
           <button
-            key={tab.id}
-            onClick={() => {
-              setActiveTab(tab.id);
-              // M6.39.12: switching tabs closes both the KMS viewer
-              // pane and the KMS browser sidebar — the user is moving
-              // back to "real work" (chat / terminal / files / team)
-              // and the KMS browse session is implicitly done.
-              setViewerTarget(null);
-              setBrowsingKms(null);
-              setGraphKms(null);
-            }}
-            className="flex items-center gap-1.5 px-4 py-2 text-xs font-medium transition-colors"
-            style={{
-              color:
-                effectiveTab === tab.id
-                  ? "var(--text-primary)"
-                  : "var(--text-secondary)",
-              background:
-                effectiveTab === tab.id ? "var(--bg-primary)" : "transparent",
-              borderBottom:
-                effectiveTab === tab.id
-                  ? "2px solid var(--accent)"
-                  : "2px solid transparent",
-            }}
+            onClick={() => setSidebarOpen((v) => !v)}
+            className="sm:hidden flex items-center justify-center p-2 shrink-0"
+            title="Menu"
+            aria-label="Toggle sidebar"
+            style={{ color: "var(--text-secondary)" }}
           >
-            {tab.icon}
-            {tab.label}
+            <Menu size={18} />
           </button>
-        ))}
-        <div className="flex-1" />
-        <LoginButton />
-      </div>
+          {/* Tabs — horizontally scrollable when they don't fit (mobile);
+            labels collapse to icons below `sm`. */}
+          <div className="flex items-center overflow-x-auto no-scrollbar">
+            {TABS.map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => {
+                  setActiveTab(tab.id);
+                  // M6.39.12: switching tabs closes both the KMS viewer
+                  // pane and the KMS browser sidebar — the user is moving
+                  // back to "real work" (chat / terminal / files / team)
+                  // and the KMS browse session is implicitly done.
+                  setViewerTarget(null);
+                  setBrowsingKms(null);
+                  setGraphKms(null);
+                }}
+                className="flex items-center gap-1.5 px-3 sm:px-4 py-2.5 sm:py-2 text-xs font-medium transition-colors shrink-0"
+                style={{
+                  color:
+                    effectiveTab === tab.id
+                      ? "var(--text-primary)"
+                      : "var(--text-secondary)",
+                  background:
+                    effectiveTab === tab.id
+                      ? "var(--bg-primary)"
+                      : "transparent",
+                  borderBottom:
+                    effectiveTab === tab.id
+                      ? "2px solid var(--accent)"
+                      : "2px solid transparent",
+                }}
+              >
+                {tab.icon}
+                <span className="hidden sm:inline">{tab.label}</span>
+              </button>
+            ))}
+          </div>
+          <div className="flex-1" />
+          <RunningChip />
+          <button
+            onClick={() => {
+              setActiveTab("ui");
+              setFullscreen(true);
+            }}
+            className="flex items-center justify-center p-2 sm:p-1.5 mr-1 rounded hover:opacity-100 transition-opacity"
+            title={`Full-screen UI (${navigator.platform.startsWith("Mac") ? "⌘⇧U" : "Ctrl⇧U"})`}
+            style={{ color: "var(--text-secondary)", opacity: 0.7 }}
+          >
+            <Maximize2 size={14} />
+          </button>
+          {/* Sign-in button gated by `ssoSignInEnabled` in settings.json (default
+            false) until the SSO feature is usable. Also stays hidden on any
+            cloud-hosted workspace (gateway OR BYOK): the engine returns
+            "hosted" from secrets_backend_get whenever THCLAWS_WORKSPACE_ID
+            (or THCLAWS_GATEWAY_API_KEY) is set, so the visitor is already
+            authenticated at the cloud-routing layer and a second SSO flow
+            inside the workspace is just noise. */}
+          {ssoSignInEnabled && secretsBackend !== "hosted" && <LoginButton />}
+        </div>
+      )}
 
       {/* Main content */}
       <div className="flex flex-1 min-h-0">
-        <Sidebar onBrowseKms={(name) => setBrowsingKms(name)} />
+        {!fullscreen && (
+          <>
+            {/* Drawer backdrop (mobile only) — tap to dismiss. */}
+            {sidebarOpen && (
+              <div
+                className="fixed inset-0 z-30 sm:hidden"
+                style={{ background: "rgba(0,0,0,0.45)" }}
+                onClick={() => setSidebarOpen(false)}
+              />
+            )}
+            {/* Sidebar: off-canvas slide-in drawer below `sm`, normal
+                inline column at `sm:`+. `flex` lets the inner Sidebar
+                stretch to full height inside the fixed drawer. */}
+            <div
+              className={
+                "flex z-40 max-sm:fixed max-sm:inset-y-0 max-sm:left-0 max-sm:shadow-2xl max-sm:transition-transform " +
+                (sidebarOpen
+                  ? "max-sm:translate-x-0"
+                  : "max-sm:-translate-x-full")
+              }
+            >
+              <Sidebar
+                onBrowseKms={(name) => {
+                  setBrowsingKms(name);
+                  setSidebarOpen(false);
+                }}
+              />
+            </div>
+          </>
+        )}
         <div className="flex-1 min-w-0 relative">
           {/* Keep every tab panel mounted AND full-sized via absolute+inset-0.
               Inactive panels get `invisible` + `pointer-events-none` so they
@@ -524,19 +1073,32 @@ export default function App() {
               `display: none` — which zeroes xterm's grid and kills focus,
               making the terminal un-typeable after a tab switch. */}
           {TABS.map(({ id }) => {
-            const isActive = effectiveTab === id;
+            const isActive = renderTab === id;
             // M6.39.9: when KMS viewer is open, hide tabs visually
             // (they stay mounted so xterm doesn't lose state) and
             // let the viewer's absolute-positioned pane cover them.
             const tabsHidden =
               !isActive || viewerTarget !== null || graphKms !== null;
-            const cls = `absolute inset-0 ${tabsHidden ? "invisible pointer-events-none" : ""}`;
+            // `tab-inactive` additionally display:none's media elements —
+            // WebKit's native <video>/<audio> controls (UA shadow DOM) set
+            // their own visibility and pierce the ancestor `invisible`,
+            // leaving a floating controls bar over other tabs (index.css).
+            const cls = `absolute inset-0 ${tabsHidden ? "invisible pointer-events-none tab-inactive" : ""}`;
             return (
               <div key={id} className={cls}>
-                {id === "terminal" && <TerminalView active={isActive} modalOpen={modalOpen} />}
-                {id === "chat" && <ChatView active={isActive} modalOpen={modalOpen} />}
+                {id === "terminal" && (
+                  <TerminalView active={isActive} modalOpen={modalOpen} />
+                )}
+                {id === "chat" && (
+                  <ChatView active={isActive} modalOpen={modalOpen} />
+                )}
                 {id === "files" && <FilesView active={isActive} />}
                 {id === "team" && <TeamView />}
+                {id === "ui" && (
+                  <UITab active={isActive} fullscreen={fullscreen} />
+                )}
+                {id === "shell" && <ShellTab active={isActive} />}
+                {id === "browser" && <BrowserView active={isActive} />}
               </div>
             );
           })}
@@ -625,75 +1187,75 @@ export default function App() {
         )}
       </div>
 
-      {/* Status bar */}
-      <div
-        className="flex items-center gap-2 px-3 py-1.5 shrink-0 select-none border-t"
-        style={{
-          background: "var(--bg-secondary)",
-          borderColor: "var(--border)",
-          color: "var(--text-secondary)",
-          fontSize: "12px",
-          lineHeight: "16px",
-        }}
-      >
-        <button
-          onClick={() => {
-            // Kill the current PTY so a fresh one spawns in the new dir.
-            send({ type: "pty_kill" });
-            setStarted(false);
-            setCurrentCwd("");
+      {/* Status bar — hidden in full-screen UI mode */}
+      {!fullscreen && (
+        <div
+          className="flex items-center gap-2 px-3 py-1.5 shrink-0 select-none border-t"
+          style={{
+            background: "var(--bg-secondary)",
+            borderColor: "var(--border)",
+            color: "var(--text-secondary)",
+            fontSize: "12px",
+            lineHeight: "16px",
           }}
-          className="p-1 rounded hover:bg-white/10 transition-colors"
-          title="Change working directory"
-          style={{ flexShrink: 0 }}
         >
-          <Folder size={14} style={{ opacity: 0.7 }} />
-        </button>
-        <span className="truncate font-mono" title={currentCwd}>
-          {currentCwd}
-        </span>
-        <div className="flex-1" />
-        <div className="relative" style={{ flexShrink: 0 }}>
           <button
-            ref={settingsButtonRef}
-            onClick={() => setShowSettingsMenu((v) => !v)}
-            className="p-1 rounded hover:bg-white/10 transition-colors"
-            title="Settings"
+            onClick={() => {
+              // Kill the current PTY so a fresh one spawns in the new dir.
+              send({ type: "pty_kill" });
+              setStarted(false);
+              setCurrentCwd("");
+            }}
+            className="p-2 sm:p-1 rounded hover:bg-white/10 transition-colors"
+            title="Change working directory"
+            style={{ flexShrink: 0 }}
           >
-            <Settings size={14} style={{ opacity: 0.7 }} />
+            <Folder size={14} style={{ opacity: 0.7 }} />
           </button>
-          {showSettingsMenu && (
-            <SettingsMenu
-              anchorRef={settingsButtonRef}
-              onClose={() => setShowSettingsMenu(false)}
-              onPick={(choice) => {
-                if (choice === "api-keys") setShowSettings(true);
-                else if (choice === "global-instructions") setInstructionsScope("global");
-                else if (choice === "folder-instructions") setInstructionsScope("folder");
-                else if (choice === "line-connect") setShowLineConnect(true);
-                else if (choice === "telegram-connect")
-                  setShowTelegramConnect(true);
-                else if (choice === "messenger-connect")
-                  setShowMessengerConnect(true);
-              }}
-            />
-          )}
+          <span className="truncate font-mono" title={currentCwd}>
+            {currentCwd}
+          </span>
+          <div className="flex-1" />
+          <div className="relative" style={{ flexShrink: 0 }}>
+            <button
+              ref={settingsButtonRef}
+              onClick={() => setShowSettingsMenu((v) => !v)}
+              className="p-2 sm:p-1 rounded hover:bg-white/10 transition-colors"
+              title="Settings"
+            >
+              <Settings size={14} style={{ opacity: 0.7 }} />
+            </button>
+            {showSettingsMenu && (
+              <SettingsMenu
+                anchorRef={settingsButtonRef}
+                onClose={() => setShowSettingsMenu(false)}
+                onPick={(choice) => {
+                  if (choice === "api-keys") setShowSettings(true);
+                  else if (choice === "global-instructions")
+                    setInstructionsScope("global");
+                  else if (choice === "folder-instructions")
+                    setInstructionsScope("folder");
+                  else if (choice === "line-connect") setShowLineConnect(true);
+                  else if (choice === "telegram-connect")
+                    setShowTelegramConnect(true);
+                  else if (choice === "messenger-connect")
+                    setShowMessengerConnect(true);
+                }}
+              />
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
       {showLineConnect && (
         <LineConnectModal onClose={() => setShowLineConnect(false)} />
       )}
       {showTelegramConnect && (
-        <TelegramConnectModal
-          onClose={() => setShowTelegramConnect(false)}
-        />
+        <TelegramConnectModal onClose={() => setShowTelegramConnect(false)} />
       )}
       {showMessengerConnect && (
-        <MessengerConnectModal
-          onClose={() => setShowMessengerConnect(false)}
-        />
+        <MessengerConnectModal onClose={() => setShowMessengerConnect(false)} />
       )}
       {instructionsScope && (
         <InstructionsEditorModal
@@ -703,6 +1265,8 @@ export default function App() {
       )}
       <ApprovalModal />
       <ScheduleAddModal />
+      <AgentEditorModal />
+      <MarketplaceModal />
       <ContextWarningBanner />
       {modelPicker && (
         <ModelPickerModal

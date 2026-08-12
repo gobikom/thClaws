@@ -39,7 +39,7 @@ WebKit2GTK on Linux).
 | **CPU** | any 64-bit x86_64 or ARM64 from the past ~10 years | modern multi-core |
 | **RAM** | 2 GB free | 8 GB total |
 | **Disk** | ~50 MB | SSD |
-| **Network** | required for cloud providers (Anthropic / OpenAI / Gemini / OpenRouter / Z.ai / DashScope / Agentic Press); optional if you only use local Ollama or LMStudio | broadband |
+| **Network** | required for cloud providers (Anthropic / OpenAI / Gemini / OpenRouter / Z.ai / DashScope); optional if you only use local Ollama or LMStudio | broadband |
 
 If you're using thClaws purely against cloud providers, any laptop
 bought in the past few years works comfortably. The heavy spec floor

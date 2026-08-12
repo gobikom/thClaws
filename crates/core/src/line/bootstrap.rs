@@ -16,6 +16,7 @@
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use crate::bridge::BridgeConfig;
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 

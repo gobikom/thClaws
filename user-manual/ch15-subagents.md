@@ -66,10 +66,44 @@ Frontmatter fields:
 | `model` | Model override for this agent |
 | `tools` | Comma-separated tool allowlist |
 | `disallowedTools` | Tool denylist |
+| `skills` | Comma-separated skill allowlist this agent may load/list/search (subset of the parent's). Empty = inherit all |
+| `mcp` | Comma-separated MCP **server** names this agent may use (subset). Empty = inherit all; otherwise MCP tools from other servers are dropped |
+| `writePaths` | Glob allowlist confining this agent's file writes (Write/Edit/office tools), e.g. `.thclaws/kms/**`. Empty = inherit. Mechanical write-scoping — a writer can't scribble outside its lane. Does **not** cover `Bash` |
+| `output_schema` | JSON Schema for the agent's output — single-line inline JSON, or a path (relative to the `.md`) to a `.json` file. A workflow `thclaws.subagent({agent})` call that omits a per-call `schema` validates against this (one source of truth instead of duplicating the schema in the workflow). See [ch25](ch25-workflows.md) |
+| `input_schema` | JSON Schema documenting the agent's expected input (same encoding as `output_schema`) — used by `thclaws agent validate` |
 | `permissionMode` | `auto` or `ask` (useful for "read-only" agents) |
 | `maxTurns` | Max iterations (default 200) |
 | `color` | Terminal colour for child output |
 | `isolation` | `worktree` — give this agent its own git worktree (teams only) |
+
+> **Scaffold, validate, run.** `thclaws agent new <dir> --pattern
+> static-pipeline|batch-fanout|dynamic` scaffolds a best-practice skeleton
+> (planner / worker / read-only verifier subagents + schemas + a workflow) that
+> validates green out of the box. `thclaws agent validate <dir>` then lints
+> offline — frontmatter parses, tool names known, `output_schema` /
+> `input_schema` valid, `writePaths` globs compile, `.thclaws/scripts/*.py`
+> compile, declared MCP/skills present, workflow avoids stripped globals, manifest
+> fuses. `thclaws agent run <dir> --args '{…}'` *runs* the agent's workflow
+> headlessly (Task + MCP wired) to behaviorally smoke-test it; `--dry-tools`
+> skips real generation. `thclaws agent pack <dir>` builds the publish tarball
+> (identical to what `/cloud publish` ships).
+
+### Authoring in the GUI — `/agent new` / `/agent edit`
+
+In the desktop GUI you don't have to hand-edit the `.md`. Two GUI-only
+commands open an editor modal with separate panes for the YAML
+frontmatter and the system prompt:
+
+- **`/agent new <name>`** — opens a starter template for a brand-new
+  agent.
+- **`/agent edit <name>`** — opens an existing agent (loaded from disk,
+  or reconstructed from a built-in like `translator`) for editing.
+
+Save writes a **project override** at `.thclaws/agents/<name>.md`. The
+new/edited def is immediately spawnable via `/agent <name>`; the
+model-driven `Task` tool picks it up on the next session. In the CLI
+these commands just point you at the file to edit by hand (there's no
+terminal modal).
 
 ## Invoking
 
@@ -95,16 +129,16 @@ In the desktop GUI, you can spawn a subagent **yourself** without going through 
 /agent translator แปลไฟล์ src/foo.md เป็นภาษาไทย
 ```
 
-The chat surface confirms: `✓ spawned background agent 'translator' (id: side-abc123)`. While the translator runs:
+The chat surface confirms: `✓ spawned background agent 'translator' (id: side-a1b2c3d4)` — the id is `side-` followed by the first 8 hex digits of a UUID. While the translator runs:
 
 - **Main agent keeps accepting input** — you can keep working with it. Side-channel agents run on their own tokio task, concurrent with main.
-- **Main's history is unaffected.** The prompt + result never enter the main conversation. The side-channel result lands as a separate bordered card in the chat surface (amber border = running, green = done, red = error).
+- **Main's history is unaffected.** The prompt + result never enter the main conversation. Progress shows in a separate **Background Agents** sidebar (green = running, grey = done, red = error), and a one-line system message lands in the chat when it finishes (`✓ /translator done in Ns …`).
 - **Cancel is independent.** Pressing the main agent's stop button does NOT kill side-channels. To cancel a side-channel use `/agent cancel <id>`.
 - **Permission requests stay distinguishable.** If the side-channel asks for `Bash` approval while main is also doing tool calls, the approval modal labels each request with its source ("translator (background) wants to run Bash" vs "Main wants to run Bash") so you don't accidentally approve the wrong one.
 
 ```
-/agents                    # list active background agents
-/agent cancel side-abc123  # signal cancel to a specific channel
+/agents                       # list active background agents
+/agent cancel side-a1b2c3d4   # signal cancel to a specific channel
 ```
 
 Side-channel agents share the same AgentDef registry — the named agents available via `Task` are the same ones available via `/agent`. Permissions, sandbox, MCP servers, and KMS access all behave identically.
@@ -128,8 +162,35 @@ The Task tool at depth 3 disables recursion to prevent runaway chains.
 ## Load order
 
 Built-in (binary) → `~/.config/thclaws/agents.json` → `~/.claude/agents/*.md` →
-`~/.config/thclaws/agents/*.md` → `.thclaws/agents/*.md`. Later wins
-by name.
+`~/.config/thclaws/agents/*.md` → `.claude/agents/*.md` →
+`.thclaws/agents/*.md`. Later wins by name.
+
+## Installing subagents from the marketplace
+
+Subagents are one of the four types in the thClaws marketplace (see
+[Chapter 12](ch12-skills.md)). A catalog subagent is packaged as a
+single `.md` (frontmatter + system prompt) and installed with the same
+commands as skills:
+
+```
+❯ /subagent marketplace            # list catalog subagents
+❯ /subagent search review          # search
+❯ /subagent info reviewer          # detail view
+❯ /subagent install reviewer       # install by catalog name
+```
+
+`/subagent install` accepts a catalog name, a git URL (with the
+`#<branch>:<path/to/agent.md>` subpath syntax), or a `.zip`. It lands
+the file at `.thclaws/agents/<name>.md` (project) by default, or
+`~/.config/thclaws/agents/` with `--user`. The name is taken from the
+file's frontmatter `name:` (or pass an override:
+`/subagent install <url> <name>`). `linked-only` entries point you at
+the upstream repo instead of installing.
+
+In the GUI, the **Subagents** tab of the `/marketplace` browser does
+the same with one click. A freshly installed subagent is spawnable via
+`/agent <name>` right away; the model-driven `Task` tool sees it on the
+next session.
 
 ## Built-in subagents
 
@@ -141,8 +202,14 @@ overrides the built-in.
 
 | Name | Default model | What it does |
 |---|---|---|
-| `dream` | `claude-opus-4-7` | Consolidate the project's KMS by mining recent sessions, deduping pages, surfacing insights. Invoked via the `/dream` slash command. See [Chapter 9](ch09-knowledge-bases-kms.md). |
-| `translator` | `gpt-4.1` | Translate text or files between languages while preserving structure (markdown headings, lists, code blocks, frontmatter). Invoked via `/agent translator <prompt>` or `Task(agent: "translator")`. |
+| `dream` | session model | Consolidate the project's KMS by mining recent sessions, deduping pages, surfacing insights. Invoked via the `/dream` slash command. See [Chapter 9](ch09-knowledge-bases-kms.md). |
+| `translator` | session model | Translate text or files between languages while preserving structure (markdown headings, lists, code blocks, frontmatter). Invoked via `/agent translator <prompt>` or `Task(agent: "translator")`. |
+| `kms-linker` | session model | Fix broken page links, refresh stale pages, and patch missing index entries in a KMS. Dispatched as a side-channel by `/kms wrap-up --fix`. |
+| `kms-reconcile` | session model | Find and resolve contradictions across KMS pages — rewrites outdated pages with History sections, flags ambiguous cases as Conflict pages. Dispatched by `/kms reconcile <name> [--apply]`. |
+
+Neither built-in pins a `model:` in its frontmatter — both inherit the
+session's active model so cross-provider users don't hit "model not
+found" errors. Override per-agent via `settings.json` (below).
 
 ### Override the model via `settings.json`
 
@@ -161,7 +228,7 @@ Resolution chain:
 
 1. Disk-resident `<scope>/.thclaws/agents/translator.md` — full override (replaces the entire AgentDef including instructions). Use this when you want to customize the prose, not just the model.
 2. `settings.json` field (e.g. `translator_subagent_model`) — model-only override that leaves the embedded body intact.
-3. Embedded built-in `model:` frontmatter — fallback when neither is configured.
+3. The session's active model — fallback when neither is configured (the embedded built-ins ship with no `model:` frontmatter).
 
 Each future built-in subagent that needs settings tunability gets its
 own field (`<name>_subagent_model`). Same per-agent named-field

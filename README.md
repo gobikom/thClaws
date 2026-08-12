@@ -15,7 +15,7 @@ A native-Rust AI agent workspace that codes, automates, remembers, and coordinat
 [![Platform](https://img.shields.io/badge/platform-macOS%20·%20Windows%20·%20Linux-lightgrey.svg)](#installation)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
 
-[Website](https://thclaws.ai) · [Download](https://thclaws.ai/downloads.html) · [Manual](https://thclaws.ai/manual) · [Discussions](https://github.com/thClaws/thClaws/discussions) · [Contribute](#contribute)
+[Website](https://thclaws.ai) · [Download](https://thclaws.ai/downloads.html) · [Manual](https://thclaws.ai/manual) · [Discussions](https://github.com/thClaws/thClaws/discussions) · [Contribute](#contribute) · [Supporters](SUPPORTERS.md)
 
 </div>
 
@@ -32,6 +32,32 @@ Three tabs, one binary — captured from a live thClaws session looking at its o
 **Files** (codemirror + tiptap)  ·  **Terminal** (REPL · slash commands · ANSI tool output)  ·  **Chat** (markdown render · tool indicators)
 
 </div>
+
+---
+
+## New in v0.61.0
+
+### 🎨 Media Studio — generate images & video, built in
+
+A point-and-click shell for the new media tools — **Text → Image**, **Image Edit**, **Text → Video**, and **Image → Video** — across Google Gemini, OpenAI `gpt-image-2`, Alibaba Qwen, Veo, and DashScope HappyHorse. Pick a provider/model, set the resolution, hit Generate; finished media lands in a live gallery you can click to reuse as the source for the next run. The same tools (`TextToImage` / `ImageToImage` / `TextToVideo` / `ImageToVideo` / `MediaJobStatus`) are callable by the agent from chat too — async video included.
+
+<div align="center">
+
+<a href="docs/img/media-studio.webp"><img src="docs/img/media-studio.webp" alt="thClaws Media Studio — text-to-image with a live gallery of generated media" width="860" /></a>
+
+</div>
+
+### 🧠 OpenRouter Fusion — many models, one answer
+
+`openrouter/fusion` fans your question out to a **panel** of up to 8 models in parallel (each can search the web), then a **judge** weighs the answers and synthesizes the consensus — multi-model deliberation packaged as a single model id. The new **`openrouter/fusion+`** makes it fully configurable right from the model picker: choose the panel, the judge, the per-model tool-call budget, temperature, reasoning effort, and tool-choice. A practical stand-in when the model you'd reach for isn't available on the platform.
+
+<div align="center">
+
+<a href="docs/img/fusion-config.webp"><img src="docs/img/fusion-config.webp" alt="thClaws — configuring the OpenRouter Fusion panel, judge, and limits" width="860" /></a>
+
+</div>
+
+Docs: [media tools](https://thclaws.ai/manual/ch11-built-in-tools.html) · [Media Studio](https://thclaws.ai/manual/ch26-gui-shells.html) · [Fusion setup](https://thclaws.ai/manual/ch06-providers-models-api-keys.html)
 
 ---
 
@@ -258,6 +284,12 @@ API keys are **never stored in config files** — only the OS keychain (default)
 - 💬 **[GitHub Discussions](https://github.com/thClaws/thClaws/discussions)** — questions, ideas, show-and-tell. The best place to start.
 - 🐛 **[Issues](https://github.com/thClaws/thClaws/issues)** — bug reports + concrete feature requests.
 - ✉️ **Email** — for security disclosures or commercial inquiries: [jimmy@thaigpt.com](mailto:jimmy@thaigpt.com) (see also [SECURITY.md](SECURITY.md)).
+
+---
+
+## Supporters
+
+In 2026 a mini fundraiser — selling of the e-book *Building thClaws* — helped fund this project. A huge thank-you to the **155 founding supporters** who backed it early: see the [**Supporters wall →**](SUPPORTERS.md). 🦞🙏
 
 ---
 

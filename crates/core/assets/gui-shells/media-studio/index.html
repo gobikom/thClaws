@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Media Studio</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <header class="bar">
+      <div class="title-row">
+        <span class="logo" aria-hidden="true">◈</span>
+        <h1>Media Studio</h1>
+        <span class="spacer"></span>
+        <span class="jobs-pill" id="jobs-pill" hidden></span>
+        <button id="exit-fullscreen" class="ghost-btn" title="Exit full screen (⌘⇧U)" hidden>⤢ Exit</button>
+      </div>
+      <nav class="modes" id="modes" role="tablist">
+        <button class="mode-tab active" data-mode="text2image" role="tab">Text → Image</button>
+        <button class="mode-tab" data-mode="image2image" role="tab">Image Edit</button>
+        <button class="mode-tab" data-mode="text2video" role="tab">Text → Video</button>
+        <button class="mode-tab" data-mode="image2video" role="tab">Image → Video</button>
+        <button class="mode-tab" data-mode="text2speech" role="tab">Text → Speech</button>
+      </nav>
+    </header>
+
+    <main class="layout">
+      <section class="panel" id="panel">
+        <label class="field">
+          <span class="label">Model</span>
+          <select id="model"></select>
+        </label>
+
+        <label class="field" id="input-path-field" hidden>
+          <span class="label">Source image</span>
+          <input id="input-path" type="text" autocomplete="off"
+                 placeholder="output/img-….png — or click an image below" />
+          <span class="sub">Click any image in the gallery to use it as the source.</span>
+        </label>
+
+        <div class="field">
+          <div class="label-row">
+            <span class="label" id="prompt-label">Prompt</span>
+            <button id="enhance" class="link-btn" type="button"
+                    title="Write an enhanced version below (⌘⇧E)">✦ Enhance</button>
+          </div>
+          <textarea id="prompt" rows="6" spellcheck="false"
+                    placeholder="Describe what to generate…"></textarea>
+        </div>
+
+        <div class="field" id="enhanced-field" hidden>
+          <div class="label-row">
+            <span class="label">Enhanced prompt</span>
+            <button id="clear-enhanced" class="link-btn" type="button"
+                    title="Discard this and generate from your own prompt">✕ Discard</button>
+          </div>
+          <textarea id="enhanced" rows="7" spellcheck="false"></textarea>
+          <span class="sub">Generate uses this while it has text — your prompt above is untouched.</span>
+        </div>
+
+        <div class="row" id="image-params">
+          <label class="field">
+            <span class="label">Aspect</span>
+            <select id="aspect">
+              <option value="16:9">16:9</option>
+              <option value="9:16">9:16</option>
+              <option value="1:1">1:1</option>
+              <option value="3:4">3:4</option>
+              <option value="4:3">4:3</option>
+            </select>
+          </label>
+
+          <label class="field" id="size-field">
+            <span class="label">Size</span>
+            <select id="size">
+              <option value="1K">1K</option>
+              <option value="512">512</option>
+              <option value="2K">2K</option>
+            </select>
+          </label>
+
+          <label class="field" id="duration-field" hidden>
+            <span class="label">Duration</span>
+            <select id="duration">
+              <option value="8">8s</option>
+              <option value="6">6s</option>
+              <option value="4">4s</option>
+            </select>
+          </label>
+
+          <label class="field" id="resolution-field" hidden>
+            <span class="label">Resolution</span>
+            <select id="resolution">
+              <option value="720P">720P</option>
+              <option value="1080P">1080P</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="row" id="speech-params" hidden>
+          <label class="field">
+            <span class="label">Voice</span>
+            <select id="voice">
+              <option value="Charon">Charon</option>
+              <option value="Kore">Kore</option>
+              <option value="Puck">Puck</option>
+              <option value="Aoede">Aoede</option>
+              <option value="Fenrir">Fenrir</option>
+              <option value="">Provider default</option>
+            </select>
+          </label>
+          <label class="field grow">
+            <span class="label">Delivery (optional)</span>
+            <input id="style" type="text" autocomplete="off"
+                   placeholder="e.g. Say warmly, like a friendly narrator" />
+          </label>
+        </div>
+
+        <button id="generate" class="generate">Generate</button>
+        <p class="status" id="status" role="status"></p>
+        <p class="hint" id="hint"></p>
+      </section>
+
+      <section class="gallery-wrap">
+        <div class="gallery-head">
+          <div class="filters" id="filters" role="tablist">
+            <button class="chip active" data-filter="all">All</button>
+            <button class="chip" data-filter="image">Images</button>
+            <button class="chip" data-filter="video">Video</button>
+            <button class="chip" data-filter="audio">Audio</button>
+          </div>
+          <span class="spacer"></span>
+          <input id="search" class="search" type="search" autocomplete="off" placeholder="Filter by name or prompt…" />
+          <button id="refresh" class="ghost-btn" title="Re-scan output/">↻</button>
+        </div>
+
+        <div class="jobs" id="jobs"></div>
+
+        <div class="gallery" id="gallery"></div>
+        <div class="empty" id="gallery-empty">
+          <p class="empty-title">Nothing here yet</p>
+          <p class="empty-sub">Generated media lands in <code>output/</code> and shows up here — including anything the agent made.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="lightbox" id="lightbox" hidden>
+    <button class="lightbox-nav prev" id="lightbox-prev" title="Previous (←)">‹</button>
+    <button class="lightbox-close" id="lightbox-close" title="Close (Esc)">✕</button>
+    <!-- Column stage: the media, then its own toolbar and prompt panel
+         BELOW it. Nothing overlays the media, so video controls stay
+         clickable, and the panel inherits the stage's width — which the
+         media sets. -->
+    <div class="lightbox-stage" id="lightbox-stage">
+      <div class="lightbox-body" id="lightbox-body"></div>
+      <div class="lightbox-bar">
+        <button class="ghost-btn" id="toggle-prompt" type="button">Show prompt</button>
+        <span class="lightbox-meta" id="lightbox-meta"></span>
+        <button class="ghost-btn" id="copy-path" title="Copy the workspace path">Copy path</button>
+      </div>
+      <div class="lightbox-caption" id="lightbox-caption" hidden></div>
+    </div>
+    <button class="lightbox-nav next" id="lightbox-next" title="Next (→)">›</button>
+  </div>
+
+  <div class="transport-badge" id="transport-badge"></div>
+  <script src="main.js"></script>
+</body>
+</html>

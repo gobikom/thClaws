@@ -1,0 +1,43 @@
+film "เช้าวันจันทร์" {
+    aspect: 16:9
+    style: naturalistic Thai drama, warm muted palette
+}
+
+char  $แอน   = @./anny.png  voice:th-female-warm  desc:"หญิงสาวผมยาว"
+char  $โทนี่  = @./tony.png  voice:th-male-low     desc:"ชายหนุ่มไว้เครา"
+scene $ห้อง   = @./room.png  time:day
+view  $ห้อง#หน้าต่าง = @./room_window.png
+view  $ห้อง#กำแพง   = @./room_wall.png
+prop  $โต๊ะ   = @./table.png
+music $เพลงเศร้า = @./sad_theme.mp3
+
+sequence "บทสนทนาที่ค้างคา" {
+    scene: $ห้อง
+    music: $เพลงเศร้า volume:0.5
+
+    shot 0 (establishing) {
+        ห้องนั่งเล่นยามเช้า แสงลอดผ่านหน้าต่าง
+        camera: slow push-in, wide
+        @duration: 4
+        @transition: cut
+    }
+
+    shot 1 (dialogue) {
+        scene: $ห้อง#หน้าต่าง
+        $แอน นั่งที่ $โต๊ะ ฉากหลังเป็นหน้าต่าง, $โทนี่ นั่งตรงข้าม ฉากหลังเป็นกำแพง
+        camera: two-shot, static
+        $แอน say "คุณหายไปไหนมาตั้งแต่เช้า"
+        @duration: 6
+    }
+
+    shot 2 (dialogue) {
+        scene: $ห้อง#กำแพง
+        close-up $โทนี่
+        expression: หงุดหงิด
+        $โทนี่ say "ไปทำงาน" แล้วลุกจากโต๊ะเดินออกจากเฟรม
+        camera: static
+        @continue_from: 1
+        @duration: 6
+        @transition: to_black 1.0
+    }
+}

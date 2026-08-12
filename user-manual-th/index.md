@@ -11,8 +11,8 @@ deploy โปรเจกต์จริง ไม่ว่าจะเป็น
 |---|---|
 | 1 | [thClaws คืออะไร?](ch01-what-is-thclaws.md) |
 | 2 | [การติดตั้ง](ch02-installation.md) |
-| 3 | [ทัวร์ Desktop GUI](ch04-desktop-gui-tour.md) |
-| 4 | [Working directory และโหมดการรัน](ch03-working-directory-and-modes.md) |
+| 3 | [Working directory และโหมดการรัน](ch03-working-directory-and-modes.md) |
+| 4 | [ทัวร์ Desktop GUI](ch04-desktop-gui-tour.md) |
 | 5 | [สิทธิ์การใช้งาน (Permissions)](ch05-permissions.md) |
 | 6 | [Provider, โมเดล และ API key](ch06-providers-models-api-keys.md) |
 | 7 | [Session](ch07-sessions.md) |
@@ -26,17 +26,30 @@ deploy โปรเจกต์จริง ไม่ว่าจะเป็น
 | 15 | [Subagent](ch15-subagents.md) |
 | 16 | [Plugin](ch16-plugins.md) |
 | 17 | [ทีมของ Agent](ch17-agent-teams.md) |
+| 18 | [Plan mode (โหมดวางแผน)](ch18-plan-mode.md) |
 | 19 | [การตั้งเวลา (Scheduling)](ch19-scheduling.md) |
 | 20 | [Background research (`/research`)](ch20-research.md) |
 | 21 | [LINE chat & web browser bridge](ch21-line-and-browser-chat.md) |
-| 22 | [Paperclip adapter](ch22-paperclip-adapter.md) |
+| 22 | [Paperclip adapter](ch22-paperclip-adapter.md) — *ยกเลิกแล้ว* |
 | 23 | [Telegram bot](ch23-telegram.md) |
 | 24 | [Facebook Page Messenger bot](ch24-messenger.md) |
+| 25 | [Workflows (`/workflow run`)](ch25-workflows.md) |
+| 26 | [GUI Shells](ch26-gui-shells.md) |
+| 27 | [thClaws.cloud (catalog + hosted + gateway)](ch27-thclaws-cloud.md) |
+| 28 | [Browser automation](ch28-browser-automation.md) |
+| 29 | [Movie Maker (สร้างหนัง AI จากบท)](ch29-movie-maker.md) |
+| 30 | [Job Artifacts (รับ-ส่งไฟล์สำหรับ orchestrator)](ch30-job-artifacts.md) |
 
-> **ส่วนที่ 2 — กรณีศึกษา (บทที่ 25–28)** — walkthrough สำหรับสร้าง
+> **ส่วนที่ 2 — กรณีศึกษา (บทที่ 29–31)** — walkthrough สำหรับสร้าง
 > โปรเจกต์จริงด้วย thClaws (เว็บ static, Node.js app, AI agent, การ
 > deploy ขึ้น Agentic Press) ยังอยู่ระหว่างพัฒนา จะถูกเพิ่มเข้ามาในคู่มือ
 > เมื่อรีวิวและพร้อมเผยแพร่ทีละบท
+
+## ภาคผนวก
+
+| # | ภาคผนวก |
+|---|---|
+| A | [Provider, โมเดล และราคา (thClaws.cloud gateway)](appendix-a-providers-models-prices.md) |
 
 ## ข้อกำหนดการเขียนที่ใช้ในคู่มือเล่มนี้
 

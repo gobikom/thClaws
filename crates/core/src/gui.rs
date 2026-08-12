@@ -17,8 +17,8 @@
 
 use crate::config::AppConfig;
 use crate::event_render::{
-    render_chat_dispatches, render_terminal_ansi, terminal_data_envelope,
-    terminal_history_replaced_envelope, TerminalRenderState,
+    render_chat_dispatches, render_gui_shell_dispatch, render_terminal_ansi,
+    terminal_data_envelope, terminal_history_replaced_envelope, TerminalRenderState,
 };
 use crate::session::SessionStore;
 use crate::shared_session::{SharedSessionHandle, ShellInput, ViewEvent};
@@ -80,6 +80,11 @@ enum UserEvent {
     SessionLoaded(String),
     FileContent(String),
     QuitRequested,
+    /// GUI `/reload`: persist the current window size (so the re-exec
+    /// restores it, not the last size saved on a normal close) then
+    /// re-exec the binary. Routed through the loop because the size
+    /// lives here, not in the shell dispatcher that runs `/reload`.
+    ReloadRequested,
     /// Settings → Appearance changed `guiScale`. Carries the new
     /// (clamped) factor so the event loop can apply it via
     /// `webview.zoom()` without re-reading config. Issue #47.
@@ -117,7 +122,19 @@ fn spawn_event_translator(handle: &SharedSessionHandle, proxy: EventLoopProxy<Us
                             let _ = proxy.send_event(UserEvent::QuitRequested);
                             continue;
                         }
+                        if matches!(ev, ViewEvent::ReloadRequested) {
+                            let _ = proxy.send_event(UserEvent::ReloadRequested);
+                            continue;
+                        }
                         for dispatch in render_chat_dispatches(&ev) {
+                            let _ = proxy.send_event(UserEvent::Dispatch(dispatch));
+                        }
+                        // dev-plan/33 Tier 1: also emit a gui_shell_event
+                        // for any active shell iframes. The shell shares
+                        // this session in Tier 1, so this is effectively
+                        // a third rendering of the same stream — Chat and
+                        // Terminal still get their events as before.
+                        if let Some(dispatch) = render_gui_shell_dispatch(&ev) {
                             let _ = proxy.send_event(UserEvent::Dispatch(dispatch));
                         }
                         if let Some(ansi) = render_terminal_ansi(&mut term_state, &ev) {
@@ -136,11 +153,12 @@ fn spawn_event_translator(handle: &SharedSessionHandle, proxy: EventLoopProxy<Us
                             let _ = proxy.send_event(UserEvent::Dispatch(envelope));
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Slow consumer dropped events; resync by replaying
-                        // a fresh "history replaced" with the agent's view
-                        // would need agent access — skip for now and hope
-                        // the next live event keeps state in sync.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Slow consumer dropped events; log the drop so it's
+                        // diagnosable (issue #163 Bug 1) — a full re-sync
+                        // would need agent access; the next live event keeps
+                        // state roughly in sync.
+                        eprintln!("[event_forwarder:gui] lagged: dropped {n} events");
                         continue;
                     }
                     Err(_) => break,
@@ -250,17 +268,18 @@ pub(crate) fn native_confirm(title: &str, message: &str, yes_label: &str, no_lab
 /// PowerShell `FolderBrowserDialog`) with the `rfd` crate, which calls
 /// the same OS APIs natively. Eliminates dependence on `osascript` /
 /// `zenity` being installed and PowerShell quote-escaping bugs.
-fn pick_directory_native(start_dir: &str) -> Option<String> {
+fn pick_directory_native(start_dir: &str, title: &str) -> Option<String> {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         FileDialog::new()
-            .set_title("Select working directory")
+            .set_title(title)
             .set_directory(start_dir)
             .pick_folder()
             .map(|p| p.to_string_lossy().into_owned())
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
+        let _ = title;
         None
     }
 }
@@ -270,13 +289,12 @@ fn pick_directory_native(start_dir: &str) -> Option<String> {
 // crate::shared_session::build_session_list (the worker-side variant
 // that includes current_id) is still consumed by the worker loop.
 
-// provider_has_credentials / kind_has_credentials / auto_fallback_model
-// moved to crate::providers in M6.36 SERVE9e so the WS transport can
-// share the same readiness logic. Re-import here to keep gui.rs's
-// existing call sites compiling unchanged.
-// kind_has_credentials migrated to handle_ipc; the SendInitialState
-// builder still uses auto_fallback_model + provider_has_credentials.
-use crate::providers::{auto_fallback_model, provider_has_credentials};
+// provider_has_credentials / kind_has_credentials moved to
+// crate::providers in M6.36 SERVE9e so the WS transport can share the
+// same readiness logic. Re-import here to keep gui.rs's existing call
+// sites compiling unchanged. kind_has_credentials migrated to
+// handle_ipc; the SendInitialState builder uses provider_has_credentials.
+use crate::providers::provider_has_credentials;
 
 /// Resolve the AGENTS.md path for the Settings → Instructions editor.
 /// `scope="global"` → `~/.config/thclaws/AGENTS.md`, `scope="folder"` →
@@ -311,6 +329,50 @@ pub(crate) fn clear_mcp_tool_counts() {
     if let Ok(mut map) = mcp_tool_counts().lock() {
         map.clear();
     }
+    if let Ok(mut map) = mcp_failures().lock() {
+        map.clear();
+    }
+}
+
+/// Why a configured MCP server isn't online, keyed by server name.
+/// `McpFailed` used to only print an error line into the transcript,
+/// which scrolls away — a Connectors surface has to be able to answer
+/// "this one is configured but not working, and here's why" at any
+/// later moment.
+static MCP_FAILURES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+fn mcp_failures() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    MCP_FAILURES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record why `server_name` failed to come online.
+pub(crate) fn record_mcp_failure(server_name: &str, error: &str) {
+    if let Ok(mut map) = mcp_failures().lock() {
+        map.insert(server_name.to_string(), error.to_string());
+    }
+}
+
+/// Forget a server's failure — it connected, or it was removed.
+pub(crate) fn clear_mcp_failure(server_name: &str) {
+    if let Ok(mut map) = mcp_failures().lock() {
+        map.remove(server_name);
+    }
+}
+
+/// Snapshot of `(name, error)` for every server currently in a failed
+/// state.
+pub(crate) fn mcp_failure_snapshot() -> std::collections::HashMap<String, String> {
+    mcp_failures().lock().map(|m| m.clone()).unwrap_or_default()
+}
+
+/// Snapshot of `(name, tool_count)` for every server that connected.
+pub(crate) fn mcp_tool_count_snapshot() -> std::collections::HashMap<String, usize> {
+    mcp_tool_counts()
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default()
 }
 
 /// Build the `[{name, tools}]` array that the sidebar consumes for
@@ -325,12 +387,22 @@ pub(crate) fn clear_mcp_tool_counts() {
 /// (`.thclaws/mcp.json` / `.mcp.json` / `.claude/mcp.json`) scopes
 /// per `AppConfig::load` — project overrides user by name. Both
 /// scopes flow through unchanged here.
+///
+/// Plugin-contributed servers are appended (config wins on a name
+/// clash), mirroring the merge the worker does before spawning. The
+/// worker has spawned them since the tool-parity fix, so omitting them
+/// here listed fewer servers than the session actually had running.
 pub(crate) fn build_mcp_servers_payload(
     config: &crate::config::AppConfig,
 ) -> Vec<serde_json::Value> {
     let counts = mcp_tool_counts().lock().unwrap_or_else(|e| e.into_inner());
-    config
-        .mcp_servers
+    let mut merged = config.mcp_servers.clone();
+    for p_mcp in crate::plugins::plugin_mcp_servers() {
+        if !merged.iter().any(|s| s.name == p_mcp.name) {
+            merged.push(p_mcp);
+        }
+    }
+    merged
         .iter()
         .map(|s| {
             let tool_count = counts.get(&s.name).copied().unwrap_or(0);
@@ -408,6 +480,118 @@ fn escape_for_js(s: &str) -> String {
         .replace('\u{2029}', "\\u2029")
 }
 
+/// Resolve a `/gui-shell/<id>/<rel>` request against the embedded
+/// registry and return the asset bytes (HTML responses get the bridge
+/// `<script>` injected). Used by the custom-protocol handler.
+fn serve_gui_shell_asset(
+    registry: &crate::gui_shell::ShellRegistry,
+    rest: &str,
+) -> Response<Cow<'static, [u8]>> {
+    // rest = "<id>/<path>", "<id>/" or "<id>". A bare id or trailing slash
+    // (empty asset path) defaults to index.html — mirrors the cloud `--serve`
+    // route, and is what the Windows desktop hits: the WebView runs from
+    // http://thclaws.localhost/, so UIView takes the http branch and emits
+    // `gui-shell/<id>/?session=…` with no explicit index.html (#183).
+    let decoded = urlencoding::decode(rest)
+        .map(|c| c.into_owned())
+        .unwrap_or_else(|_| rest.to_string());
+    let mut parts = decoded.splitn(2, '/');
+    let shell_id = parts.next().unwrap_or("");
+    let rel = match parts.next().unwrap_or("") {
+        "" => "index.html",
+        r => r,
+    };
+
+    let Some(shell) = registry.resolve(shell_id) else {
+        return Response::builder()
+            .status(404)
+            .body(Cow::Borrowed(&b"unknown shell"[..]))
+            .expect("build 404");
+    };
+
+    let (bytes, mime) = match shell.read_asset(rel) {
+        Ok(pair) => pair,
+        Err(_) => {
+            return Response::builder()
+                .status(404)
+                .body(Cow::Borrowed(&b"asset not found"[..]))
+                .expect("build 404");
+        }
+    };
+
+    let body: Cow<'static, [u8]> = if mime.starts_with("text/html") {
+        // Inline the bridge (don't `<script src="thclaws://…">` it): on Windows
+        // the WebView runs from http://thclaws.localhost/, where the `thclaws://`
+        // scheme doesn't resolve, so an external bridge script fails to load and
+        // `window.thclaws` is undefined — breaking every shell (empty model
+        // dropdowns, dead tabs; #184). Inlining works on macOS + Windows alike.
+        Cow::Owned(crate::gui_shell::serve::inject_inline_bridge_with_id(
+            &bytes, shell_id,
+        ))
+    } else {
+        Cow::Owned(bytes)
+    };
+
+    Response::builder()
+        .header("Content-Type", mime)
+        .header("X-Content-Type-Options", "nosniff")
+        .body(body)
+        .expect("build gui-shell asset response")
+}
+
+/// Inject `<script src="thclaws://localhost/gui-shell-bridge.js"></script>`
+/// at the start of `<head>`. Superseded by the inlining path
+/// (`gui_shell::serve::inject_inline_bridge_with_id`) which also works on the
+/// Windows http://thclaws.localhost/ WebView where `thclaws://` can't load
+/// (#184); kept for reference.
+#[allow(dead_code)]
+fn inject_bridge_script(html: &[u8]) -> Vec<u8> {
+    // Bridge (external, custom-protocol asset) + the shared theme/chrome
+    // runtime inlined right after it — same head injection in every serve
+    // path (Mode A here, Mode B/C in gui_shell::serve).
+    let mut tag: Vec<u8> =
+        b"<script src=\"thclaws://localhost/gui-shell-bridge.js\"></script>".to_vec();
+    tag.extend_from_slice(crate::gui_shell::shared_chrome_head().as_bytes());
+    let tag = tag.as_slice();
+    let lower = html.to_ascii_lowercase();
+    if let Some(idx) = find_subslice(&lower, b"<head>") {
+        let insert_at = idx + b"<head>".len();
+        let mut out = Vec::with_capacity(html.len() + tag.len());
+        out.extend_from_slice(&html[..insert_at]);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&html[insert_at..]);
+        out
+    } else if let Some(idx) = find_subslice(&lower, b"<head ") {
+        // Match `<head class="...">` etc. — insert after the closing >.
+        let after_open = html[idx..]
+            .iter()
+            .position(|&b| b == b'>')
+            .map(|p| idx + p + 1)
+            .unwrap_or(idx);
+        let mut out = Vec::with_capacity(html.len() + tag.len());
+        out.extend_from_slice(&html[..after_open]);
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&html[after_open..]);
+        out
+    } else {
+        // No head — prepend one. Wraps the bridge in <head> so a strict
+        // parser still treats the rest as body.
+        let mut out = Vec::with_capacity(html.len() + tag.len() + b"<head></head>".len());
+        out.extend_from_slice(b"<head>");
+        out.extend_from_slice(tag);
+        out.extend_from_slice(b"</head>");
+        out.extend_from_slice(html);
+        out
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 #[cfg(target_os = "macos")]
 fn is_macos_close_shortcut(event: &tao::event::KeyEvent, modifiers: ModifiersState) -> bool {
     if event.state != ElementState::Pressed || !modifiers.super_key() {
@@ -439,14 +623,11 @@ fn is_macos_close_shortcut(event: &tao::event::KeyEvent, modifiers: ModifiersSta
 // the always-on dispatch table.
 // build_all_models_payload migrated; request_all_models removed in SERVE9k.
 
-fn request_gui_shutdown(
-    shared: &SharedSessionHandle,
-    control_flow: &mut ControlFlow,
-    latest_window_size: Option<(f64, f64)>,
-) {
-    // Persist the latest window size so the next launch restores it.
-    // Only writes when the size actually changed from what's on disk —
-    // avoids a no-op rewrite that would touch the file's mtime.
+// Persist the latest window size so the next launch restores it. Only
+// writes when the size actually changed from what's on disk — avoids a
+// no-op rewrite that would touch the file's mtime. Shared by the normal
+// close path and `/reload` (which re-execs and must save first).
+fn persist_window_size(latest_window_size: Option<(f64, f64)>) {
     if let Some((w, h)) = latest_window_size {
         let mut project = crate::config::ProjectConfig::load().unwrap_or_default();
         if project.window_width != Some(w) || project.window_height != Some(h) {
@@ -455,11 +636,26 @@ fn request_gui_shutdown(
             let _ = project.save();
         }
     }
+}
+
+fn request_gui_shutdown(
+    shared: &SharedSessionHandle,
+    control_flow: &mut ControlFlow,
+    latest_window_size: Option<(f64, f64)>,
+) {
+    persist_window_size(latest_window_size);
     let _ = shared.input_tx.send(ShellInput::SaveAndQuit);
-    // Kill any spawned teammate processes.
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "team-agent"])
-        .status();
+    // Kill ONLY this session's teammate processes (scoped by absolute
+    // --team-dir). The old broad `pkill -f team-agent` killed teammates of
+    // other thClaws sessions/projects. Teammates run in tmux-server-owned
+    // panes, so they are NOT reclaimed when the GUI process exits — the
+    // explicit scoped kill is required.
+    crate::team::kill_my_teammates();
+    // Snapshot browser cookies and kill the engine-managed Chromium so
+    // it doesn't orphan — a surviving orphan breaks the next launch's
+    // playwright-mcp CDP attach ("Browser context management is not
+    // supported").
+    crate::browser_cdp::shutdown();
     *control_flow = ControlFlow::Exit;
 }
 
@@ -602,6 +798,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                 shared_for_serve,
                 pending_asks_for_serve,
                 ask_broadcast_for_serve,
+                None,
             )
             .await
             {
@@ -688,7 +885,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                             "type": "approval_request",
                             "id": req.id,
                             "tool_name": req.tool_name,
-                            "input": req.input,
+                            "input": crate::tool_display::redact_json_value(&req.input),
                             "summary": req.summary,
                             "originator": req.originator,
                         });
@@ -701,7 +898,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                     "type": "approval_request",
                     "id": req.id,
                     "tool_name": req.tool_name,
-                    "input": req.input,
+                    "input": crate::tool_display::redact_json_value(&req.input),
                     "summary": req.summary,
                     "originator": req.originator,
                 });
@@ -733,21 +930,73 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
 
     let builder = WebViewBuilder::new()
         .with_url(start_url)
-        .with_custom_protocol("thclaws".into(), |_webview_id, request| {
+        .with_custom_protocol("thclaws".into(), move |_webview_id, request| {
             // File-asset route: serves on-disk files so previewed HTML
             // can load its sibling CSS/JS with relative URLs. Example:
             // `thclaws://localhost/file-asset/Users/jimmy/site/index.html`
             // → reads `/Users/jimmy/site/index.html`. Every request is
             // validated through the sandbox before hitting disk.
             let req_path = request.uri().path();
+
+            // GUI Shell bridge runtime — served at a fixed path so every
+            // shell's injected <script src="…/gui-shell-bridge.js"> hits
+            // the same well-known URL regardless of which shell is loaded.
+            if req_path == "/gui-shell-bridge.js" {
+                return Response::builder()
+                    .header("Content-Type", "application/javascript; charset=utf-8")
+                    .body(Cow::Borrowed(crate::gui_shell::BRIDGE_RUNTIME.as_bytes()))
+                    .expect("build bridge-runtime response");
+            }
+
+            // GUI Shell asset route — `/gui-shell/<id>/<rel>`. Rebuild
+            // the registry per request so newly-installed agents and
+            // workspace cwd switches are picked up live (matches the
+            // fresh-scan the `gui_shell_list` IPC does — without this
+            // the picker would list a project shell that the protocol
+            // handler 404s, producing a blank iframe). Each shell load
+            // triggers a handful of asset requests, so the per-request
+            // FS scan stays well under the human-perceptible threshold.
+            if let Some(rest) = req_path.strip_prefix("/gui-shell/") {
+                let registry = crate::gui_shell::ShellRegistry::new();
+                return serve_gui_shell_asset(&registry, rest);
+            }
+
             if let Some(rest) = req_path.strip_prefix("/file-asset/") {
                 let decoded = urlencoding::decode(rest)
                     .map(|c| c.into_owned())
                     .unwrap_or_else(|_| rest.to_string());
-                let abs = format!("/{decoded}");
-                match crate::sandbox::Sandbox::check(&abs) {
-                    Ok(resolved) => match std::fs::read(&resolved) {
-                        Ok(bytes) => {
+                // Two URL shapes both reach this route — match the
+                // dual-path lookup in server.rs::serve_project_asset:
+                //   - FilesView builds absolute paths (`/Users/.../foo.png`);
+                //     the URL pathname strips the leading slash, so we
+                //     re-add it and try Sandbox::check (cwd-or-absolute).
+                //   - GUI shells (image-batch's Gallery, speech-studio,
+                //     video-studio) build workspace-relative paths
+                //     (`images/<slug>/<file>.png`); the absolute attempt
+                //     resolves to `/images/...` and 404s, so we fall back
+                //     to passing `decoded` directly and let Sandbox::check
+                //     join it with cwd.
+                //
+                // Cloud (`server.rs`) had this fallback since the early
+                // shells shipped; desktop was stuck on the absolute-only
+                // path, which is why image-generator's Gallery worked in
+                // hosted workspaces but rendered broken thumbnails in the
+                // desktop GUI.
+                let abs_first = format!("/{decoded}");
+                let resolved = crate::sandbox::Sandbox::check(&abs_first)
+                    .or_else(|_| crate::sandbox::Sandbox::check(&decoded));
+                // HTTP Range support — <video>/<audio> in shells stream large
+                // media (a chapter mp4 is tens of MB); without 206 responses
+                // the WebView pulls the whole file per request and playback
+                // stutters + seeking restarts the download.
+                let range_hdr = request
+                    .headers()
+                    .get("range")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                match resolved {
+                    Ok(resolved) => match crate::gui_shell::serve::read_asset_maybe_range(&resolved, range_hdr.as_deref()) {
+                        Ok((bytes, range_meta)) => {
                             let ext = resolved.extension()
                                 .and_then(|e| e.to_str())
                                 .unwrap_or("")
@@ -763,14 +1012,42 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                                 "gif" => "image/gif",
                                 "webp" => "image/webp",
                                 "ico" => "image/x-icon",
+                                // PDFs render in an <iframe src=/file-asset>;
+                                // the WebView only invokes its built-in PDF
+                                // viewer when the Content-Type is correct —
+                                // octet-stream gave a blank/black pane.
+                                "pdf" => "application/pdf",
+                                "epub" => "application/epub+zip",
                                 "woff" => "font/woff",
                                 "woff2" => "font/woff2",
                                 "ttf" => "font/ttf",
                                 "otf" => "font/otf",
+                                // Audio
+                                "mp3" => "audio/mpeg",
+                                "wav" => "audio/wav",
+                                "m4a" | "aac" => "audio/mp4",
+                                "ogg" | "oga" => "audio/ogg",
+                                "opus" => "audio/opus",
+                                "flac" => "audio/flac",
+                                "weba" => "audio/webm",
+                                // Video
+                                "mp4" | "m4v" => "video/mp4",
+                                "webm" => "video/webm",
+                                "mov" => "video/quicktime",
+                                "mkv" => "video/x-matroska",
+                                "ogv" => "video/ogg",
                                 _ => "application/octet-stream",
                             };
-                            return Response::builder()
+                            let mut rb = Response::builder()
                                 .header("Content-Type", mime)
+                                .header("Accept-Ranges", "bytes");
+                            if let Some((start, end, total)) = range_meta {
+                                rb = rb.status(206).header(
+                                    "Content-Range",
+                                    format!("bytes {start}-{end}/{total}"),
+                                );
+                            }
+                            return rb
                                 .body(Cow::Owned(bytes))
                                 .expect("build file-asset response");
                         }
@@ -830,6 +1107,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                 // the shared dispatch path today.
                 let on_zoom: crate::ipc::ZoomFn = Arc::new(|_scale: f64| {});
                 let ipc_ctx = crate::ipc::IpcContext {
+                    is_serve_mode: false,
                     shared: shared_for_ipc.clone(),
                     approver: approver_for_ipc.clone(),
                     pending_asks: pending_asks_for_ipc.clone(),
@@ -837,6 +1115,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                     on_quit,
                     on_send_initial_state,
                     on_zoom,
+                    workflow_approver: shared_for_ipc.workflow_approver.clone(),
                 };
                 if crate::ipc::handle_ipc(msg.clone(), &ipc_ctx) {
                     return;
@@ -886,7 +1165,7 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                         .unwrap_or_else(|| std::env::current_dir()
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_else(|_| ".".into()));
-                    let result = pick_directory_native(&start_dir);
+                    let result = pick_directory_native(&start_dir, "Select working directory");
                     let payload = match result {
                         Some(path) => serde_json::json!({
                             "type": "directory_picked",
@@ -900,6 +1179,117 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                     let _ = proxy_for_ipc.send_event(
                         UserEvent::SessionLoaded(payload.to_string()),
                     );
+                }
+                // OKF (Open Knowledge Format) import/export for a KMS,
+                // driven from the sidebar "Knowledge" header context menu.
+                // GUI-only: both open a native folder picker (rfd), so they
+                // can't live in the transport-agnostic handle_ipc path. The
+                // picker blocks the event loop the same way `pick_directory`
+                // above does.
+                "kms_export_okf" => {
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let start_dir = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".into());
+                    let payload = if name.is_empty() {
+                        serde_json::json!({
+                            "type": "kms_okf_result", "ok": false,
+                            "message": "Export failed: no KMS selected.",
+                        })
+                    } else {
+                        match pick_directory_native(
+                            &start_dir,
+                            &format!("Export '{name}' — choose a destination folder"),
+                        ) {
+                            None => serde_json::json!({
+                                "type": "kms_okf_result", "ok": false,
+                                "message": "Export cancelled.",
+                            }),
+                            Some(dir) => {
+                                let out = std::path::Path::new(&dir).join(format!("{name}-okf"));
+                                match crate::kms::export_okf(&name, &out) {
+                                    Ok(r) => serde_json::json!({
+                                        "type": "kms_okf_result", "ok": true,
+                                        "message": format!(
+                                            "Exported '{name}' → {} ({} page(s), {} reference(s)).",
+                                            r.out_dir.display(), r.pages, r.sources,
+                                        ),
+                                    }),
+                                    Err(e) => serde_json::json!({
+                                        "type": "kms_okf_result", "ok": false,
+                                        "message": format!("Export failed: {e}"),
+                                    }),
+                                }
+                            }
+                        }
+                    };
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::SessionLoaded(payload.to_string()));
+                }
+                "kms_import_okf" => {
+                    let name = msg
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    let scope = match msg.get("scope").and_then(|v| v.as_str()) {
+                        Some("project") => crate::kms::KmsScope::Project,
+                        _ => crate::kms::KmsScope::User,
+                    };
+                    let start_dir = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| ".".into());
+                    let mut imported = false;
+                    let payload = if name.is_empty() {
+                        serde_json::json!({
+                            "type": "kms_okf_result", "ok": false,
+                            "message": "Import failed: name the new KMS first.",
+                        })
+                    } else {
+                        match pick_directory_native(
+                            &start_dir,
+                            "Import OKF bundle — choose the bundle folder",
+                        ) {
+                            None => serde_json::json!({
+                                "type": "kms_okf_result", "ok": false,
+                                "message": "Import cancelled.",
+                            }),
+                            Some(dir) => match crate::kms::import_okf(
+                                std::path::Path::new(&dir),
+                                &name,
+                                scope,
+                            ) {
+                                Ok(r) => {
+                                    imported = true;
+                                    serde_json::json!({
+                                        "type": "kms_okf_result", "ok": true,
+                                        "message": format!(
+                                            "Imported OKF bundle → KMS '{name}' ({} page(s), {} source(s)). Tick it to attach.",
+                                            r.pages, r.sources,
+                                        ),
+                                    })
+                                }
+                                Err(e) => serde_json::json!({
+                                    "type": "kms_okf_result", "ok": false,
+                                    "message": format!("Import failed: {e}"),
+                                }),
+                            },
+                        }
+                    };
+                    let _ = proxy_for_ipc
+                        .send_event(UserEvent::SessionLoaded(payload.to_string()));
+                    if imported {
+                        // Refresh the sidebar's KMS list so the new one shows.
+                        let _ = proxy_for_ipc.send_event(UserEvent::SessionLoaded(
+                            crate::kms::build_update_payload().to_string(),
+                        ));
+                    }
                 }
                 "confirm" => {
                     // Native OS confirmation dialog. Frontend sends an
@@ -1015,6 +1405,36 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                             images: attachments,
                         });
                     } else if !trimmed.is_empty() {
+                        // dev-plan/32 Tier 3 Terminal-tab approval
+                        // intercept (mirrors crate::ipc::handle_ipc).
+                        // The worker loop is blocked on the workflow
+                        // approver oneshot, so typed approvals queued
+                        // through input_tx wait forever. Resolve at
+                        // the IPC boundary instead.
+                        let pending = shared_for_ipc.workflow_approver.pending_ids();
+                        if !pending.is_empty() {
+                            match crate::workflow::parse_chat_decision(trimmed) {
+                                Some(decision) => {
+                                    if let Some(id) = pending.into_iter().next_back() {
+                                        shared_for_ipc
+                                            .workflow_approver
+                                            .resolve(&id, decision);
+                                    }
+                                    return;
+                                }
+                                None => {
+                                    let _ = shared_for_ipc.events_tx.send(
+                                        crate::shared_session::ViewEvent::SlashOutput(
+                                            "workflow review pending — type \
+                                             `approve`, `cancel`, or `rework: <note>` \
+                                             (or click in the Chat tab)"
+                                                .to_string(),
+                                        ),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
                         let _ = shared_for_ipc
                             .input_tx
                             .send(ShellInput::Line(trimmed.to_string()));
@@ -1106,27 +1526,17 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
                 ));
             }
             Event::UserEvent(UserEvent::SendInitialState) => {
-                let mut config = AppConfig::load().unwrap_or_default();
-                // If the saved model's provider has no key but another
-                // provider does, auto-switch and persist. Keeps the
-                // sidebar's "ready" indicator honest across restarts —
-                // after the user sets (say) an Agentic Press key, the
-                // next launch lands on ap/* instead of showing a stuck
-                // "no API key" on the OpenAI default.
-                if let Some(new_model) = auto_fallback_model(&config) {
-                    let mut project = crate::config::ProjectConfig::load()
-                        .unwrap_or_default();
-                    project.set_model(&new_model);
-                    let _ = project.save();
-                    // The user's `--model X` choice has been deemed
-                    // unreachable; drop the CLI override so the reload
-                    // returns the fallback (Y), not X. Without this the
-                    // session would keep re-pinning to a model whose
-                    // provider has no credentials, defeating the entire
-                    // auto-fallback affordance.
-                    crate::config::clear_cli_model_override();
-                    config = AppConfig::load().unwrap_or_default();
-                }
+                let config = AppConfig::load().unwrap_or_default();
+                // No auto-switch here. This used to rewrite settings.json to
+                // a local runtime whenever the active provider had no key —
+                // without checking that the runtime was installed, and while
+                // dropping the user's `--model` override. Most users have no
+                // local runtime, so the swap only moved the failure from an
+                // actionable "no API key" to a connection refused on the
+                // first prompt. `provider_ready` below reports the state
+                // honestly instead; the startup path
+                // (`build_provider_with_fallback`) still offers a local
+                // fallback, but only after probing that it answers.
                 let provider_name = config.detect_provider().unwrap_or("unknown");
                 let provider_ready = provider_has_credentials(&config);
                 let mcp_servers = build_mcp_servers_payload(&config);
@@ -1171,6 +1581,17 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
             Event::UserEvent(UserEvent::QuitRequested) => {
                 request_gui_shutdown(&shared_for_events, control_flow, latest_window_size);
             }
+            Event::UserEvent(UserEvent::ReloadRequested) => {
+                // Save the live window size first (the re-exec bypasses the
+                // close path), then re-exec off-thread after a beat so the
+                // "[reload]…" line paints before the process image is replaced.
+                persist_window_size(latest_window_size);
+                std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    let err = crate::util::reexec_self();
+                    eprintln!("[reload] re-exec failed: {err}");
+                });
+            }
             Event::UserEvent(UserEvent::ZoomChanged(scale)) => {
                 let _ = webview.zoom(scale);
             }
@@ -1205,6 +1626,44 @@ fn run_gui_inner(serve: Option<crate::server::ServeConfig>) {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod gui_shell_asset_tests {
+    use super::*;
+
+    // #183: on Windows the WebView runs from http://thclaws.localhost/, so
+    // UIView takes the http branch and emits `gui-shell/<id>/` with no
+    // explicit index.html. An empty asset path (bare id or trailing slash)
+    // must resolve to index.html, not 404 "asset not found".
+    #[test]
+    fn empty_asset_path_defaults_to_index_html() {
+        let reg = crate::gui_shell::ShellRegistry::builtin_only();
+        for rest in ["media-studio", "media-studio/"] {
+            let res = serve_gui_shell_asset(&reg, rest);
+            assert_eq!(res.status(), 200, "rest {rest:?} should serve index.html");
+            // #184: the html branch now inlines the bridge (Windows can't load
+            // the thclaws:// external script), so assert on the inline marker.
+            assert!(
+                String::from_utf8_lossy(res.body()).contains("__thclaws_shell_id"),
+                "rest {rest:?} should be the inline-bridge-injected index.html",
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_asset_served_and_missing_or_unknown_still_404() {
+        let reg = crate::gui_shell::ShellRegistry::builtin_only();
+        assert_eq!(
+            serve_gui_shell_asset(&reg, "media-studio/index.html").status(),
+            200,
+        );
+        assert_eq!(
+            serve_gui_shell_asset(&reg, "media-studio/nope.html").status(),
+            404,
+        );
+        assert_eq!(serve_gui_shell_asset(&reg, "unknown-shell/").status(), 404);
+    }
 }
 
 #[cfg(test)]

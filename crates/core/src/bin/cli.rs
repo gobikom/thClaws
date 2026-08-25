@@ -92,6 +92,9 @@ async fn main() {
     secrets::load_into_env();
     endpoints::load_into_env();
     load_dotenv();
+    // Same appliance detection as the `thclaws` binary — someone on the DGX
+    // box running the CLI should reach the local gateway too.
+    thclaws_core::aiserver::bootstrap().await;
     let _ = Sandbox::init();
 
     // Org policy file enforcement (Enterprise Edition foundation).

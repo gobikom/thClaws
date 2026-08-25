@@ -276,6 +276,15 @@ function resolveWorkspaceLink(
   return { path, isDir };
 }
 
+// Windows: the IPC backend echoes the requested path back with `\`
+// separators, while a markdown link resolves to the same file with `/`
+// (see resolveLink / injectBaseHref above). Compare a separator-normalized
+// form so a valid response is not mistaken for a stale one. Reported as
+// issue #197 — clicking a linked file showed nothing at all.
+function samePath(a: string, b: string): boolean {
+  return a.replace(/\\/g, "/") === b.replace(/\\/g, "/");
+}
+
 function injectBaseHref(html: string, filePath: string): string {
   const normalized = filePath.replace(/\\/g, "/");
   const lastSlash = normalized.lastIndexOf("/");
@@ -441,7 +450,10 @@ export function FilesView({ active }: Props) {
         }
         // Late response for a file the pane has already navigated away
         // from — drop it instead of letting it overwrite the current one.
-        if (requestedPathRef.current && incomingPath !== requestedPathRef.current) {
+        if (
+          requestedPathRef.current &&
+          !samePath(incomingPath, requestedPathRef.current)
+        ) {
           return;
         }
         const incomingReadMode: ReadMode =

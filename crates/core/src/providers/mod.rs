@@ -1530,6 +1530,14 @@ pub async fn build_all_models_payload() -> String {
 /// configured provider fails to build; this picks the preferred *paid*
 /// default when nothing is configured yet.
 pub fn preferred_default_model(cfg: &crate::config::AppConfig) -> Option<String> {
+    // On a DGX Spark appliance the box *is* the provider: AI Server's
+    // gateway is already running on loopback and needs no credentials, so it
+    // outranks any cloud tier below. Read-only — the probe happened once at
+    // startup (`aiserver::bootstrap`), and only when nothing had pinned
+    // `LITELLM_BASE_URL`, so this cannot override a configured provider.
+    if let Some(d) = crate::aiserver::cached() {
+        return Some(d.model_id());
+    }
     // Ordered (provider, model) preference: the first provider the user can
     // reach — own key OR a gateway route — picks the session default. Models
     // are pinned explicitly (not `kind.default_model()`) so the credential-

@@ -373,13 +373,6 @@ impl OpenAIProvider {
         if let Some(tc) = &self.tool_choice {
             body["tool_choice"] = tc.clone();
         }
-        if self.is_local_base() {
-            // Local Qwen3.x defaults to "thinking", which derails tool-calling
-            // (the model emits reasoning instead of a tool_call). Non-thinking
-            // is the recommended mode for agentic tool use; non-Qwen local
-            // servers ignore this template kwarg.
-            body["chat_template_kwargs"] = json!({"enable_thinking": false});
-        }
         body
     }
 
@@ -422,9 +415,55 @@ impl OpenAIProvider {
         // `context_length` (top-level or nested under `top_provider`).
         m.get("max_model_len")
             .or_else(|| m.get("context_length"))
+            // LiteLLM's proxy shape, when the operator declared it.
+            .or_else(|| m.get("max_input_tokens"))
             .or_else(|| m.get("top_provider").and_then(|p| p.get("context_length")))
             .and_then(Value::as_u64)
             .map(|n| n as u32)
+    }
+
+    /// Ask the server exactly how large the prompt is, via vLLM-style
+    /// `POST /tokenize`, which applies the real chat template to the
+    /// messages *and* the tool definitions. Beats guessing: the tool block
+    /// alone is ~17k tokens on a full agentic turn, and `estimate_tokens`
+    /// (chars/2.8, tuned for Thai prose) reads JSON schemas ~1.4x heavy.
+    /// `None` when the server has no such endpoint — caller falls back to
+    /// the estimate.
+    async fn served_prompt_tokens(&self, req: &StreamRequest) -> Option<u32> {
+        // vLLM serves `/tokenize` off the server root, NOT under `/v1`
+        // (`/v1/tokenize` 404s), so strip the whole OpenAI path segment.
+        let api_base = self
+            .base_url
+            .rsplit_once("/chat/completions")
+            .map(|(base, _)| base)
+            .unwrap_or_else(|| self.base_url.trim_end_matches('/'));
+        let root = api_base.trim_end_matches('/').trim_end_matches("/v1");
+        let url = format!("{root}/tokenize");
+        let mut probe = self.build_body(req);
+        // `/tokenize` only reads the prompt-shaped fields; the sampling ones
+        // make some builds reject the request outright.
+        for k in [
+            "stream",
+            "stream_options",
+            "max_completion_tokens",
+            "tool_choice",
+        ] {
+            probe.as_object_mut()?.remove(k);
+        }
+        let resp = self
+            .client
+            .post(&url)
+            .header(self.auth_header_name(), self.auth_header_value())
+            .header("content-type", "application/json")
+            .json(&probe)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: Value = resp.json().await.ok()?;
+        v.get("count").and_then(Value::as_u64).map(|n| n as u32)
     }
 
     /// POST a prepared body to the chat/completions endpoint. Factored
@@ -555,6 +594,58 @@ fn strip_request_images(req: &StreamRequest) -> StreamRequest {
 /// these: stripping the images would wrongly stamp a vision-capable model
 /// (e.g. gpt-4.1-nano) as "not vision-capable" and hide the real cause (too
 /// many / too-large images in one request — the gateway's 5 MB body cap).
+/// Fallback prompt sizing when the server won't tokenize for us. Deliberately
+/// generous: `estimate_tokens` (chars/2.8, tuned for Thai prose) plus 25% and
+/// a fixed slack for the chat template, so prompt + output stays inside the
+/// served window even when the guess runs low.
+fn estimated_prompt_reserve(req: &StreamRequest) -> usize {
+    let mut est = crate::compaction::estimate_messages_tokens(&req.messages);
+    if let Some(sys) = &req.system {
+        est += crate::tokens::estimate_tokens(sys);
+    }
+    if !req.tools.is_empty() {
+        if let Ok(s) = serde_json::to_string(&req.tools) {
+            est += crate::tokens::estimate_tokens(&s);
+        }
+    }
+    est + est / 4 + 1024
+}
+
+/// Pull `(context_window, prompt_tokens)` out of a "context length exceeded"
+/// refusal. Both vLLM and OpenAI state the two numbers we need, so the retry
+/// can size the next attempt exactly instead of halving blindly:
+///
+///   This model's maximum context length is 32768 tokens. However, you
+///   requested 32000 output tokens and your prompt contains at least 769
+///   input tokens, for a total of at least 32769 tokens.
+///
+///   This model's maximum context length is 8192 tokens. However, your
+///   messages resulted in 8500 tokens.
+///
+/// `None` when the body isn't that error, or states no usable numbers.
+fn context_window_overflow(body: &str) -> Option<(u32, u32)> {
+    let ctx = regex::Regex::new(r"maximum context length is (\d+) tokens")
+        .ok()?
+        .captures(body)?
+        .get(1)?
+        .as_str()
+        .parse::<u32>()
+        .ok()?;
+    // vLLM phrasing first, then OpenAI's.
+    let prompt = regex::Regex::new(
+        r"(?:prompt contains at least (\d+) input tokens|messages resulted in (\d+) tokens)",
+    )
+    .ok()
+    .and_then(|re| re.captures(body))
+    .and_then(|c| {
+        c.get(1)
+            .or_else(|| c.get(2))
+            .map(|m| m.as_str().to_string())
+    })
+    .and_then(|v| v.parse::<u32>().ok())?;
+    Some((ctx, prompt))
+}
+
 fn is_request_too_large(status: reqwest::StatusCode, body: &str) -> bool {
     if status.as_u16() == 413 {
         return true;
@@ -778,19 +869,16 @@ impl Provider for OpenAIProvider {
         // headroom left for the prompt.
         if self.is_local_base() {
             if let Some(ctx) = self.served_context(&req.model).await {
-                let mut est = crate::compaction::estimate_messages_tokens(&req.messages);
-                if let Some(sys) = &req.system {
-                    est += crate::tokens::estimate_tokens(sys);
-                }
-                if !req.tools.is_empty() {
-                    if let Ok(s) = serde_json::to_string(&req.tools) {
-                        est += crate::tokens::estimate_tokens(&s);
-                    }
-                }
-                // `estimate_tokens` under-counts (chars/2.8, worse for Thai);
-                // inflate 25% + fixed slack for the chat template so
-                // prompt+output stays under the served window.
-                let reserve = est + est / 4 + 1024;
+                // Exact when the server will tell us, estimated otherwise.
+                // Getting this right matters more than it looks: a full tool
+                // block is ~17k of a 32k window, so an inflated guess used to
+                // drive the cap straight into its own floor and leave 512
+                // tokens of output — not enough for a reasoning model to
+                // finish thinking, let alone emit the tool call afterwards.
+                let reserve = match self.served_prompt_tokens(&req).await {
+                    Some(exact) => exact as usize + 512,
+                    None => estimated_prompt_reserve(&req),
+                };
                 let cap = (ctx as usize).saturating_sub(reserve).max(512) as u32;
                 if req.max_tokens > cap {
                     req.max_tokens = cap;
@@ -816,7 +904,46 @@ impl Provider for OpenAIProvider {
             // 413) is NOT a vision problem — stripping there would mislabel a
             // vision-capable model as "not vision-capable" and mask the real
             // cause, so we surface a clear size error instead.
-            if status.is_client_error() && needs_reasoning_effort_none(&text) {
+            // The server knows its own window; when it refuses because
+            // prompt + max_tokens overruns it, resize and go again. This is
+            // the backstop for every self-hosted setup that does not publish a
+            // context window at all: a LiteLLM proxy in front of vLLM reports
+            // `max_input_tokens: null`, so `served_context` finds nothing to
+            // clamp against and the default 32000 sails past a 32k window.
+            if let Some((ctx, prompt)) =
+                context_window_overflow(&text).filter(|_| status.is_client_error())
+            {
+                // vLLM says "at least N input tokens" — a LOWER bound that
+                // leaves out the tool block, which is the bulk of an agentic
+                // prompt (79 tools ≈ 17k of a 32k window against a reported
+                // 769). Sizing off that number alone overruns the window a
+                // second time, so take whichever reserve is larger.
+                let reserve = (prompt as usize).max(estimated_prompt_reserve(&req));
+                let cap = (ctx as usize)
+                    .saturating_sub(reserve)
+                    .saturating_sub(256)
+                    .max(256) as u32;
+                if cap < req.max_tokens {
+                    req.max_tokens = cap;
+                    let retry_body = self.build_body(&req);
+                    match self.send_body(&retry_body).await {
+                        Ok(r) if r.status().is_success() => resp = r,
+                        _ => {
+                            return Err(Error::Provider(format!(
+                                "http {status}: {}\n\n⚠️ `{}` has a {ctx}-token window and the prompt already uses {prompt}.                                  Retrying with max_tokens={cap} did not help — shorten the conversation (/compact) or use a model with a larger window.",
+                                super::redact_key(&text, &self.api_key),
+                                req.model
+                            )));
+                        }
+                    }
+                } else {
+                    return Err(Error::Provider(format!(
+                        "http {status}: {}\n\n⚠️ `{}` has a {ctx}-token window and the prompt alone uses {prompt}.                          There is no room left for a reply — shorten the conversation (/compact) or use a model with a larger window.",
+                        super::redact_key(&text, &self.api_key),
+                        req.model
+                    )));
+                }
+            } else if status.is_client_error() && needs_reasoning_effort_none(&text) {
                 // gpt-5.6-* defaults `reasoning_effort` to something other than
                 // 'none' and then refuses function tools on chat/completions:
                 //
@@ -2372,6 +2499,206 @@ mod tests {
             "got: {source}"
         );
         assert!(!source.contains("/v1/model/info"), "got: {source}");
+    }
+
+    /// A local backend's real constraint is `prompt + output <= max_model_len`,
+    /// and the tool block dominates the prompt. Estimating it drove the cap
+    /// into its own 512 floor, which starved reasoning models mid-thought —
+    /// the symptom once misread as "thinking breaks tool-calling". Ask the
+    /// server instead: vLLM's `/tokenize` applies the real chat template to
+    /// messages *and* tools.
+    /// A LiteLLM proxy in front of vLLM publishes no window at all
+    /// (`max_input_tokens: null`), so nothing can be clamped up front and the
+    /// server refuses the default 32000. Its refusal states both numbers —
+    /// parse them so the retry can be sized exactly.
+    #[test]
+    fn context_overflow_is_parsed_from_both_server_phrasings() {
+        let vllm = "litellm.ContextWindowExceededError: OpenAIException - This model's \
+                    maximum context length is 32768 tokens. However, you requested 32000 \
+                    output tokens and your prompt contains at least 769 input tokens, for \
+                    a total of at least 32769 tokens.";
+        assert_eq!(context_window_overflow(vllm), Some((32768, 769)));
+
+        let openai = "This model's maximum context length is 8192 tokens. However, your \
+                      messages resulted in 8500 tokens.";
+        assert_eq!(context_window_overflow(openai), Some((8192, 8500)));
+
+        // Unrelated 4xx bodies must not be mistaken for it.
+        assert_eq!(
+            context_window_overflow("The model `auto` does not exist."),
+            None
+        );
+        assert_eq!(
+            context_window_overflow("\"auto\" tool choice requires --enable-auto-tool-choice"),
+            None
+        );
+    }
+
+    /// End to end: the first attempt overruns the window, the retry is resized
+    /// from the server's own numbers and succeeds.
+    #[tokio::test]
+    async fn context_overflow_retries_with_a_fitted_max_tokens() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"model\":\"auto\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut req = local_req(32000);
+        req.model = "auto".into();
+        // The server's "at least 769" leaves out the tool block, so the retry
+        // sizes off whichever reserve is larger.
+        let reserve = 769usize.max(estimated_prompt_reserve(&req));
+        let expected = 32768usize - reserve - 256;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(
+                serde_json::json!({"max_completion_tokens": expected}),
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        // Anything else (i.e. the un-resized first attempt) gets the refusal.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                "This model's maximum context length is 32768 tokens. However, you \
+                 requested 32000 output tokens and your prompt contains at least 769 \
+                 input tokens, for a total of at least 32769 tokens.",
+            ))
+            .mount(&server)
+            .await;
+
+        let provider =
+            OpenAIProvider::new("k").with_base_url(format!("{}/v1/chat/completions", server.uri()));
+        let raw = provider.stream(req).await.expect("retry succeeds");
+        let out = collect_turn(assemble(raw)).await.expect("collect");
+        assert_eq!(out.text, "ok");
+        assert!(
+            expected < 32000,
+            "the retry must shrink the ask: {expected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn local_clamp_sizes_the_prompt_with_served_tokenize() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_models(&server, 32768).await;
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"count": 21555, "max_model_len": 32768})),
+            )
+            .mount(&server)
+            .await;
+        mount_empty_stream(&server).await;
+
+        let body = sent_body(&server, local_req(32000)).await;
+        // 32768 - 21555 - 512 slack
+        assert_eq!(body["max_completion_tokens"], 10701);
+        // The template's own default decides thinking; we no longer force it
+        // off behind the user's back.
+        assert!(
+            body.get("chat_template_kwargs").is_none(),
+            "must not override the chat template: {body}"
+        );
+    }
+
+    /// Servers without `/tokenize` (llama.cpp builds, ds4) must still get a
+    /// clamp — just from the estimate.
+    #[tokio::test]
+    async fn local_clamp_falls_back_to_the_estimate_without_tokenize() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        mount_models(&server, 8192).await;
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        mount_empty_stream(&server).await;
+
+        let body = sent_body(&server, local_req(32000)).await;
+        let cap = body["max_completion_tokens"].as_u64().unwrap();
+        assert!(cap < 8192, "clamped below the served window: {cap}");
+        assert!(cap >= 512, "never below the floor: {cap}");
+    }
+
+    async fn mount_models(server: &wiremock::MockServer, ctx: u32) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "local-model", "max_model_len": ctx}]
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_empty_stream(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let sse = concat!(
+            "data: {\"id\":\"c\",\"model\":\"local-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn local_req(max_tokens: u32) -> StreamRequest {
+        StreamRequest {
+            model: "local-model".into(),
+            system: Some("you are an agent".into()),
+            messages: vec![Message::user("hey")],
+            tools: vec![crate::types::ToolDef {
+                name: "Bash".into(),
+                description: "Run a shell command.".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"]
+                }),
+            }],
+            max_tokens,
+            thinking_budget: None,
+            stream_chunk_timeout_override: None,
+        }
+    }
+
+    /// Drive one stream against the mock and hand back the chat body it saw.
+    async fn sent_body(server: &wiremock::MockServer, req: StreamRequest) -> serde_json::Value {
+        let provider =
+            OpenAIProvider::new("k").with_base_url(format!("{}/v1/chat/completions", server.uri()));
+        let raw = provider.stream(req).await.expect("stream");
+        let _ = collect_turn(assemble(raw)).await;
+        let reqs = server.received_requests().await.expect("recorded requests");
+        let chat = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/chat/completions"))
+            .expect("a chat request was sent");
+        serde_json::from_slice(&chat.body).expect("json body")
     }
 
     #[tokio::test]

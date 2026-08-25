@@ -65,8 +65,10 @@ fn build_image_result(bytes: &[u8], path: &std::path::Path) -> ToolResultContent
 
 const MODEL_DESC: &str = "Which image model. Provider is inferred from the model. \
 Gemini: `flash` (default; gemini-3.1-flash-image) or `pro` (gemini-3-pro-image). \
-OpenAI: `gpt-image-2` (alias `openai`). Qwen: `qwen-image-2.0` (alias `qwen`) or \
-`qwen-image-2.0-pro` — strong at multi-image editing + text rendering. Default: flash.";
+OpenAI: `gpt-image-2` (alias `openai`). Qwen: `qwen-image-3.0` (alias `qwen-3`) or \
+`qwen-image-3.0-pro` — newest, best at dense layouts and small text; `qwen-image-2.0` \
+(alias `qwen`) / `-pro` remain. Strong at multi-image editing + text rendering. \
+Default: flash.";
 const PROVIDER_DESC: &str = "Optional explicit provider (`gemini` | `openai` | `qwen`). \
 Usually omit — it's inferred from `model`.";
 
@@ -156,7 +158,8 @@ impl Tool for ImageToImageTool {
     fn description(&self) -> &'static str {
         "Edit or transform an existing image using a text prompt (edit mode). \
          Multi-provider: Gemini (`flash`/`pro`), OpenAI (`gpt-image-2`), or Qwen \
-         (`qwen-image-2.0`/`-pro`, strong at edits + text). Pass \
+         (`qwen-image-3.0`/`-pro`, newest; `qwen-image-2.0`/`-pro` also available — \
+         strong at edits + text). Pass \
          `input_path` (a path under the workspace) + a `prompt` describing the \
          change; the result is written to `output/img-<ts>-<sha8>.<ext>`. Use for \
          background removal, style transfer, adding/removing elements, lighting \
@@ -273,6 +276,24 @@ mod tests {
         let (p, m) = registry::resolve("openai", "").unwrap();
         assert_eq!(p.id(), "openai");
         assert_eq!(m, "gpt-image-2");
+    }
+
+    #[test]
+    fn qwen_3_models_resolve() {
+        for (input, want) in [
+            ("qwen-image-3.0", "qwen-image-3.0"),
+            ("qwen-3", "qwen-image-3.0"),
+            ("qwen-image-3.0-pro", "qwen-image-3.0-pro"),
+            ("qwen-3-pro", "qwen-image-3.0-pro"),
+        ] {
+            let (p, m) = registry::resolve("", input).unwrap();
+            assert_eq!(p.id(), "qwen", "{input} routes to the qwen provider");
+            assert_eq!(m, want, "{input}");
+        }
+        // Adding 3.x must not move the bare `qwen` alias or the provider
+        // default off 2.0 — that is a separate decision.
+        assert_eq!(registry::resolve("", "qwen").unwrap().1, "qwen-image-2.0");
+        assert_eq!(registry::resolve("qwen", "").unwrap().1, "qwen-image-2.0");
     }
 
     #[test]

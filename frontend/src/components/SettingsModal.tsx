@@ -67,6 +67,7 @@ const PROVIDER_LABELS: Record<string, string> = {
   "brave-search": "Brave Search",
   serpapi: "SerpAPI (Google Search)",
   hal: "HAL Public API (YouTube transcript + Web scrape)",
+  ltx: "LTX (video generation + native audio)",
 };
 
 export function SettingsModal({ onClose }: { onClose: () => void }) {

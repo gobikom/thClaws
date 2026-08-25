@@ -430,9 +430,11 @@ pub(crate) fn collaboration_primitives_section(team_enabled: bool) -> String {
     // Teams item entirely when off, rather than printing a "disabled" notice.
     let subagent = "**Subagent** — the `Task` tool launches one scoped child \
          agent that returns a transcript when done. Always available. \
-         Use for a single side-quest that would clutter history, a \
-         read-only sweep, or a well-defined delegation. NOT for \
-         parallel fan-out (one call = one child).";
+         Use for a side-quest that would clutter history, a read-only \
+         sweep, or a well-defined delegation. To fan out, emit SEVERAL \
+         `Task` calls in ONE message — they run concurrently. A lone \
+         `Task` call, or one batched with a tool that isn't read-only, \
+         runs sequentially.";
     let teams = "**Agent Teams** — `TeamCreate` + `SpawnTeammate` start \
          persistent parallel teammates with optional worktree \
          isolation; `TeamTaskCreate` / `Claim` / `Complete` for the \
@@ -440,9 +442,9 @@ pub(crate) fn collaboration_primitives_section(team_enabled: bool) -> String {
          coordination. See the detailed playbook below.";
     let workflow = "**WorkflowRun** — `WorkflowRun(prompt: \"…\")` authors a \
          JavaScript orchestration script and runs it in a Boa \
-         sandbox. Use for deterministic fan-out across N items, \
-         retry loops, multistep pipelines with budget control, or \
-         anything where you'd otherwise loop over Subagent calls. \
+         sandbox. Use when a batch of `Task` calls isn't enough because \
+         the work needs deterministic control flow: fan-out across N \
+         items, retry loops, multistep pipelines, budget caps. \
          Requires user approval per invocation. Nested WorkflowRun \
          calls (from inside a running workflow) are rejected — \
          orchestrate via `thclaws.subagent(...)` / \
@@ -1024,6 +1026,35 @@ mod tests {
             !off.to_lowercase().contains("team"),
             "team-off must not say 'team' at all"
         );
+    }
+
+    /// Regression: the Subagent item used to end "NOT for parallel
+    /// fan-out (one call = one child)", which told the model to issue
+    /// `Task` calls one at a time — so subagents never overlapped even
+    /// though the runtime has run them concurrently since dev-plan/46
+    /// (`SubAgentTool::parallelizable() == true` + the ≥2-parallelizable
+    /// fast-path in `agent::run_turn`). The prompt, not the engine, was
+    /// the reason. It also contradicted system.md's "run independent
+    /// tool calls in parallel in a single turn".
+    #[test]
+    fn collaboration_section_tells_model_to_batch_task_calls() {
+        for section in [
+            collaboration_primitives_section(true),
+            collaboration_primitives_section(false),
+        ] {
+            assert!(
+                !section.contains("NOT for parallel fan-out"),
+                "must not forbid Task fan-out — the runtime supports it"
+            );
+            assert!(
+                section.contains("SEVERAL `Task` calls in ONE message"),
+                "must tell the model how to fan out, got: {section}"
+            );
+            assert!(
+                section.contains("run concurrently"),
+                "must say batched Task calls run concurrently, got: {section}"
+            );
+        }
     }
 
     /// The unified builder slots the Collaboration section between

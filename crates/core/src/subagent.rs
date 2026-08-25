@@ -660,7 +660,10 @@ impl Tool for SubAgentTool {
         "Launch a sub-agent with its own history to handle a bounded subtask. \
          The sub-agent runs independently, may call tools (and spawn further \
          sub-agents up to the recursion limit), and returns its final response \
-         as text. Use `agent` to pick a named agent definition from agents.json."
+         as text. Use `agent` to pick a named agent definition from agents.json. \
+         When several subtasks are independent, emit all their `Task` calls in \
+         a SINGLE message — they run concurrently. Batching them with a tool \
+         that isn't read-only forces the whole message to run one call at a time."
     }
 
     fn input_schema(&self) -> Value {
@@ -1451,6 +1454,27 @@ mod tests {
     fn subagent_tool_does_not_require_approval() {
         let tool = SubAgentTool::new(SimpleFactory::new(vec![]));
         assert!(!tool.requires_approval(&json!({"prompt": "go"})));
+    }
+
+    /// `parallelizable() == true` only pays off if the model actually
+    /// emits ≥2 `Task` blocks in one message, so the schema description
+    /// has to say so. Pre-fix it never mentioned batching and the
+    /// prompt's Collaboration section actively forbade it — subagents
+    /// ran one at a time despite the concurrent fast-path in
+    /// `agent::run_turn`.
+    #[test]
+    fn subagent_tool_description_advertises_concurrent_fan_out() {
+        let tool = SubAgentTool::new(SimpleFactory::new(vec![]));
+        assert!(tool.parallelizable());
+        let d = tool.description();
+        assert!(
+            d.contains("SINGLE message"),
+            "description must tell the model to batch Task calls, got: {d}"
+        );
+        assert!(
+            d.contains("run concurrently"),
+            "description must say a batch runs concurrently, got: {d}"
+        );
     }
 
     fn tool_call_script(id: &str, name: &str, args: &str) -> Vec<ProviderEvent> {

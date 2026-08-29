@@ -132,6 +132,7 @@ pub mod telegram;
 #[cfg(feature = "kms_search_index")]
 pub mod thai;
 pub mod theme;
+pub mod tmux_hud;
 pub mod tokens;
 pub mod tool_display;
 pub mod tools;

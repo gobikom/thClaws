@@ -228,12 +228,12 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `deepseek/deepseek-r1-0528` | 164k | $0.62 | — | $2.69 |
 | `deepseek/deepseek-r1-distill-llama-70b` | 131k | $1.00 | — | $1.00 |
 | `deepseek/deepseek-v3.1-terminus` | 164k | $0.34 | — | $1.25 |
-| `deepseek/deepseek-v3.2` | 131k | $0.33 | — | $0.47 |
+| `deepseek/deepseek-v3.2` | 131k | $0.34 | — | $0.50 |
 | `deepseek/deepseek-v3.2-exp` | 164k | $0.34 | — | $0.51 |
-| `deepseek/deepseek-v4-flash` | 1.04858M | $0.11 | — | $0.21 |
+| `deepseek/deepseek-v4-flash` | 1.04858M | $0.10 | — | $0.21 |
 | `deepseek/deepseek-v4-flash-0731` | 1.04858M | $0.06 | — | $0.11 |
 | `deepseek/deepseek-v4-flash-vision-exp` | 1.04858M | $0.28 | — | $0.83 |
-| `deepseek/deepseek-v4-pro` | 1.04858M | $0.86 | — | $1.73 |
+| `deepseek/deepseek-v4-pro` | 1.04858M | $0.72 | — | $1.45 |
 | `deepseek/deepseek-v4-pro-0813` | 1.04858M | $0.83 | — | $2.48 |
 | `dots-studio/dots-3-note-preview:free` | 512k | free | — | free |
 | `google/gemini-2.5-flash` | 1.04858M | $0.38 | — | $3.12 |
@@ -474,7 +474,7 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `tencent/hy-mt2-1.8b` | 8k | $0.05 | — | $0.22 |
 | `tencent/hy-mt2-30b-a3b` | 8k | $0.09 | — | $0.37 |
 | `tencent/hy-mt2-7b` | 8k | $0.09 | — | $0.37 |
-| `tencent/hy3` | 262k | $0.17 | — | $0.66 |
+| `tencent/hy3` | 262k | $0.10 | — | $0.41 |
 | `tencent/hy3-preview` | 262k | $0.22 | — | $0.75 |
 | `tencent/hy4-preview` | 1.04858M | $1.04 | — | $3.13 |
 | `thedrummer/cydonia-24b-v4.1` | 131k | $0.38 | — | $0.62 |

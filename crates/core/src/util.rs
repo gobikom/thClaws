@@ -109,6 +109,76 @@ pub fn format_tokens(n: usize) -> String {
     }
 }
 
+/// Absolutize a path for baking into a child process's argv.
+///
+/// `canonicalize()` alone is not enough on Windows: it ALWAYS returns a
+/// verbatim (extended-length) path — `\\?\C:\Users\…`, or
+/// `\\?\UNC\server\share` for a network path. Verbatim paths disable
+/// Win32 path normalization, so a child that joins or compares them the
+/// ordinary way silently fails every file operation — no error, just
+/// nothing written. That is issue #200: a teammate spawned with a
+/// verbatim `--team-dir` never wrote its status, so the lead reported
+/// "launched but never booted".
+///
+/// Falls back to `current_dir().join(p)` when canonicalize fails (the
+/// directory may not exist yet on a first team session). No-op on Unix
+/// beyond canonicalize.
+pub fn absolutize_for_child(p: &std::path::Path) -> String {
+    let abs = p.canonicalize().unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|c| c.join(p))
+            .unwrap_or_else(|_| p.to_path_buf())
+    });
+    let s = abs.to_string_lossy().into_owned();
+    strip_verbatim_prefix(&s)
+}
+
+/// Strip Windows' extended-length (`\\?\`) prefix from a path string.
+/// Kept separate from [`absolutize_for_child`] so it is unit-testable on
+/// every platform — the string transform has no OS dependency, and the
+/// bug it fixes can only be reproduced on Windows.
+pub fn strip_verbatim_prefix(path: &str) -> String {
+    // `\\?\UNC\server\share` is a network path — the replacement is
+    // `\\server\share`, NOT `server\share`, which would be relative.
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        return format!(r"\\{rest}");
+    }
+    match path.strip_prefix(r"\\?\") {
+        Some(rest) => rest.to_string(),
+        None => path.to_string(),
+    }
+}
+
+/// Build a sync `std::process::Command` that runs `program` DIRECTLY —
+/// no shell in between.
+///
+/// Prefer this over [`shell_command_sync`] whenever the caller already
+/// knows the program and its arguments: a shell string has to be quoted,
+/// and there is no quoting that works on both `/bin/sh` and `cmd.exe`.
+/// POSIX `'…'` quoting is literal text to cmd.exe, and cmd.exe has no
+/// equivalent of the `VAR=value cmd` env prefix at all — which is why
+/// SpawnTeammate could never launch a teammate on Windows (#200).
+///
+/// Applies the same Windows treatment as `shell_command_sync`: the
+/// `python3` shim on PATH, and the flag that suppresses a console window.
+pub fn direct_command(program: &str) -> std::process::Command {
+    // `mut` is only exercised by the Windows block below.
+    #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+    let mut c = std::process::Command::new(program);
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(dir) = windows_python_shim_dir() {
+            let path = std::env::var("PATH").unwrap_or_default();
+            c.env("PATH", format!("{};{}", dir.display(), path));
+        }
+        // hide the console window
+        c.creation_flags(0x08000000);
+    }
+
+    c
+}
+
 /// Build a sync `std::process::Command` that runs a shell-string in
 /// the platform's default shell. On Windows this is `cmd.exe /C
 /// <cmd>`; on Unix it's `/bin/sh -c <cmd>`. Centralized here so the
@@ -279,6 +349,39 @@ mod tests {
         // CI this could fail if a sandboxed runner strips env — we
         // allow `None` there, but don't crash.
         let _ = home_dir();
+    }
+
+    /// Issue #200: Rust's `canonicalize()` on Windows ALWAYS returns a
+    /// verbatim path. A teammate handed `\\?\C:\…` as `--team-dir` wrote
+    /// nothing — no error, just a status stuck on "spawning".
+    #[test]
+    fn strip_verbatim_prefix_unwraps_windows_extended_paths() {
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\C:\Users\dev\proj\.thclaws\team"),
+            r"C:\Users\dev\proj\.thclaws\team"
+        );
+        // A UNC path must stay UNC — `server\share` alone is relative.
+        assert_eq!(
+            strip_verbatim_prefix(r"\\?\UNC\server\share\team"),
+            r"\\server\share\team"
+        );
+        // Already-plain paths pass through untouched, on every platform.
+        assert_eq!(strip_verbatim_prefix(r"C:\Users\dev"), r"C:\Users\dev");
+        assert_eq!(strip_verbatim_prefix("/home/dev/proj"), "/home/dev/proj");
+        assert_eq!(strip_verbatim_prefix(""), "");
+    }
+
+    /// The two team_dir call sites (spawn argv and the `kill_my_teammates`
+    /// matcher) must agree, so both go through this helper.
+    #[test]
+    fn absolutize_for_child_is_absolute_and_not_verbatim() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let got = absolutize_for_child(&cwd);
+        assert!(!got.starts_with(r"\\?\"), "verbatim prefix leaked: {got}");
+        assert!(
+            std::path::Path::new(&got).is_absolute(),
+            "not absolute: {got}"
+        );
     }
 
     #[test]

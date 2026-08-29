@@ -347,52 +347,17 @@ fn announce_key_stored(provider: &str, ok: bool, error: &str, storage: &str, ctx
                 "provider_ready": ready,
             });
             (ctx.dispatch)(broadcast.to_string());
-            let cat = crate::model_catalogue::EffectiveCatalogue::load();
-            let mut models = cat.list_models_for_provider(provider);
-            models.retain(|(_, e)| e.chat != Some(false));
-            if provider == "openrouter" && new_cfg.openrouter_free_only {
-                models.retain(|(_, e)| e.free == Some(true));
-            }
-            // Gateway routing is strictly metered: unpriced
-            // models 400 upstream, so don't offer them.
-            if crate::providers::thclaws_gateway::hides_unpriced_models(&new_cfg, provider) {
-                models.retain(|(_, e)| e.input_per_mtok.is_some() && e.output_per_mtok.is_some());
-            }
-            let runtime_loaded = matches!(
-                provider,
-                "ollama" | "ollama-anthropic" | "lmstudio" | "vllm" | "llamacpp" | "litellm"
-            );
-            if models.len() >= 3 && !runtime_loaded {
-                let _ = crate::providers::ProviderKind::detect(&new_cfg.model);
-                let model_rows: Vec<serde_json::Value> = models
-                    .iter()
-                    .map(|(id, e)| {
-                        let canonical = crate::model_catalogue::canonical_model_id(provider, id);
-                        serde_json::json!({
-                            "id": canonical,
-                            "context": e.context,
-                            // dev-plan/57: the window may be the provider's
-                            // blanket default rather than a published figure.
-                            // The picker renders those as `200k?` — printing
-                            // a floor as a specification is what #190 was.
-                            "context_unverified": e.context_unverified(),
-                            "max_output": e.max_output,
-                            // Plan-10: surfaced for the
-                            // OpenRouter "Free only" toggle
-                            // in the Settings modal. Other
-                            // providers leave this None.
-                            "free": e.free,
-                        })
-                    })
-                    .collect();
-                let picker = serde_json::json!({
-                    "type": "model_picker_open",
-                    "provider": provider,
-                    "current": new_cfg.model,
-                    "models": model_rows,
-                });
-                (ctx.dispatch)(picker.to_string());
-            }
+            // Off-thread: the builder lists an endpoint-owned provider
+            // (LiteLLM / Ollama / …) over the network, and `handle_ipc` is
+            // sync. Same shape as the `request_all_models` arm.
+            let dispatch = ctx.dispatch.clone();
+            tokio::spawn(async move {
+                if let Some(picker) =
+                    crate::providers::build_model_picker_payload(&new_cfg, 3).await
+                {
+                    dispatch(picker);
+                }
+            });
         } else {
             let provider_name = cfg.detect_provider().unwrap_or("unknown");
             let ready = crate::providers::provider_has_credentials(&cfg);

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.118.0] — 2026-08-29
+
+Teammates launch reliably on Windows, user-pointed providers own their model lists, and the model catalogue gets its pre-release refresh.
+
+### Changed
+- **The model catalogue is refreshed ahead of the release.** Pricing and context data are refreshed from the providers, and the online Appendix A is regenerated to match.
+
+### Fixed
+- **Teammates now spawn without a shell.** Argv, env and cwd go straight to the process, so there is nothing for `cmd.exe` to mis-quote — `SpawnTeammate` works on Windows without the `THCLAWS_SHELL` workaround. (#200)
+- **Team directories on Windows drop the verbatim UNC prefix.** The `\\?\` prefix Rust's `canonicalize()` adds is stripped from the team-dir (and `\\?\UNC\` paths stay UNC), so teammates can actually write their status and inbox files. (#200, #201 — thanks @torandben)
+- **User-pointed providers now own their model list.** For a custom endpoint the endpoint, not a fixed list, defines which models are offered.
+
 ## [0.117.0] — 2026-08-29
 
 A one-slide-at-a-time PPTX preview lands, the model catalogue gets corrected context windows and pricing, and Qwen-Image 3.x stops rendering smaller images.

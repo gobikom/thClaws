@@ -1626,6 +1626,19 @@ impl Tool for SpawnTeammateTool {
             })
             .to_string_lossy()
             .to_string();
+        // Windows: Path::canonicalize() ALWAYS returns a \\?\-prefixed
+        // UNC form (GetFinalPathNameByHandleW). The teammate process uses
+        // this team_dir for all mailbox/status/inbox I/O, and file ops on
+        // the \\?\ form silently fail - status never leaves "spawning",
+        // the inbox never drains, and the 8s liveness probe reports "never
+        // booted" even though the process runs. Strip the prefix so the
+        // child gets a plain drive path. (Spawning via a POSIX shell via
+        // THCLAWS_SHELL works only when the path has no \\?\ prefix.)
+        #[cfg(windows)]
+        let team_dir = team_dir
+            .strip_prefix(r"\\?\")
+            .map(str::to_string)
+            .unwrap_or(team_dir);
         let needs_cli = bin.ends_with("/thclaws") || bin.ends_with("\\thclaws");
         let cli_flag = if needs_cli { " --cli" } else { "" };
 

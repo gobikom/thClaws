@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.117.0] — 2026-08-29
+
+A one-slide-at-a-time PPTX preview lands, the model catalogue gets corrected context windows and pricing, and Qwen-Image 3.x stops rendering smaller images.
+
+### Added
+- **PPTX previews now page one slide at a time.** A `.pptx` preview steps through the deck with ←/→ instead of showing every slide in one long scroll; the rendered PDF stays one click away.
+
+### Changed
+- **The model catalogue is refreshed with current provider pricing.** Qwen3.8-Flash is priced and the catalogue is refreshed from the provider APIs.
+
+### Fixed
+- **Model context windows are sourced from the providers.** The windows for 47 models are pulled from the providers, stale guesses are raised, and the Qwen3.8 and GLM-5.3 values now use their real sizes instead of the provider floor.
+- **The Z.ai GLM-5.3 entry no longer inherits GLM-5's price.** The mis-inherited catalogue price is corrected.
+- **Qwen-Image 3.x no longer renders smaller images.** The size table that shrank images for free is removed.
+
 ## [0.116.0] — 2026-08-25
 
 Qwen-Image 3.0 joins the media models, a co-located AI Server is auto-detected and used as the LLM gateway, and the LTX API key moves into the Settings modal. A round of OpenAI-compat, Windows file-link and Task fan-out fixes lands alongside.

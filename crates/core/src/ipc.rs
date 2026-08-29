@@ -521,6 +521,20 @@ fn job_view_json(v: &crate::research::JobView) -> serde_json::Value {
 /// handled here is silently dropped (the WS-side dispatch surface IS
 /// `handle_ipc` — there's no fallback closure to delegate to).
 #[must_use = "callers must consult the returned bool to decide whether to fall through to a transport-specific dispatch"]
+/// Workspace-relative paths of the per-slide PNGs beside a rendered
+/// `deck.pdf`, for the Files tab's one-slide-at-a-time deck viewer.
+fn rel_slide_pngs(workspace: &std::path::Path, pdf: &std::path::Path) -> Vec<String> {
+    crate::tools::slide_render::slide_pngs(pdf)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(workspace)
+                .unwrap_or(p.as_path())
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect()
+}
+
 pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
     let ty = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
@@ -6142,11 +6156,17 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                                     .unwrap_or(pdf.as_path())
                                     .to_string_lossy()
                                     .replace('\\', "/");
+                                // Per-slide PNGs go along so the pane
+                                // can page through the deck one slide
+                                // at a time; the PDF stays the
+                                // fallback when there are none.
+                                let slides = rel_slide_pngs(&workspace, &pdf);
                                 (ctx.dispatch)(
                                     serde_json::json!({
                                         "type": "file_content",
                                         "path": raw,
                                         "render_path": rel,
+                                        "slides": slides,
                                         "content": "",
                                         "mime": "application/pdf",
                                         "mode": mode_s,
@@ -6202,6 +6222,7 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                                         .unwrap_or(pdf.as_path())
                                         .to_string_lossy()
                                         .replace('\\', "/");
+                                    let slides = rel_slide_pngs(&workspace, &pdf);
                                     (dispatch2)(
                                         serde_json::json!({
                                             "type": "file_content",
@@ -6210,6 +6231,7 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                                             // like any other PDF — the
                                             // viewer is already there.
                                             "render_path": rel,
+                                            "slides": slides,
                                             "content": "",
                                             "mime": "application/pdf",
                                             "mode": mode_s,

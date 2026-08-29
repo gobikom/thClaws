@@ -382,6 +382,33 @@ impl Tool for RenderSlidesTool {
 /// the far end can re-render on demand.
 pub const PPTX_CACHE_REL: &str = ".thclaws/state/pptx-preview";
 
+/// The per-slide PNGs sitting beside a rendered `deck.pdf`, in slide
+/// order. `extract_deck` already writes them (`slide-01.png`, …) — the
+/// Files tab shows one at a time so a deck reads as a deck instead of
+/// one long PDF scroll; the PDF stays the fallback when this is empty
+/// (older cache dirs, or a service response that carried no PNGs).
+pub fn slide_pngs(pdf: &Path) -> Vec<std::path::PathBuf> {
+    let Some(dir) = pdf.parent() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_file()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("slide-") && n.ends_with(".png"))
+        })
+        .collect();
+    // Zero-padded names sort lexicographically into slide order.
+    out.sort();
+    out
+}
+
 /// True when a deck can be rendered right now — i.e. a slide-render
 /// endpoint resolves (self-hosted URL, or a valid gateway key). The
 /// Files tab calls this before auto-rendering so a signed-out user
@@ -629,6 +656,29 @@ mod tests {
             PptxPreview::Skip(_) => "Skip",
             PptxPreview::Renderable => "Renderable",
         }
+    }
+
+    /// The Files tab pages through these in order — a plain
+    /// `read_dir` comes back in whatever order the FS hands over.
+    #[test]
+    fn slide_pngs_sorted_and_filtered() {
+        let ws = tempfile::tempdir().unwrap();
+        let dir = ws.path();
+        for name in [
+            "slide-03.png",
+            "slide-01.png",
+            "slide-02.png",
+            "deck.pdf",
+            "notes.txt",
+            "thumb.png",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let got: Vec<String> = slide_pngs(&dir.join("deck.pdf"))
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got, ["slide-01.png", "slide-02.png", "slide-03.png"]);
     }
 
     #[test]

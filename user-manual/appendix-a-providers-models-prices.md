@@ -36,7 +36,7 @@ Prices are **what you pay** — upstream cost with the 1.25× platform markup al
 
 A context marked **`?`** was never published by the provider — it is that provider's blanket default, kept because a missing window breaks model pickers. Treat it as a lower bound, not a specification.
 
-628 models across 14 providers.
+630 models across 14 providers.
 
 ### Anthropic
 
@@ -154,9 +154,9 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `gemini-2.5-computer-use-preview-10-2025` | 128k | $1.56 | — | $12.50 |
 | `gemini-2.5-flash` | 1.04858M | $0.38 | $0.04 | $3.12 |
 | `gemini-2.5-flash-lite` | 1.04858M | $0.12 | $0.01 | $0.50 |
-| `gemini-2.5-flash-native-audio-latest` | 1.04858M | $0.38 | — | $3.12 |
-| `gemini-2.5-flash-native-audio-preview-09-2025` | 1.04858M | $0.38 | — | $3.12 |
-| `gemini-2.5-flash-native-audio-preview-12-2025` | 1.04858M | $0.38 | — | $3.12 |
+| `gemini-2.5-flash-native-audio-latest` | 1.04858M | $0.62 | — | $2.50 |
+| `gemini-2.5-flash-native-audio-preview-09-2025` | 1.04858M | $0.62 | — | $2.50 |
+| `gemini-2.5-flash-native-audio-preview-12-2025` | 1.04858M | $0.62 | — | $2.50 |
 | `gemini-2.5-pro` | 2M | $1.56 | $0.16 | $12.50 |
 | `gemini-3-flash-preview` | 1.04858M | $0.62 | $0.06 | $3.75 |
 | `gemini-3-pro-preview` | 1.04858M | $2.50 | $0.25 | $15.00 |
@@ -167,6 +167,7 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `gemini-3.1-pro-preview-customtools` | 1.04858M | $2.50 | $0.25 | $15.00 |
 | `gemini-3.5-flash` | 1.04858M | $1.88 | $0.19 | $11.25 |
 | `gemini-3.5-flash-lite` | 1.04858M | $0.38 | — | $3.12 |
+| `gemini-3.5-transcribe` | 1M? | $2.50 | — | $15.00 |
 | `gemini-3.6-flash` | 1.04858M | $0.94 | — | $4.69 |
 | `gemini-3.7-flash` | 1.04858M | $0.94 | — | $4.69 |
 | `gemini-flash-latest` | 1.04858M | $0.38 | $0.04 | $3.12 |
@@ -182,7 +183,6 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `aion-labs/aion-3.0` | 131k | $3.75 | — | $7.50 |
 | `aion-labs/aion-3.0-mini` | 131k | $0.88 | — | $1.75 |
 | `aion-labs/aion-rp-llama-3.1-8b` | 33k | $1.00 | — | $2.00 |
-| `allenai/olmo-3-32b-think` | 66k | $0.19 | — | $0.62 |
 | `amazon/nova-2-lite-v1` | 1M | $0.38 | — | $3.12 |
 | `amazon/nova-lite-v1` | 300k | $0.07 | — | $0.30 |
 | `amazon/nova-micro-v1` | 128k | $0.04 | — | $0.18 |
@@ -207,7 +207,6 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `anthropic/claude-sonnet-4.6` | 1M | $3.75 | $0.38 | $18.75 |
 | `anthropic/claude-sonnet-5` | 1M | $2.50 | — | $12.50 |
 | `arcee-ai/trinity-large-thinking` | 262k | $0.28 | — | $1.06 |
-| `arcee-ai/virtuoso-large` | 131k | $0.94 | — | $1.50 |
 | `baidu/ernie-4.5-vl-424b-a47b` | 123k | $0.53 | — | $1.56 |
 | `bytedance-seed/seed-1.6` | 262k | $0.31 | — | $2.50 |
 | `bytedance-seed/seed-1.6-flash` | 262k | $0.09 | — | $0.38 |
@@ -231,11 +230,11 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `deepseek/deepseek-v3.1-terminus` | 164k | $0.34 | — | $1.25 |
 | `deepseek/deepseek-v3.2` | 131k | $0.33 | — | $0.47 |
 | `deepseek/deepseek-v3.2-exp` | 164k | $0.34 | — | $0.51 |
-| `deepseek/deepseek-v4-flash` | 1.04858M | $0.08 | — | $0.16 |
-| `deepseek/deepseek-v4-flash-0731` | 1.04858M | $0.08 | — | $0.15 |
+| `deepseek/deepseek-v4-flash` | 1.04858M | $0.11 | — | $0.21 |
+| `deepseek/deepseek-v4-flash-0731` | 1.04858M | $0.06 | — | $0.11 |
 | `deepseek/deepseek-v4-flash-vision-exp` | 1.04858M | $0.28 | — | $0.83 |
-| `deepseek/deepseek-v4-pro` | 1.04858M | $0.72 | — | $1.43 |
-| `deepseek/deepseek-v4-pro-0813` | 1.04858M | $1.40 | — | $4.21 |
+| `deepseek/deepseek-v4-pro` | 1.04858M | $0.86 | — | $1.73 |
+| `deepseek/deepseek-v4-pro-0813` | 1.04858M | $0.83 | — | $2.48 |
 | `dots-studio/dots-3-note-preview:free` | 512k | free | — | free |
 | `google/gemini-2.5-flash` | 1.04858M | $0.38 | — | $3.12 |
 | `google/gemini-2.5-flash-lite` | 1.04858M | $0.12 | $0.01 | $0.50 |
@@ -253,21 +252,21 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `google/gemini-3.5-flash` | 1.04858M | $1.88 | $0.19 | $11.25 |
 | `google/gemini-3.5-flash-lite` | 1.04858M | $0.38 | — | $3.12 |
 | `google/gemini-3.6-flash` | 1.04858M | $0.94 | — | $4.69 |
-| `google/gemini-3.7-flash` | 1.04858M | $0.47 | — | $2.34 |
+| `google/gemini-3.7-flash` | 1.04858M | $0.94 | — | $4.69 |
 | `google/gemma-2-27b-it` | 8k | $0.81 | — | $0.81 |
 | `google/gemma-3-12b-it` | 131k | $0.06 | — | $0.19 |
 | `google/gemma-3-27b-it` | 131k | $0.10 | — | $0.56 |
 | `google/gemma-3-4b-it` | 131k | $0.06 | — | $0.12 |
-| `google/gemma-3n-e4b-it` | 33k | $0.07 | — | $0.15 |
 | `google/gemma-4-26b-a4b-it` | 262k | $0.09 | — | $0.43 |
 | `google/gemma-4-26b-a4b-it:free` | 262k | free | — | free |
-| `google/gemma-4-31b-it` | 262k | $0.12 | — | $0.43 |
+| `google/gemma-4-31b-it` | 262k | $0.11 | — | $0.43 |
 | `google/gemma-4-31b-it:free` | 262k | free | — | free |
 | `gryphe/mythomax-l2-13b` | 4k | $0.07 | — | $0.07 |
 | `ibm-granite/granite-4.0-h-micro` | 131k | $0.02 | — | $0.14 |
 | `ibm-granite/granite-4.1-8b` | 131k | $0.06 | — | $0.12 |
 | `inception/mercury-2` | 128k | $0.31 | $0.03 | $0.94 |
 | `inclusionai/ling-3.0-flash` | 262k | $0.03 | — | $0.08 |
+| `inclusionai/ling-3.0-flash-fin:free` | 262k | free | — | free |
 | `kwaipilot/kat-coder-air-v2.5` | 256k | $0.19 | — | $0.75 |
 | `kwaipilot/kat-coder-pro-v2` | 256k | $0.38 | — | $1.50 |
 | `kwaipilot/kat-coder-pro-v2.5` | 256k | $0.93 | — | $3.70 |
@@ -278,11 +277,11 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `meta-llama/llama-3.1-8b-instruct` | 16k | $0.06 | — | $0.10 |
 | `meta-llama/llama-3.2-1b-instruct` | 60k | $0.03 | — | $0.25 |
 | `meta-llama/llama-3.2-3b-instruct` | 80k | $0.06 | — | $0.41 |
-| `meta-llama/llama-3.3-70b-instruct` | 131k | $0.12 | — | $0.40 |
+| `meta-llama/llama-3.3-70b-instruct` | 131k | $0.89 | — | $0.89 |
 | `meta-llama/llama-4-maverick` | 1.04858M | $0.25 | — | $1.00 |
-| `meta-llama/llama-4-scout` | 328k | $0.12 | — | $0.38 |
+| `meta-llama/llama-4-scout` | 328k | $0.14 | — | $0.43 |
 | `meta-llama/llama-guard-4-12b` | 164k | $0.22 | — | $0.22 |
-| `meta/muse-glimmer-30b` | 131k | $0.44 | — | $1.88 |
+| `meta/muse-glimmer-30b` | 131k | $0.38 | — | $1.50 |
 | `meta/muse-spark-1.1` | 1.04858M | $1.56 | — | $5.31 |
 | `meta/muse-spark-1.2` | 1.04858M | $1.56 | — | $5.31 |
 | `meta/muse-spark-1.2-contributor` | 1.04858M | $0.12 | — | $0.25 |
@@ -302,7 +301,6 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `mistralai/devstral-2512` | 262k | $0.55 | — | $2.75 |
 | `mistralai/ministral-14b-2512` | 262k | $0.25 | — | $0.25 |
 | `mistralai/ministral-3b-2512` | 131k | $0.12 | — | $0.12 |
-| `mistralai/ministral-8b` | 128k | $0.14 | — | $0.14 |
 | `mistralai/ministral-8b-2512` | 262k | $0.19 | — | $0.19 |
 | `mistralai/mistral-large` | 128k | $2.50 | — | $7.50 |
 | `mistralai/mistral-large-2407` | 131k | $2.50 | — | $7.50 |
@@ -323,7 +321,7 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `moonshotai/kimi-k2-thinking` | 262k | $0.75 | — | $3.12 |
 | `moonshotai/kimi-k2.5` | 262k | $0.75 | $0.12 | $3.75 |
 | `moonshotai/kimi-k2.6` | 256k | $1.19 | — | $5.00 |
-| `moonshotai/kimi-k2.7-code` | 262k | $0.84 | — | $4.25 |
+| `moonshotai/kimi-k2.7-code` | 262k | $0.83 | — | $4.25 |
 | `moonshotai/kimi-k3` | 1.04858M | $3.75 | — | $18.75 |
 | `morph/morph-v3-fast` | 82k | $1.00 | — | $1.50 |
 | `morph/morph-v3-large` | 262k | $1.12 | — | $2.38 |
@@ -337,7 +335,7 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free` | 256k | free | — | free |
 | `nvidia/nemotron-3-super-120b-a12b` | 262k | $0.11 | — | $0.50 |
 | `nvidia/nemotron-3-super-120b-a12b:free` | 262k | free | — | free |
-| `nvidia/nemotron-3-ultra-550b-a55b` | 1M | $0.75 | — | $4.50 |
+| `nvidia/nemotron-3-ultra-550b-a55b` | 1M | $0.62 | — | $2.75 |
 | `nvidia/nemotron-3-ultra-550b-a55b:free` | 1M | free | — | free |
 | `nvidia/nemotron-3.5-content-safety:free` | 128k | free | — | free |
 | `nvidia/nemotron-3.5-lightning` | 262k | $0.10 | — | $0.25 |
@@ -415,10 +413,10 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `qwen/qwen-2.5-coder-32b-instruct` | 33k | $0.83 | — | $1.25 |
 | `qwen/qwen-plus` | 1M | $0.33 | — | $0.98 |
 | `qwen/qwen-plus-2025-07-28` | 1M | $0.33 | — | $0.98 |
-| `qwen/qwen2.5-vl-72b-instruct` | 32k | $1.00 | — | $1.25 |
+| `qwen/qwen2.5-vl-72b-instruct` | 32k | $0.31 | — | $0.94 |
 | `qwen/qwen3-14b` | 41k | $0.15 | — | $0.30 |
 | `qwen/qwen3-235b-a22b` | 131k | $0.57 | — | $2.27 |
-| `qwen/qwen3-235b-a22b-2507` | 262k | $0.11 | — | $0.69 |
+| `qwen/qwen3-235b-a22b-2507` | 262k | $0.11 | — | $0.44 |
 | `qwen/qwen3-235b-a22b-thinking-2507` | 131k | $0.29 | — | $2.88 |
 | `qwen/qwen3-30b-a3b` | 41k | $0.15 | — | $0.62 |
 | `qwen/qwen3-30b-a3b-instruct-2507` | 262k | $0.06 | — | $0.24 |
@@ -436,21 +434,21 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `qwen/qwen3-next-80b-a3b-thinking` | 131k | $0.19 | — | $1.50 |
 | `qwen/qwen3-vl-235b-a22b-instruct` | 262k | $0.26 | — | $2.38 |
 | `qwen/qwen3-vl-235b-a22b-thinking` | 131k | $0.50 | — | $5.00 |
-| `qwen/qwen3-vl-30b-a3b-instruct` | 131k | $0.16 | — | $0.65 |
+| `qwen/qwen3-vl-30b-a3b-instruct` | 131k | $0.19 | — | $0.75 |
 | `qwen/qwen3-vl-30b-a3b-thinking` | 131k | $0.25 | — | $3.00 |
 | `qwen/qwen3-vl-32b-instruct` | 131k | $0.13 | — | $0.52 |
 | `qwen/qwen3-vl-8b-instruct` | 131k | $0.15 | — | $0.57 |
 | `qwen/qwen3-vl-8b-thinking` | 131k | $0.22 | — | $2.62 |
-| `qwen/qwen3.5-122b-a10b` | 262k | $0.33 | — | $2.60 |
+| `qwen/qwen3.5-122b-a10b` | 262k | $0.36 | — | $3.00 |
 | `qwen/qwen3.5-27b` | 262k | $0.24 | — | $1.95 |
 | `qwen/qwen3.5-35b-a3b` | 262k | $0.31 | — | $1.56 |
-| `qwen/qwen3.5-397b-a17b` | 262k | $0.62 | — | $4.50 |
+| `qwen/qwen3.5-397b-a17b` | 262k | $0.49 | — | $2.92 |
 | `qwen/qwen3.5-9b` | 262k | $0.12 | — | $0.19 |
 | `qwen/qwen3.5-flash-02-23` | 1M | $0.08 | — | $0.33 |
 | `qwen/qwen3.5-plus-02-15` | 1M | $0.33 | — | $1.95 |
 | `qwen/qwen3.5-plus-20260420` | 1M | $0.38 | — | $2.25 |
-| `qwen/qwen3.6-27b` | 262k | $0.40 | — | $4.00 |
-| `qwen/qwen3.6-35b-a3b` | 262k | $0.18 | — | $1.25 |
+| `qwen/qwen3.6-27b` | 262k | $0.75 | — | $4.50 |
+| `qwen/qwen3.6-35b-a3b` | 262k | $0.12 | — | $1.12 |
 | `qwen/qwen3.6-flash` | 1M | $0.23 | — | $1.41 |
 | `qwen/qwen3.6-max-preview` | 262k | $1.28 | — | $7.70 |
 | `qwen/qwen3.6-plus` | 1M | $0.41 | — | $2.44 |
@@ -459,6 +457,7 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `qwen/qwen3.7-plus` | 1M | $0.40 | — | $1.60 |
 | `qwen/qwen3.8-2.4t-a95b` | 1.04858M | $2.50 | — | $7.50 |
 | `qwen/qwen3.8-27b` | 1M | $0.53 | — | $3.19 |
+| `qwen/qwen3.8-flash` | 1M | $0.19 | — | $0.59 |
 | `qwen/qwen3.8-max` | 1M | $2.50 | — | $7.50 |
 | `rekaai/reka-edge` | 16k | $0.12 | — | $0.12 |
 | `rekaai/reka-flash-3` | 66k | $0.12 | — | $0.25 |
@@ -469,7 +468,6 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `sao10k/l3-lunaris-8b` | 8k | $0.05 | — | $0.06 |
 | `sao10k/l3.1-euryale-70b` | 131k | $1.06 | — | $1.06 |
 | `sao10k/l3.3-euryale-70b` | 131k | $0.81 | — | $0.94 |
-| `stealth/ox-alpha` | 1.04858M | free | — | free |
 | `stepfun/step-3.5-flash` | 262k | $0.12 | — | $0.38 |
 | `stepfun/step-3.7-flash` | 256k | $0.25 | — | $1.44 |
 | `tencent/hunyuan-a13b-instruct` | 131k | $0.18 | — | $0.71 |
@@ -478,8 +476,8 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `tencent/hy-mt2-7b` | 8k | $0.09 | — | $0.37 |
 | `tencent/hy3` | 262k | $0.17 | — | $0.66 |
 | `tencent/hy3-preview` | 262k | $0.22 | — | $0.75 |
+| `tencent/hy4-preview` | 1.04858M | $1.04 | — | $3.13 |
 | `thedrummer/cydonia-24b-v4.1` | 131k | $0.38 | — | $0.62 |
-| `thedrummer/rocinante-12b` | 33k | $0.31 | — | $0.62 |
 | `thedrummer/skyfall-36b-v2` | 33k | $0.69 | — | $1.00 |
 | `thedrummer/unslopnemo-12b` | 33k | $0.50 | — | $0.50 |
 | `thinkingmachines/inkling` | 1.04858M | $1.19 | — | $5.06 |
@@ -501,7 +499,7 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `z-ai/glm-4.5` | 131k | $0.75 | — | $2.75 |
 | `z-ai/glm-4.5-air` | 131k | $0.16 | — | $1.06 |
 | `z-ai/glm-4.5v` | 66k | $0.75 | — | $2.25 |
-| `z-ai/glm-4.6` | 205k | $0.62 | — | $2.50 |
+| `z-ai/glm-4.6` | 205k | $0.54 | — | $2.19 |
 | `z-ai/glm-4.6v` | 131k | $0.38 | — | $1.12 |
 | `z-ai/glm-4.7` | 203k | $0.50 | free | $2.19 |
 | `z-ai/glm-4.7-flash` | 203k | $0.07 | free | $0.50 |
@@ -511,14 +509,15 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `z-ai/glm-5.2` | 1.04858M | $1.49 | — | $4.68 |
 | `z-ai/glm-5.2:free` | 256k | free | — | free |
 | `z-ai/glm-5.3` | 1.04858M | $1.75 | — | $5.50 |
+| `z-ai/glm-5.3-flash` | 1.31072M | $0.09 | — | $0.31 |
 | `z-ai/glm-5v-turbo` | 203k | $1.50 | — | $5.00 |
 | `~anthropic/claude-fable-latest` | 1M | $12.50 | — | $62.50 |
 | `~anthropic/claude-haiku-latest` | 200k | $1.25 | — | $6.25 |
 | `~anthropic/claude-opus-latest` | 1M | $6.25 | — | $31.25 |
 | `~anthropic/claude-sonnet-latest` | 1M | $2.50 | — | $12.50 |
-| `~google/gemini-flash-latest` | 1.04858M | $0.47 | $0.04 | $2.34 |
+| `~google/gemini-flash-latest` | 1.04858M | $0.94 | $0.04 | $4.69 |
 | `~google/gemini-pro-latest` | 1.04858M | $2.50 | $0.16 | $15.00 |
-| `~moonshotai/kimi-latest` | 256k | $3.50 | — | $17.50 |
+| `~moonshotai/kimi-latest` | 256k | $3.19 | — | $15.94 |
 | `~openai/gpt-latest` | 1.05M | $2.50 | — | $12.50 |
 | `~openai/gpt-mini-latest` | 400k | $0.94 | — | $5.62 |
 
@@ -526,19 +525,20 @@ A context marked **`?`** was never published by the provider — it is that prov
 
 | Model | Context | Input ($/M) | Output ($/M) |
 |---|---:|---:|---:|
-| `dashscope/ZHIPU/GLM-5.3` | 131k? | $1.75 | $5.50 |
+| `dashscope/ZHIPU/GLM-5.3` | 262k? | $1.75 | $5.50 |
 | `dashscope/deepseek-v3.2` | 164k | $0.36 | $0.54 |
 | `dashscope/deepseek-v4-flash` | 1M | $0.25 | $0.50 |
 | `dashscope/deepseek-v4-flash-0731` | 1.04858M | $0.25 | $0.50 |
 | `dashscope/deepseek-v4-pro` | 1M | $3.00 | $6.00 |
-| `dashscope/deepseek-v4-pro-0813` | 131k? | $3.00 | $6.00 |
+| `dashscope/deepseek-v4-pro-0813` | 1M | $3.00 | $6.00 |
 | `dashscope/glm-5.1` | 205k | $1.07 | $3.94 |
 | `dashscope/glm-5.2` | 1.04858M | $1.07 | $3.94 |
 | `dashscope/glm-5.2-fast-preview` | 131k | $1.07 | $3.94 |
 | `dashscope/kimi-k2.7-code` | 262k | $0.72 | $3.76 |
-| `dashscope/kimi-k3` | 131k? | $3.75 | $18.75 |
+| `dashscope/kimi-k3` | 262k? | $3.75 | $18.75 |
+| `dashscope/kimi/kimi-k3` | 262k? | $3.75 | $18.75 |
 | `dashscope/qvq-max` | 131k | $1.50 | $6.00 |
-| `dashscope/qwen-coder-plus` | 131k? | $7.50 | $75.00 |
+| `dashscope/qwen-coder-plus` | 262k? | $7.50 | $75.00 |
 | `dashscope/qwen-flash` | 998k | $0.31 | $2.50 |
 | `dashscope/qwen-flash-character` | 8k | $0.31 | $2.50 |
 | `dashscope/qwen-max` | 31k | $2.00 | $8.00 |
@@ -584,7 +584,7 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `dashscope/qwen3-next-80b-a3b-thinking` | 262k | $0.19 | $1.50 |
 | `dashscope/qwen3-omni-30b-a3b-captioner` | 31k | $4.76 | $3.83 |
 | `dashscope/qwen3-omni-flash` | 66k | $0.54 | $2.07 |
-| `dashscope/qwen3-omni-flash-2025-09-15` | 131k? | $0.54 | $2.07 |
+| `dashscope/qwen3-omni-flash-2025-09-15` | 262k? | $0.54 | $2.07 |
 | `dashscope/qwen3-omni-flash-2025-12-01` | 16k | $0.54 | $2.07 |
 | `dashscope/qwen3-omni-flash-realtime` | 66k | $0.65 | $2.49 |
 | `dashscope/qwen3-omni-flash-realtime-2025-09-15` | 57k | $0.65 | $2.49 |
@@ -632,8 +632,9 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `dashscope/qwen3.7-max-preview` | 131k | $3.12 | $9.38 |
 | `dashscope/qwen3.7-plus` | 992k | $1.50 | $6.00 |
 | `dashscope/qwen3.7-plus-2026-05-26` | 131k | $1.50 | $6.00 |
-| `dashscope/qwen3.8-2.4t-a95b` | 131k? | $2.50 | $7.50 |
-| `dashscope/qwen3.8-27b` | 131k? | $0.62 | $3.75 |
+| `dashscope/qwen3.8-2.4t-a95b` | 1M | $2.50 | $7.50 |
+| `dashscope/qwen3.8-27b` | 1M | $0.62 | $3.75 |
+| `dashscope/qwen3.8-flash` | 1M | $0.19 | $0.59 |
 | `dashscope/qwen3.8-max` | 1M | $2.50 | $7.50 |
 | `dashscope/qwq-plus` | 98k | $1.00 | $3.00 |
 | `dashscope/qwq-plus-2025-03-05` | 131k | $1.00 | $3.00 |
@@ -650,14 +651,15 @@ A context marked **`?`** was never published by the provider — it is that prov
 | `zai/glm-5-turbo` | 203k | $1.50 | — | $5.00 |
 | `zai/glm-5.1` | 203k | $1.75 | — | $5.50 |
 | `zai/glm-5.2` | 1M | $1.75 | — | $5.50 |
-| `zai/glm-5.3` | 131k? | $1.25 | — | $4.00 |
+| `zai/glm-5.3` | 1M | $1.75 | — | $5.50 |
+| `zai/glm-5.3-flash` | 1M | $0.19 | — | $0.62 |
 
 ### DeepSeek
 
 | Model | Context | Input ($/M) | Output ($/M) |
 |---|---:|---:|---:|
 | `deepseek-v4-flash` | 1.04858M | $0.18 | $0.35 |
-| `deepseek-v4-flash-vision-exp` | 131k? | $0.18 | $0.35 |
+| `deepseek-v4-flash-vision-exp` | 262k? | $0.18 | $0.35 |
 | `deepseek-v4-pro` | 1.04858M | $0.54 | $1.09 |
 
 ### MiniMax

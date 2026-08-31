@@ -11,7 +11,8 @@
 //! carries a signed image URL (PNG, expires 24h) at
 //! `output.choices[0].message.content[].image`, which we download.
 //!
-//! Pricing is PER IMAGE (qwen-image-2.0 $0.035, -pro $0.075), unlike the
+//! Pricing is PER IMAGE (2.0 $0.035 / -pro $0.075; 3.0 $0.03 / -pro $0.075
+//! at the 2K tiles we request), unlike the
 //! token-metered chat models — recorded as `price_per_image_usd` in the
 //! catalogue. Gateway per-image metering is a follow-up; desktop users
 //! with their own DASHSCOPE_API_KEY work today.
@@ -38,13 +39,32 @@ const MODELS: &[ImageModelInfo] = &[
         aliases: &["qwen-pro", "qwen-image-2.0-pro"],
         label: "Qwen Image 2.0 Pro",
     },
+    ImageModelInfo {
+        id: "qwen-image-3.0",
+        aliases: &["qwen-3", "qwen-image-3.0"],
+        label: "Qwen Image 3.0",
+    },
+    ImageModelInfo {
+        id: "qwen-image-3.0-pro",
+        aliases: &["qwen-3-pro", "qwen-image-3.0-pro"],
+        label: "Qwen Image 3.0 Pro",
+    },
 ];
 
 pub struct QwenImageProvider;
 
 impl QwenImageProvider {
-    /// Map the engine's portable aspect tiers onto the qwen-image-2.0
-    /// `W*H` size strings (the 2.0 series operates around 2K).
+    /// Map the engine's portable aspect tiers onto DashScope `W*H` size
+    /// strings. One table for every model in the family.
+    ///
+    /// The 3.x model card says dimensions run 512-2048 per side, so these
+    /// 2688-wide tiles look out of range — they are not. Checked against the
+    /// live API (2026-08-25): `qwen-image-3.0` and `-3.0-pro` both return
+    /// exactly 2688x1536 and 1536x2688 when asked. Sizing 3.x down to 2048
+    /// would only hand the user a smaller picture for the same money, since
+    /// billing is by tier, not by pixel: everything over 2,250,000 px is
+    /// "2K", and every tile here clears that line. So the aspect choice
+    /// never silently changes what an image costs, on either series.
     fn size(req: &ImageRequest) -> &'static str {
         match req.aspect_ratio.as_str() {
             "1:1" => "2048*2048",

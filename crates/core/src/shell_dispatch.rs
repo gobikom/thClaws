@@ -387,46 +387,36 @@ pub async fn dispatch(
             // from a shipped catalogue: Ollama is per-machine (`/api/tags`
             // lists what's pulled), and `openai-compat` is whatever sits at
             // `OPENAI_COMPAT_BASE_URL` — a vLLM box, LiteLLM, an internal
-            // proxy. Ask the endpoint itself and union what it reports; the
-            // CLI has always done this, the GUI listed the catalogue alone
-            // and so showed openai-compat users nothing at all.
+            // proxy. Ask the endpoint itself and render exactly what it
+            // reports; the CLI has always done this, the GUI listed the
+            // catalogue alone and so showed openai-compat users nothing.
             let is_ollama = matches!(
                 kind,
                 crate::providers::ProviderKind::Ollama
                     | crate::providers::ProviderKind::OllamaAnthropic,
             );
-            // LiteLLM is the same case: the routable ids are the operator's
-            // own `model_name` aliases, so the catalogue can never carry them.
-            let asks_endpoint = is_ollama
-                || matches!(
-                    kind,
-                    crate::providers::ProviderKind::OpenAICompat
-                        | crate::providers::ProviderKind::LiteLlm
-                );
+            // LiteLLM / vLLM / llama.cpp / LMStudio / openai-compat are the
+            // same case: the routable ids are the operator's own aliases, so
+            // the catalogue can never carry them.
+            let asks_endpoint = kind.lists_from_endpoint();
             let mut live_note: Option<String> = None;
             let mut live_count = 0usize;
             if asks_endpoint {
                 if let Ok(p) = crate::repl::build_provider(&state.config) {
                     match p.list_models().await {
                         Ok(live) => {
-                            let have: std::collections::HashSet<String> =
-                                rows.iter().map(|(id, _)| id.clone()).collect();
+                            // The endpoint owns the list: what it reports IS
+                            // the set. Catalogue rows only join back in as
+                            // metadata for the ids it confirms — otherwise a
+                            // context window cached by an earlier `/model`
+                            // switch (`upsert_cache_entry`) keeps advertising
+                            // a model the proxy has since stopped serving.
+                            let meta: std::collections::HashMap<String, _> =
+                                rows.drain(..).collect();
                             live_count = live.len();
                             for m in live {
-                                if !have.contains(&m.id) {
-                                    rows.push((
-                                        m.id,
-                                        crate::model_catalogue::ModelEntry {
-                                            context: None,
-                                            max_output: None,
-                                            source: None,
-                                            verified_at: None,
-                                            free: None,
-                                            chat: None,
-                                            ..Default::default()
-                                        },
-                                    ));
-                                }
+                                let entry = meta.get(&m.id).cloned().unwrap_or_default();
+                                rows.push((m.id, entry));
                             }
                             rows.sort_by(|a, b| a.0.cmp(&b.0));
                         }
@@ -537,53 +527,19 @@ pub async fn dispatch(
                 );
                 // GUI side: also broadcast a model_picker_open event so
                 // the existing ModelPickerModal opens with the active
-                // provider's catalogue. Skipped only when there's nothing
-                // to choose (<2 entries) and for runtime-loaded backends
-                // (Ollama / LMStudio) whose model lists come from the live
-                // runtime, not the catalogue. (Was <3, which wrongly hid the
-                // picker for 2-model providers like DeepSeek — flash/pro is a
-                // real choice.) Closes #25.
-                let runtime_loaded = matches!(
-                    prov,
-                    "ollama" | "ollama-anthropic" | "lmstudio" | "vllm" | "llamacpp" | "litellm"
-                );
-                if !runtime_loaded {
-                    let cat = crate::model_catalogue::EffectiveCatalogue::load();
-                    let mut models = cat.list_models_for_provider(prov);
-                    models.retain(|(_, e)| e.chat != Some(false));
-                    if prov == "openrouter" && state.config.openrouter_free_only {
-                        models.retain(|(_, e)| e.free == Some(true));
-                    }
-                    // Strictly metered via gateway → hide unpriced rows.
-                    if crate::providers::thclaws_gateway::hides_unpriced_models(&state.config, prov)
-                    {
-                        models.retain(|(_, e)| {
-                            e.input_per_mtok.is_some() && e.output_per_mtok.is_some()
-                        });
-                    }
-                    if models.len() >= 2 {
-                        let _ = crate::providers::ProviderKind::detect(&state.config.model);
-                        let model_rows: Vec<serde_json::Value> = models
-                            .iter()
-                            .map(|(id, e)| {
-                                let canonical =
-                                    crate::model_catalogue::canonical_model_id(prov, id);
-                                serde_json::json!({
-                                    "id": canonical,
-                                    "context": e.context,
-                                    "max_output": e.max_output,
-                                    "free": e.free,
-                                })
-                            })
-                            .collect();
-                        let payload = serde_json::json!({
-                            "type": "model_picker_open",
-                            "provider": prov,
-                            "current": state.config.model,
-                            "models": model_rows,
-                        });
-                        let _ = events_tx.send(ViewEvent::ModelPickerOpen(payload.to_string()));
-                    }
+                // provider's list. Skipped only when there's nothing to
+                // choose (<2 entries). (Was <3, which wrongly hid the picker
+                // for 2-model providers like DeepSeek — flash/pro is a real
+                // choice.) Closes #25.
+                //
+                // Runtime-loaded backends (Ollama / LMStudio / LiteLLM / …)
+                // used to be excluded outright because the catalogue can't
+                // know their models. It doesn't have to: the shared builder
+                // lists them from the endpoint itself.
+                if let Some(payload) =
+                    crate::providers::build_model_picker_payload(&state.config, 2).await
+                {
+                    let _ = events_tx.send(ViewEvent::ModelPickerOpen(payload));
                 }
             } else {
                 // Strict mode: user named a specific model. A typo

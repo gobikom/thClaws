@@ -722,6 +722,11 @@ async fn main() {
     secrets::load_into_env();
     endpoints::load_into_env();
     load_dotenv();
+    // Co-located AI Server (DGX Spark appliance): if the loopback discovery
+    // endpoint answers, point the `litellm` provider at its gateway. Runs
+    // after the three env layers above so it can only fill in what none of
+    // them set. A no-op (one refused loopback connection) everywhere else.
+    thclaws_core::aiserver::bootstrap().await;
     let _ = Sandbox::init();
 
     // M6.45 / #79-followup: warn if there are additional thclaws

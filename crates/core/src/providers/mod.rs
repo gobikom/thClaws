@@ -493,6 +493,31 @@ impl ProviderKind {
         )
     }
 
+    /// True when the *endpoint* owns the model list, not the shipped
+    /// catalogue: Ollama lists what the user pulled, and a proxy
+    /// (LiteLLM / vLLM / llama.cpp / LMStudio / an internal gateway) lists
+    /// the operator's own aliases. For these, a successful `list_models()`
+    /// is the complete, authoritative set — the catalogue may only supply
+    /// *metadata* (context window) for an id the endpoint confirms.
+    ///
+    /// Why it matters: `/model <id>` caches a probed context window under
+    /// the provider key (`model_catalogue::upsert_cache_entry`), but the
+    /// endpoint is per-machine/per-URL. Letting those cached rows *add*
+    /// ids made every model the user ever switched to linger in `/models`
+    /// forever, long after the proxy stopped serving it.
+    pub fn lists_from_endpoint(&self) -> bool {
+        matches!(
+            self,
+            Self::Ollama
+                | Self::OllamaAnthropic
+                | Self::LMStudio
+                | Self::VLlm
+                | Self::LlamaCpp
+                | Self::LiteLlm
+                | Self::OpenAICompat
+        )
+    }
+
     /// Default base URL shown as a placeholder in the Settings UI when the
     /// user hasn't configured one. `None` for providers without an endpoint
     /// concept (Anthropic, OpenAI, etc. — those always hit the official API).
@@ -1360,6 +1385,160 @@ pub fn kind_has_credentials(kind: Option<ProviderKind>) -> bool {
     }
 }
 
+/// The `<provider>/` prefix a listing from `kind`'s endpoint must carry so
+/// a copied id routes back through [`ProviderKind::detect`]. Mirrors the
+/// `with_strip_model_prefix` argument each arm of `repl::build_provider`
+/// passes; `openai-compat` is the one place where the prefix (`oai/`) and
+/// the provider name diverge.
+fn listing_model_prefix(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::LMStudio => "lmstudio/",
+        ProviderKind::VLlm => "vllm/",
+        ProviderKind::LlamaCpp => "llamacpp/",
+        ProviderKind::LiteLlm => "litellm/",
+        ProviderKind::OpenAICompat => "oai/",
+        _ => "",
+    }
+}
+
+/// Build a throwaway provider whose only job is `list_models()` — for a
+/// `kind` that is NOT necessarily the session's active one. `build_provider`
+/// can't serve this: it derives the kind from `config.model`, so the picker
+/// could never ask "what does the LiteLLM box have?" while the user sits on
+/// Anthropic.
+///
+/// Same env resolution as [`openai::probe_compat_limits`]: per-kind base-URL
+/// env → `default_endpoint()`, key from the keychain → the per-kind env →
+/// a placeholder (these backends have optional auth and ignore the header
+/// when unset). Returns `None` for a kind the endpoint doesn't own.
+pub fn build_listing_provider(kind: ProviderKind) -> Option<std::sync::Arc<dyn Provider>> {
+    if !kind.lists_from_endpoint() {
+        return None;
+    }
+    let base = kind
+        .endpoint_env()
+        .and_then(|v| std::env::var(v).ok())
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| kind.default_endpoint().map(String::from))?;
+    if matches!(kind, ProviderKind::Ollama | ProviderKind::OllamaAnthropic) {
+        // Both Ollama kinds list from the same native `/api/tags`.
+        return Some(std::sync::Arc::new(
+            crate::providers::ollama::OllamaProvider::new().with_base_url(base),
+        ));
+    }
+    let key = crate::secrets::get(kind.name())
+        .or_else(|| kind.api_key_env().and_then(|v| std::env::var(v).ok()))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "local-no-auth".to_string());
+    let url = if base.ends_with("/chat/completions") {
+        base
+    } else {
+        format!("{}/chat/completions", base.trim_end_matches('/'))
+    };
+    Some(std::sync::Arc::new(
+        crate::providers::openai::OpenAIProvider::new(key)
+            .with_base_url(url)
+            .with_strip_model_prefix(listing_model_prefix(kind)),
+    ))
+}
+
+/// Ask `kind`'s endpoint for its model list, bounded so an unreachable host
+/// can't stall a picker. `None` = we could not reach it (keep the catalogue);
+/// `Some(ids)` = the authoritative set, empty included.
+pub async fn live_model_ids(kind: ProviderKind, timeout_ms: u64) -> Option<Vec<String>> {
+    let provider = build_listing_provider(kind)?;
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        provider.list_models(),
+    )
+    .await
+    {
+        Ok(Ok(models)) => Some(models.into_iter().map(|m| m.id).collect()),
+        _ => None,
+    }
+}
+
+/// Build the `model_picker_open` payload for the session's **active**
+/// provider — the per-provider modal `/model` (no arg) opens, and the one
+/// the GUI pops after a key is stored.
+///
+/// `None` when there is nothing worth opening: fewer than `min_rows`
+/// choices, or an endpoint-owned provider we could not reach (better no
+/// modal than a modal listing models the box does not serve).
+///
+/// Extracted from two copies that had drifted — `shell_dispatch`'s `/model`
+/// arm and `ipc`'s post-key switch.
+pub async fn build_model_picker_payload(
+    cfg: &crate::config::AppConfig,
+    min_rows: usize,
+) -> Option<String> {
+    let kind = cfg.detect_provider_kind().ok()?;
+    let name = crate::model_catalogue::provider_kind_name(kind);
+    let cat = crate::model_catalogue::EffectiveCatalogue::load();
+    let mut rows = cat.list_models_for_provider(name);
+    rows.retain(|(_, e)| e.chat != Some(false));
+    if name == "openrouter" && cfg.openrouter_free_only {
+        rows.retain(|(_, e)| e.free == Some(true));
+    }
+    // Gateway routing is strictly metered: unpriced models 400 upstream.
+    if crate::providers::thclaws_gateway::hides_unpriced_models(cfg, name) {
+        rows.retain(|(_, e)| e.input_per_mtok.is_some() && e.output_per_mtok.is_some());
+    }
+    if kind.lists_from_endpoint() {
+        // Built from the live config (not `build_listing_provider`) so each
+        // kind keeps its own id prefix — `ollama-anthropic` in particular
+        // lists over the Anthropic surface, not `/api/tags`.
+        let provider = crate::repl::build_provider(cfg).ok()?;
+        let live = tokio::time::timeout(
+            std::time::Duration::from_millis(2000),
+            provider.list_models(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let meta: std::collections::HashMap<String, crate::model_catalogue::ModelEntry> =
+            rows.drain(..).collect();
+        rows = live
+            .into_iter()
+            .map(|m| {
+                let entry = meta.get(&m.id).cloned().unwrap_or_default();
+                (m.id, entry)
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+    }
+    if rows.len() < min_rows {
+        return None;
+    }
+    let model_rows: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(id, e)| {
+            serde_json::json!({
+                "id": crate::model_catalogue::canonical_model_id(name, id),
+                "context": e.context,
+                // dev-plan/57: the window may be the provider's blanket
+                // default rather than a published figure. The picker renders
+                // those as `200k?` — printing a floor as a specification is
+                // what #190 was.
+                "context_unverified": e.context_unverified(),
+                "max_output": e.max_output,
+                // Plan-10: surfaced for the OpenRouter "Free only" toggle in
+                // the Settings modal. Other providers leave this None.
+                "free": e.free,
+            })
+        })
+        .collect();
+    Some(
+        serde_json::json!({
+            "type": "model_picker_open",
+            "provider": name,
+            "current": cfg.model,
+            "models": model_rows,
+        })
+        .to_string(),
+    )
+}
+
 /// Build the cross-provider model-list payload the sidebar's inline
 /// model picker dropdown consumes. Catalogue rows for every known
 /// provider plus a live Ollama probe so models the user just
@@ -1373,20 +1552,52 @@ pub async fn build_all_models_payload() -> String {
     let cat = crate::model_catalogue::EffectiveCatalogue::load();
     let app_cfg = crate::config::AppConfig::load().unwrap_or_default();
     let free_only_or = app_cfg.openrouter_free_only;
-    let ollama_live: Vec<String> = {
-        let base = std::env::var("OLLAMA_BASE_URL")
-            .unwrap_or_else(|_| crate::providers::ollama::DEFAULT_BASE_URL.to_string());
-        let provider = crate::providers::ollama::OllamaProvider::new().with_base_url(base);
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(800),
-            provider.list_models(),
-        )
+    // Providers whose endpoint owns the list (`lists_from_endpoint`): ask
+    // each one directly instead of rendering catalogue rows it may no
+    // longer serve. Probed concurrently so the dropdown still opens in one
+    // timeout, not one per backend.
+    //
+    // Only Ollama is probed unconditionally (long-standing behaviour — it is
+    // the one backend users expect to "just be there"); the rest need a
+    // configured base URL, so we don't knock on localhost:1234/4000/8000/8080
+    // for every user who never set them up. OllamaAnthropic is left out: it
+    // shares Ollama's host but needs `ollama-anthropic/` ids, and it has no
+    // catalogue rows either, so it has never appeared in this picker.
+    const ENDPOINT_OWNED: &[ProviderKind] = &[
+        ProviderKind::Ollama,
+        ProviderKind::LMStudio,
+        ProviderKind::VLlm,
+        ProviderKind::LlamaCpp,
+        ProviderKind::LiteLlm,
+        ProviderKind::OpenAICompat,
+    ];
+    let probe_kinds: Vec<ProviderKind> = ENDPOINT_OWNED
+        .iter()
+        .copied()
+        .filter(|k| {
+            matches!(k, ProviderKind::Ollama)
+                || k.endpoint_env()
+                    .and_then(|v| std::env::var(v).ok())
+                    .is_some_and(|s| !s.trim().is_empty())
+        })
+        .collect();
+    let endpoint_live: std::collections::HashMap<ProviderKind, Vec<String>> =
+        futures::future::join_all(probe_kinds.into_iter().map(|k| async move {
+            let ms = if matches!(k, ProviderKind::Ollama) {
+                800
+            } else {
+                1500
+            };
+            (k, live_model_ids(k, ms).await)
+        }))
         .await
-        {
-            Ok(Ok(models)) => models.into_iter().map(|m| m.id).collect(),
-            _ => Vec::new(),
-        }
-    };
+        .into_iter()
+        .filter_map(|(k, ids)| ids.map(|ids| (k, ids)))
+        .collect();
+    let ollama_live: Vec<String> = endpoint_live
+        .get(&ProviderKind::Ollama)
+        .cloned()
+        .unwrap_or_default();
     let opencodego_live: Vec<String> = {
         let key = std::env::var("OPENCODE_GO_API_KEY").ok();
         match key {
@@ -1461,9 +1672,19 @@ pub async fn build_all_models_payload() -> String {
                 ),
             );
         }
-        if matches!(kind, ProviderKind::Ollama) {
-            for id in &ollama_live {
-                model_ids.entry(id.clone()).or_insert((None, false, false));
+        // The endpoint is authoritative: keep only what it reports, and let
+        // the catalogue contribute the context window for the ids that
+        // survive. A row cached from an earlier `/model` switch no longer
+        // resurrects a model the proxy has since dropped.
+        if let Some(live) = endpoint_live.get(kind) {
+            let catalogued = std::mem::take(&mut model_ids);
+            for id in live {
+                let canonical = crate::model_catalogue::canonical_model_id(name, id);
+                let meta = catalogued
+                    .get(&canonical)
+                    .copied()
+                    .unwrap_or((None, false, false));
+                model_ids.insert(canonical, meta);
             }
         }
         if matches!(kind, ProviderKind::OpenCodeGo) {
@@ -1530,6 +1751,14 @@ pub async fn build_all_models_payload() -> String {
 /// configured provider fails to build; this picks the preferred *paid*
 /// default when nothing is configured yet.
 pub fn preferred_default_model(cfg: &crate::config::AppConfig) -> Option<String> {
+    // On a DGX Spark appliance the box *is* the provider: AI Server's
+    // gateway is already running on loopback and needs no credentials, so it
+    // outranks any cloud tier below. Read-only — the probe happened once at
+    // startup (`aiserver::bootstrap`), and only when nothing had pinned
+    // `LITELLM_BASE_URL`, so this cannot override a configured provider.
+    if let Some(d) = crate::aiserver::cached() {
+        return Some(d.model_id());
+    }
     // Ordered (provider, model) preference: the first provider the user can
     // reach — own key OR a gateway route — picks the session default. Models
     // are pinned explicitly (not `kind.default_model()`) so the credential-
@@ -1946,6 +2175,199 @@ mod tests {
             ProviderKind::LlamaCpp.default_endpoint(),
             Some("http://localhost:8080/v1")
         );
+    }
+
+    /// The set of providers whose *endpoint* owns the model list. Getting
+    /// this wrong in either direction is a real bug: a missing kind keeps
+    /// showing models the box dropped, an extra one throws away a shipped
+    /// catalogue in favour of whatever a hosted API happens to enumerate.
+    #[test]
+    fn lists_from_endpoint_covers_user_pointed_backends() {
+        for k in [
+            ProviderKind::Ollama,
+            ProviderKind::OllamaAnthropic,
+            ProviderKind::LMStudio,
+            ProviderKind::VLlm,
+            ProviderKind::LlamaCpp,
+            ProviderKind::LiteLlm,
+            ProviderKind::OpenAICompat,
+        ] {
+            assert!(
+                k.lists_from_endpoint(),
+                "{} points at a user endpoint",
+                k.name()
+            );
+        }
+        for k in [
+            ProviderKind::Anthropic,
+            ProviderKind::OpenAI,
+            ProviderKind::OpenRouter,
+            ProviderKind::Gemini,
+            ProviderKind::DashScope,
+            // Hosted, and its live list is probed separately in the picker.
+            ProviderKind::OpenCodeGo,
+        ] {
+            assert!(
+                !k.lists_from_endpoint(),
+                "{} ships a catalogue — don't let a listing replace it",
+                k.name()
+            );
+        }
+    }
+
+    /// `build_listing_provider` must reach the configured box, and must
+    /// re-prefix ids so a copied row pastes straight into `/model`.
+    #[tokio::test]
+    async fn live_model_ids_prefixes_and_is_authoritative() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "qwen3.8-flash-next-udq2", "object": "model"},
+                    {"id": "auto", "object": "model"},
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let _guard = crate::kms::test_env_lock();
+        let saved = std::env::var("LITELLM_BASE_URL").ok();
+        std::env::set_var("LITELLM_BASE_URL", format!("{}/v1", server.uri()));
+        let ids = live_model_ids(ProviderKind::LiteLlm, 5000).await;
+        match saved {
+            Some(v) => std::env::set_var("LITELLM_BASE_URL", v),
+            None => std::env::remove_var("LITELLM_BASE_URL"),
+        }
+
+        let mut ids = ids.expect("endpoint reachable");
+        ids.sort();
+        assert_eq!(ids, vec!["litellm/auto", "litellm/qwen3.8-flash-next-udq2"]);
+    }
+
+    /// An unreachable endpoint must report "unknown" (`None`), never an
+    /// empty list — the callers keep their catalogue rows on `None` and
+    /// would otherwise render a provider as having no models at all.
+    #[tokio::test]
+    async fn live_model_ids_is_none_when_endpoint_is_down() {
+        let _guard = crate::kms::test_env_lock();
+        let saved = std::env::var("LITELLM_BASE_URL").ok();
+        // Reserved-for-documentation address: nothing listens, connect fails.
+        std::env::set_var("LITELLM_BASE_URL", "http://127.0.0.1:1/v1");
+        let ids = live_model_ids(ProviderKind::LiteLlm, 2000).await;
+        match saved {
+            Some(v) => std::env::set_var("LITELLM_BASE_URL", v),
+            None => std::env::remove_var("LITELLM_BASE_URL"),
+        }
+        assert!(
+            ids.is_none(),
+            "unreachable endpoint is 'unknown', not 'empty'"
+        );
+    }
+
+    /// The bug this whole change exists for: `/model litellm/x` caches a
+    /// probed context window under the `litellm` provider key, but the
+    /// endpoint is per-machine. Once the operator swapped models on the
+    /// proxy, that cached row kept advertising a model `GET /v1/models` no
+    /// longer returns — in `/models`, in the sidebar picker, everywhere.
+    #[tokio::test]
+    async fn picker_payload_drops_cached_models_the_endpoint_no_longer_serves() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "object": "list",
+                "data": [
+                    {"id": "qwen3.8-flash-next-udq2", "object": "model"},
+                    {"id": "auto", "object": "model"},
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let home = tempfile::tempdir().expect("tempdir");
+        let cat_dir = home.path().join("thclaws");
+        std::fs::create_dir_all(&cat_dir).expect("mkdir");
+        // A cache exactly like the one that shipped this report: `auto` is
+        // still served, `qwen38-ud-q2-mtp` is long gone, and both were
+        // written by `/model` probes against different base URLs.
+        std::fs::write(
+            cat_dir.join("model_catalogue.json"),
+            r#"{
+                "schema": 4,
+                "providers": {
+                    "litellm": {
+                        "models": {
+                            "litellm/auto": {"context": 262144, "source": "probe"},
+                            "litellm/qwen38-ud-q2-mtp": {"context": 262144, "source": "probe"}
+                        }
+                    }
+                },
+                "fallback": 128000
+            }"#,
+        )
+        .expect("write cache");
+
+        let _guard = crate::kms::test_env_lock();
+        let saved_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        let saved_base = std::env::var("LITELLM_BASE_URL").ok();
+        std::env::set_var("XDG_CONFIG_HOME", home.path());
+        std::env::set_var("LITELLM_BASE_URL", format!("{}/v1", server.uri()));
+
+        let mut cfg = crate::config::AppConfig::default();
+        cfg.model = "litellm/auto".to_string();
+        let payload = build_model_picker_payload(&cfg, 2).await;
+
+        match saved_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        match saved_base {
+            Some(v) => std::env::set_var("LITELLM_BASE_URL", v),
+            None => std::env::remove_var("LITELLM_BASE_URL"),
+        }
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&payload.expect("picker opens for a reachable proxy"))
+                .expect("valid json");
+        let mut ids: Vec<&str> = payload["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .map(|m| m["id"].as_str().expect("id"))
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            vec!["litellm/auto", "litellm/qwen3.8-flash-next-udq2"],
+            "the endpoint's list is the whole list"
+        );
+        // …and the cache is still useful for the ids that survived.
+        let auto = payload["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == "litellm/auto")
+            .expect("auto listed");
+        assert_eq!(
+            auto["context"].as_u64(),
+            Some(262144),
+            "a surviving id keeps its cached context window"
+        );
+    }
+
+    /// Hosted providers have no endpoint to ask.
+    #[test]
+    fn build_listing_provider_declines_hosted_kinds() {
+        assert!(build_listing_provider(ProviderKind::Anthropic).is_none());
+        assert!(build_listing_provider(ProviderKind::OpenRouter).is_none());
     }
 
     #[test]

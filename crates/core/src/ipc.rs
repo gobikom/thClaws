@@ -347,52 +347,17 @@ fn announce_key_stored(provider: &str, ok: bool, error: &str, storage: &str, ctx
                 "provider_ready": ready,
             });
             (ctx.dispatch)(broadcast.to_string());
-            let cat = crate::model_catalogue::EffectiveCatalogue::load();
-            let mut models = cat.list_models_for_provider(provider);
-            models.retain(|(_, e)| e.chat != Some(false));
-            if provider == "openrouter" && new_cfg.openrouter_free_only {
-                models.retain(|(_, e)| e.free == Some(true));
-            }
-            // Gateway routing is strictly metered: unpriced
-            // models 400 upstream, so don't offer them.
-            if crate::providers::thclaws_gateway::hides_unpriced_models(&new_cfg, provider) {
-                models.retain(|(_, e)| e.input_per_mtok.is_some() && e.output_per_mtok.is_some());
-            }
-            let runtime_loaded = matches!(
-                provider,
-                "ollama" | "ollama-anthropic" | "lmstudio" | "vllm" | "llamacpp" | "litellm"
-            );
-            if models.len() >= 3 && !runtime_loaded {
-                let _ = crate::providers::ProviderKind::detect(&new_cfg.model);
-                let model_rows: Vec<serde_json::Value> = models
-                    .iter()
-                    .map(|(id, e)| {
-                        let canonical = crate::model_catalogue::canonical_model_id(provider, id);
-                        serde_json::json!({
-                            "id": canonical,
-                            "context": e.context,
-                            // dev-plan/57: the window may be the provider's
-                            // blanket default rather than a published figure.
-                            // The picker renders those as `200k?` — printing
-                            // a floor as a specification is what #190 was.
-                            "context_unverified": e.context_unverified(),
-                            "max_output": e.max_output,
-                            // Plan-10: surfaced for the
-                            // OpenRouter "Free only" toggle
-                            // in the Settings modal. Other
-                            // providers leave this None.
-                            "free": e.free,
-                        })
-                    })
-                    .collect();
-                let picker = serde_json::json!({
-                    "type": "model_picker_open",
-                    "provider": provider,
-                    "current": new_cfg.model,
-                    "models": model_rows,
-                });
-                (ctx.dispatch)(picker.to_string());
-            }
+            // Off-thread: the builder lists an endpoint-owned provider
+            // (LiteLLM / Ollama / …) over the network, and `handle_ipc` is
+            // sync. Same shape as the `request_all_models` arm.
+            let dispatch = ctx.dispatch.clone();
+            tokio::spawn(async move {
+                if let Some(picker) =
+                    crate::providers::build_model_picker_payload(&new_cfg, 3).await
+                {
+                    dispatch(picker);
+                }
+            });
         } else {
             let provider_name = cfg.detect_provider().unwrap_or("unknown");
             let ready = crate::providers::provider_has_credentials(&cfg);
@@ -521,6 +486,20 @@ fn job_view_json(v: &crate::research::JobView) -> serde_json::Value {
 /// handled here is silently dropped (the WS-side dispatch surface IS
 /// `handle_ipc` — there's no fallback closure to delegate to).
 #[must_use = "callers must consult the returned bool to decide whether to fall through to a transport-specific dispatch"]
+/// Workspace-relative paths of the per-slide PNGs beside a rendered
+/// `deck.pdf`, for the Files tab's one-slide-at-a-time deck viewer.
+fn rel_slide_pngs(workspace: &std::path::Path, pdf: &std::path::Path) -> Vec<String> {
+    crate::tools::slide_render::slide_pngs(pdf)
+        .iter()
+        .map(|p| {
+            p.strip_prefix(workspace)
+                .unwrap_or(p.as_path())
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect()
+}
+
 pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
     let ty = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match ty {
@@ -6142,11 +6121,17 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                                     .unwrap_or(pdf.as_path())
                                     .to_string_lossy()
                                     .replace('\\', "/");
+                                // Per-slide PNGs go along so the pane
+                                // can page through the deck one slide
+                                // at a time; the PDF stays the
+                                // fallback when there are none.
+                                let slides = rel_slide_pngs(&workspace, &pdf);
                                 (ctx.dispatch)(
                                     serde_json::json!({
                                         "type": "file_content",
                                         "path": raw,
                                         "render_path": rel,
+                                        "slides": slides,
                                         "content": "",
                                         "mime": "application/pdf",
                                         "mode": mode_s,
@@ -6202,6 +6187,7 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                                         .unwrap_or(pdf.as_path())
                                         .to_string_lossy()
                                         .replace('\\', "/");
+                                    let slides = rel_slide_pngs(&workspace, &pdf);
                                     (dispatch2)(
                                         serde_json::json!({
                                             "type": "file_content",
@@ -6210,6 +6196,7 @@ pub fn handle_ipc(msg: Value, ctx: &IpcContext) -> bool {
                                             // like any other PDF — the
                                             // viewer is already there.
                                             "render_path": rel,
+                                            "slides": slides,
                                             "content": "",
                                             "mime": "application/pdf",
                                             "mode": mode_s,

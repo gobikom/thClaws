@@ -104,15 +104,11 @@ pub fn set_lead_team_dir(team_dir: &Path) {
     // argv, so a relative matcher value would never match → kill_my_teammates
     // orphans every teammate. Absolutize via current_dir() join when
     // canonicalize fails, mirroring the spawn path (team.rs ~1386).
-    let abs = team_dir
-        .canonicalize()
-        .unwrap_or_else(|_| {
-            std::env::current_dir()
-                .map(|c| c.join(team_dir))
-                .unwrap_or_else(|_| team_dir.to_path_buf())
-        })
-        .to_string_lossy()
-        .into_owned();
+    // Must produce the SAME string the spawn path bakes into the child
+    // argv — `kill_my_teammates` matches on it. Windows canonicalize
+    // returns a verbatim `\\?\` path; both sites go through one helper so
+    // they can never disagree.
+    let abs = crate::util::absolutize_for_child(team_dir);
     if let Ok(mut g) = lead_team_dir_slot().lock() {
         *g = Some(abs);
     }
@@ -1062,6 +1058,38 @@ fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Render the teammate launch as a POSIX shell string — `cd <dir> && VAR=…
+/// <bin> <args…>`. Only tmux needs this: `tmux split-window` takes a
+/// command STRING, not an argv, so there is no way to hand it structured
+/// arguments. The background path spawns `bin` directly instead (no shell,
+/// nothing to quote) — see [`TeamTools::spawn_teammate`].
+///
+/// tmux does not exist on Windows, so this stays POSIX-only by
+/// construction; that is what makes single-quote escaping safe here.
+fn spawn_shell_string(
+    bin: &str,
+    args: &[String],
+    envs: &[(String, String)],
+    cwd: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    if let Some(dir) = cwd {
+        // Escape the cwd so spaces / quotes in macOS user dirs don't break
+        // the cd. Unescaped, `cd /Users/Some One/proj && …` splits into
+        // `cd /Users/Some` (wrong dir) + `One/proj` (404).
+        out.push_str(&format!("cd {} && ", shell_escape(dir)));
+    }
+    for (k, v) in envs {
+        out.push_str(&format!("{k}={} ", shell_escape(v)));
+    }
+    out.push_str(&shell_escape(bin));
+    for a in args {
+        out.push(' ');
+        out.push_str(&shell_escape(a));
+    }
+    out
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1072,6 +1100,13 @@ fn now_secs() -> u64 {
 // ── tmux integration ────────────────────────────────────────────────
 
 pub fn has_tmux() -> bool {
+    // The tmux launch is a POSIX shell string by construction
+    // (`spawn_shell_string`). A tmux.exe from MSYS2/Cygwin on PATH would
+    // hand that string to whichever shell it finds — Windows always takes
+    // the direct-spawn path instead.
+    if cfg!(windows) {
+        return false;
+    }
     std::process::Command::new("tmux")
         .arg("-V")
         .output()
@@ -1615,33 +1650,31 @@ impl Tool for SpawnTeammateTool {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| "thclaws".to_string());
         // Use absolute path so teammates with different cwd still find the team dir.
-        let team_dir = self
-            .mailbox
-            .team_dir
-            .canonicalize()
-            .unwrap_or_else(|_| {
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(&self.mailbox.team_dir)
-            })
-            .to_string_lossy()
-            .to_string();
+        let team_dir = crate::util::absolutize_for_child(&self.mailbox.team_dir);
         let needs_cli = bin.ends_with("/thclaws") || bin.ends_with("\\thclaws");
-        let cli_flag = if needs_cli { " --cli" } else { "" };
 
-        // M6.34 TEAM2: shell-escape every interpolated value. `name` is
-        // already restricted to [A-Za-z0-9_-] by TEAM1, but escape it
-        // anyway for consistency. `bin` is from std::env::current_exe and
-        // could legally contain spaces (macOS app bundle paths) — must
-        // escape. `team_dir` is the canonicalized absolute path which
-        // routinely contains spaces (macOS user dirs).
-        let mut agent_cmd = format!(
-            "{}{} --team-agent {} --team-dir {} --permission-mode auto --accept-all",
-            shell_escape(&bin),
-            cli_flag,
-            shell_escape(name),
-            shell_escape(&team_dir),
-        );
+        // Argv as data, not as a shell string. `bin` (from current_exe)
+        // and `team_dir` routinely contain spaces — macOS app bundles,
+        // `C:\Program Files\thClaws\bin\thclaws.exe` — and quoting them
+        // correctly for both /bin/sh and cmd.exe is not possible in one
+        // string. Only the tmux path renders these back into a shell
+        // string, where `shell_escape` is safe (tmux is POSIX-only).
+        //
+        // `--cli` is redundant (`--team-agent` already forces CLI mode in
+        // app.rs) but kept so the spawn line stays self-explanatory.
+        let mut args: Vec<String> = Vec::new();
+        if needs_cli {
+            args.push("--cli".to_string());
+        }
+        args.extend([
+            "--team-agent".to_string(),
+            name.to_string(),
+            "--team-dir".to_string(),
+            team_dir.clone(),
+            "--permission-mode".to_string(),
+            "auto".to_string(),
+            "--accept-all".to_string(),
+        ]);
 
         // Model override resolution — precedence:
         //   1. SpawnTeammate input `model:` (per-spawn explicit choice,
@@ -1649,7 +1682,8 @@ impl Tool for SpawnTeammateTool {
         //   2. Agent def `model:` frontmatter from .thclaws/agents/<name>.md
         //   3. Lead session config default (no flag)
         if let Some(ref m) = runtime_model {
-            agent_cmd.push_str(&format!(" --model {}", shell_escape(m)));
+            args.push("--model".to_string());
+            args.push(m.clone());
         } else if let Some(def) = agent_def {
             if let Some(ref model) = def.model {
                 if model.contains('-') {
@@ -1657,7 +1691,8 @@ impl Tool for SpawnTeammateTool {
                     // can legally contain `/` (e.g.
                     // `anthropic/claude-sonnet-4-6`); future model ids
                     // could carry other shell-significant chars.
-                    agent_cmd.push_str(&format!(" --model {}", shell_escape(model)));
+                    args.push("--model".to_string());
+                    args.push(model.clone());
                 } else {
                     // Short alias — resolve provider-aware.
                     let current_provider = crate::config::AppConfig::load()
@@ -1672,8 +1707,8 @@ impl Tool for SpawnTeammateTool {
                                     "\x1b[33m[team] resolved agent def alias '{model}' → '{resolved}' (provider: {})\x1b[0m",
                                     provider.name()
                                 );
-                                agent_cmd
-                                    .push_str(&format!(" --model {}", shell_escape(&resolved)));
+                                args.push("--model".to_string());
+                                args.push(resolved.clone());
                             }
                             None => {
                                 eprintln!(
@@ -1809,46 +1844,49 @@ impl Tool for SpawnTeammateTool {
         // shell cwd the lead happened to have. Without this, a teammate like
         // qa (isolation: null) could drift into .worktrees/<other>/ via a
         // single Bash `cd` and start writing files on the wrong branch.
-        let project_root_str = std::env::current_dir()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
+        // Stripped of any `\\?\` prefix for the same reason as team_dir: a
+        // workspace switch can leave the process cwd verbatim on Windows,
+        // and it would otherwise leak into the child's cwd and
+        // THCLAWS_PROJECT_ROOT.
+        let project_root_str = crate::util::strip_verbatim_prefix(
+            &std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy(),
+        );
         let effective_cwd = worktree_path
             .clone()
             .or_else(|| cwd.map(String::from))
             .or_else(|| member.as_ref().and_then(|m| m.cwd.clone()))
-            .or_else(|| Some(project_root_str.clone()));
-        // Expose the original project root so teammates in worktrees know where to
-        // write shared docs / artifacts that other teammates should see.
-        // M6.34 TEAM2: replace inline `replace('\'', "'\\''")` with the
-        // shared `shell_escape` helper for consistency.
-        agent_cmd = format!(
-            "THCLAWS_PROJECT_ROOT={} {}",
-            shell_escape(&project_root_str),
-            agent_cmd
-        );
-        // Stub out interactive editors. Even though BashTool redirects stdin
-        // to /dev/null, programs like vi/nano/vim open /dev/tty directly to
-        // find a terminal — and a teammate running inside a tmux pane has
-        // a real tty available, so vi finds it and waits forever for human
-        // input. Setting EDITOR/GIT_EDITOR/VISUAL to `true` makes any
-        // attempted editor invocation a no-op exit-0, so e.g.
-        // `git commit -e` falls back to the message it already has and
-        // the agent's bash call returns instead of hanging the team.
-        agent_cmd = format!(
-            "EDITOR=true VISUAL=true GIT_EDITOR=true GIT_SEQUENCE_EDITOR=true {}",
-            agent_cmd
-        );
+            .or_else(|| Some(project_root_str.clone()))
+            .map(|d| crate::util::strip_verbatim_prefix(&d));
+        // Child environment. Kept as data (not a `VAR=value …` string
+        // prefix) because that prefix form is POSIX-only — cmd.exe has no
+        // equivalent, which is half of why Windows spawns never launched
+        // (#200). `spawn_shell_string` re-adds the prefix for tmux.
+        //
+        // THCLAWS_PROJECT_ROOT exposes the original project root so
+        // teammates in worktrees know where to write shared docs /
+        // artifacts that other teammates should see.
+        //
+        // EDITOR/VISUAL/GIT_EDITOR stub out interactive editors. Even
+        // though BashTool redirects stdin to /dev/null, programs like
+        // vi/nano/vim open /dev/tty directly to find a terminal — and a
+        // teammate running inside a tmux pane has a real tty available, so
+        // vi finds it and waits forever for human input. Pointing them at
+        // `true` makes any attempted editor invocation a no-op exit-0, so
+        // e.g. `git commit -e` falls back to the message it already has
+        // and the agent's bash call returns instead of hanging the team.
+        let mut envs: Vec<(String, String)> = vec![
+            ("THCLAWS_PROJECT_ROOT".to_string(), project_root_str.clone()),
+            ("EDITOR".to_string(), "true".to_string()),
+            ("VISUAL".to_string(), "true".to_string()),
+            ("GIT_EDITOR".to_string(), "true".to_string()),
+            ("GIT_SEQUENCE_EDITOR".to_string(), "true".to_string()),
+        ];
         if worktree_path.is_some() {
-            agent_cmd = format!("THCLAWS_IN_WORKTREE=1 {}", agent_cmd);
+            envs.push(("THCLAWS_IN_WORKTREE".to_string(), "1".to_string()));
         }
-        if let Some(ref dir) = effective_cwd {
-            // M6.34 TEAM2: shell-escape the cwd path so spaces /
-            // quotes in macOS user dirs don't break the cd. Pre-fix
-            // `cd /Users/Some One/proj && ...` would split into
-            // `cd /Users/Some` (wrong dir) + `One/proj` (404).
-            agent_cmd = format!("cd {} && {}", shell_escape(dir), agent_cmd);
-        }
+        let agent_cmd = spawn_shell_string(&bin, &args, &envs, effective_cwd.as_deref());
 
         // Update config: mark member active.
         if let Some(mut cfg) = config {
@@ -1865,9 +1903,9 @@ impl Tool for SpawnTeammateTool {
         let spawn_t = now_secs();
 
         // Spawn via tmux or background.
-        eprintln!("\x1b[33m[team] spawn cmd: {}\x1b[0m", agent_cmd);
         let mut bg_child: Option<std::process::Child> = None;
         let spawn_desc = if has_tmux() {
+            eprintln!("\x1b[33m[team] spawn cmd (tmux): {}\x1b[0m", agent_cmd);
             if is_inside_tmux() {
                 let st = std::process::Command::new("tmux")
                     .args(["split-window", "-h", "-d"])
@@ -1926,7 +1964,29 @@ impl Tool for SpawnTeammateTool {
             let log_err = log_file
                 .try_clone()
                 .map_err(|e| Error::Tool(format!("clone log: {e}")))?;
-            let child = crate::util::shell_command_sync(&agent_cmd)
+            // Spawn the binary DIRECTLY — no shell. A shell string would
+            // have to be quoted, and no quoting works on both /bin/sh and
+            // cmd.exe: POSIX `'…'` is literal text to cmd.exe, and the
+            // `VAR=value cmd` env prefix has no cmd.exe equivalent at all.
+            // That is why every Windows spawn failed with "The filename,
+            // directory name, or volume label syntax is incorrect" (#200).
+            // Log the real argv, not the tmux shell string — on Windows
+            // the two differ, and the reporter of #200 reads these lines.
+            eprintln!(
+                "\x1b[33m[team] spawn (direct, no shell): {} {} (cwd: {})\x1b[0m",
+                bin,
+                args.join(" "),
+                effective_cwd.as_deref().unwrap_or("<inherit>")
+            );
+            let mut cmd = crate::util::direct_command(&bin);
+            cmd.args(&args);
+            for (k, v) in &envs {
+                cmd.env(k, v);
+            }
+            if let Some(ref dir) = effective_cwd {
+                cmd.current_dir(dir);
+            }
+            let child = cmd
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(log_file))
                 .stderr(std::process::Stdio::from(log_err))
@@ -1941,7 +2001,13 @@ impl Tool for SpawnTeammateTool {
         // (usually <1s — the loop writes "idle" before its first turn, so
         // model latency doesn't matter). On a background process that exits
         // immediately, surface the failure with the output.log tail.
-        const BOOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+        // Windows gets a longer grace period: process creation is slower,
+        // and a healthy boot still has to bring up the scheduler, bind the
+        // api_v1 loopback port and scan session metadata before the poll
+        // loop writes its first status. 8s was tight enough there to
+        // report a live teammate as dead (#200).
+        const BOOT_TIMEOUT: std::time::Duration =
+            std::time::Duration::from_secs(if cfg!(windows) { 25 } else { 8 });
         let deadline = std::time::Instant::now() + BOOT_TIMEOUT;
         loop {
             if let Some(st) = self.mailbox.read_status(name) {
@@ -2802,6 +2868,41 @@ mod tests {
     /// M6.34 TEAM2: shell-escape helper pins POSIX single-quote
     /// behavior. Critical paths are values that make it into
     /// SpawnTeammate's agent_cmd shell string.
+    /// The tmux path is the only one that still needs a shell string, and
+    /// tmux is POSIX-only — so every interpolated value must be escaped
+    /// there, including paths with spaces.
+    #[test]
+    fn spawn_shell_string_escapes_bin_args_env_and_cwd() {
+        let got = spawn_shell_string(
+            "/Applications/My App/thclaws",
+            &[
+                "--cli".to_string(),
+                "--team-agent".to_string(),
+                "qa".to_string(),
+                "--team-dir".to_string(),
+                "/Users/Some One/proj/.thclaws/team".to_string(),
+            ],
+            &[(
+                "THCLAWS_PROJECT_ROOT".to_string(),
+                "/Users/Some One/proj".to_string(),
+            )],
+            Some("/Users/Some One/proj"),
+        );
+        assert_eq!(
+            got,
+            "cd '/Users/Some One/proj' && THCLAWS_PROJECT_ROOT='/Users/Some One/proj' \
+'/Applications/My App/thclaws' '--cli' '--team-agent' 'qa' '--team-dir' \
+'/Users/Some One/proj/.thclaws/team'"
+        );
+    }
+
+    #[test]
+    fn spawn_shell_string_omits_the_cd_when_there_is_no_cwd() {
+        let got = spawn_shell_string("thclaws", &["--cli".to_string()], &[], None);
+        assert_eq!(got, "'thclaws' '--cli'");
+        assert!(!got.contains("cd "));
+    }
+
     #[test]
     fn shell_escape_wraps_in_single_quotes() {
         assert_eq!(shell_escape("simple"), "'simple'");

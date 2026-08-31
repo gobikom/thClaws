@@ -110,7 +110,14 @@ fn walk_document_xml(xml: &str) -> Result<String> {
             Event::Empty(e) => match e.local_name().as_ref() {
                 b"pStyle" if in_ppr => {
                     if let Ok(Some(val)) = e.try_get_attribute("w:val") {
-                        let v = val.decode_and_unescape_value(decoder).unwrap_or_default();
+                        // OOXML is XML 1.0 and carries no version declaration
+                        // inside the part, which is exactly `Implicit1_0`.
+                        let v = val
+                            .decoded_and_normalized_value(
+                                quick_xml::XmlVersion::Implicit1_0,
+                                decoder,
+                            )
+                            .unwrap_or_default();
                         // OOXML built-in heading styles: "Heading1", "Heading2", ...
                         // Tolerate lowercase and "heading 1" (some authors).
                         let norm = v.to_lowercase().replace(' ', "");

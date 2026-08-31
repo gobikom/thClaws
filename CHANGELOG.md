@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.118.0] — 2026-08-29
+
+Teammates launch reliably on Windows, user-pointed providers own their model lists, and the model catalogue gets its pre-release refresh.
+
+### Changed
+- **The model catalogue is refreshed ahead of the release.** Pricing and context data are refreshed from the providers, and the online Appendix A is regenerated to match.
+
+### Fixed
+- **Teammates now spawn without a shell.** Argv, env and cwd go straight to the process, so there is nothing for `cmd.exe` to mis-quote — `SpawnTeammate` works on Windows without the `THCLAWS_SHELL` workaround. (#200)
+- **Team directories on Windows drop the verbatim UNC prefix.** The `\\?\` prefix Rust's `canonicalize()` adds is stripped from the team-dir (and `\\?\UNC\` paths stay UNC), so teammates can actually write their status and inbox files. (#200, #201 — thanks @torandben)
+- **User-pointed providers now own their model list.** For a custom endpoint the endpoint, not a fixed list, defines which models are offered.
+
+## [0.117.0] — 2026-08-29
+
+A one-slide-at-a-time PPTX preview lands, the model catalogue gets corrected context windows and pricing, and Qwen-Image 3.x stops rendering smaller images.
+
+### Added
+- **PPTX previews now page one slide at a time.** A `.pptx` preview steps through the deck with ←/→ instead of showing every slide in one long scroll; the rendered PDF stays one click away.
+
+### Changed
+- **The model catalogue is refreshed with current provider pricing.** Qwen3.8-Flash is priced and the catalogue is refreshed from the provider APIs.
+
+### Fixed
+- **Model context windows are sourced from the providers.** The windows for 47 models are pulled from the providers, stale guesses are raised, and the Qwen3.8 and GLM-5.3 values now use their real sizes instead of the provider floor.
+- **The Z.ai GLM-5.3 entry no longer inherits GLM-5's price.** The mis-inherited catalogue price is corrected.
+- **Qwen-Image 3.x no longer renders smaller images.** The size table that shrank images for free is removed.
+
+## [0.116.0] — 2026-08-25
+
+Qwen-Image 3.0 joins the media models, a co-located AI Server is auto-detected and used as the LLM gateway, and the LTX API key moves into the Settings modal. A round of OpenAI-compat, Windows file-link and Task fan-out fixes lands alongside.
+
+### Added
+- **Qwen-Image 3.0 and Qwen-Image 3.0 Pro join the media models.** The two new DashScope image models land in the catalogue alongside LTX 2.3 and LTX 2.5.
+- **A co-located AI Server is auto-detected and used as the LLM gateway.** When an AI Server sits alongside thClaws, it is found automatically and the LLM is routed through its gateway.
+- **The LTX API key is now settable in the Settings modal.** LTX can be configured from Settings alongside the other media providers.
+
+### Changed
+- **The model catalogue is refreshed with current provider pricing.** The four previously unpriced DashScope models now carry prices, and the catalogue is refreshed from the provider APIs.
+
+### Fixed
+- **Linked files render on Windows.** Path comparison is now separator-agnostic, so linked files render correctly on Windows.
+- **OpenAI-compat context-window handling follows the server and retries.** The local clamp is sized from the server, requests refused as over-context are resized and retried, and thinking is no longer forced off.
+- **OpenAI-compat answers are no longer stranded in the thinking channel.** Assembly now delivers them instead of leaving them stuck in the thinking channel.
+- **Task calls now fan out concurrently.** The prompt lets the model issue parallel Task calls instead of running them one at a time.
+
 ## [0.115.0] — 2026-08-20
 
 LTX 2.5 joins the media models, third-party agent prompts import as native thClaws packages, and LiteLLM becomes a first-class self-hosted provider. A new FolderIndex tool and a round of shell, markdown-preview and OpenAI fixes land alongside.

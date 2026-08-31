@@ -26,6 +26,7 @@ import { useTheme } from "../hooks/useTheme";
 import { MarkdownEditor } from "./MarkdownEditor";
 import { CodeEditor } from "./CodeEditor";
 import { EpubViewer } from "./EpubViewer";
+import { SlideDeckViewer } from "./SlideDeckViewer";
 
 // Target languages for the Files-tab "Translate" action. `code` becomes the
 // `<stem>-<code>.md` filename suffix; `label` is what the combobox shows.
@@ -276,6 +277,15 @@ function resolveWorkspaceLink(
   return { path, isDir };
 }
 
+// Windows: the IPC backend echoes the requested path back with `\`
+// separators, while a markdown link resolves to the same file with `/`
+// (see resolveLink / injectBaseHref above). Compare a separator-normalized
+// form so a valid response is not mistaken for a stale one. Reported as
+// issue #197 — clicking a linked file showed nothing at all.
+function samePath(a: string, b: string): boolean {
+  return a.replace(/\\/g, "/") === b.replace(/\\/g, "/");
+}
+
 function injectBaseHref(html: string, filePath: string): string {
   const normalized = filePath.replace(/\\/g, "/");
   const lastSlash = normalized.lastIndexOf("/");
@@ -366,6 +376,10 @@ export function FilesView({ active }: Props) {
     /// slide-render service. The viewer mounts THIS path; `path`
     /// stays the file the user actually opened.
     renderPath?: string;
+    /// Per-slide PNGs of a rendered deck, in order. Present ⇒ the pane
+    /// pages through the deck one slide at a time instead of dropping
+    /// the whole PDF into a scrolling iframe.
+    slides?: string[];
   } | null>(null);
 
   // Bumped on every Refresh click; used as part of iframe `key` props so
@@ -378,6 +392,10 @@ export function FilesView({ active }: Props) {
   // the slide-render service). Cleared when its file_content lands.
   // Without this the tab looks frozen for the ~13s a cold render takes.
   const [renderPending, setRenderPending] = useState<string | null>(null);
+  // A rendered deck previews one slide at a time; this flips that pane
+  // to the PDF iframe instead (scrolling, text selection, print).
+  // Per-file — reopening a deck starts back on the slides.
+  const [deckAsPdf, setDeckAsPdf] = useState(false);
 
   const [mode, setMode] = useState<ViewMode>("preview");
   // Source-text kept separate from preview.content because the preview
@@ -441,7 +459,10 @@ export function FilesView({ active }: Props) {
         }
         // Late response for a file the pane has already navigated away
         // from — drop it instead of letting it overwrite the current one.
-        if (requestedPathRef.current && incomingPath !== requestedPathRef.current) {
+        if (
+          requestedPathRef.current &&
+          !samePath(incomingPath, requestedPathRef.current)
+        ) {
           return;
         }
         const incomingReadMode: ReadMode =
@@ -452,6 +473,9 @@ export function FilesView({ active }: Props) {
           mime: msg.mime as string,
           readMode: incomingReadMode,
           renderPath: (msg.render_path as string) || undefined,
+          slides: Array.isArray(msg.slides)
+            ? (msg.slides as string[])
+            : undefined,
         });
         setRenderPending(null);
         if (incomingReadMode === "source") {
@@ -1287,6 +1311,11 @@ export function FilesView({ active }: Props) {
     return () => window.removeEventListener("beforeunload", handler);
   }, [editorDirty]);
 
+  const previewPath = preview?.path;
+  useEffect(() => {
+    setDeckAsPdf(false);
+  }, [previewPath]);
+
   const isHtml = preview?.mime === "text/html";
   const isImage = preview?.mime.startsWith("image/");
   const isPdf = preview?.mime === "application/pdf";
@@ -1607,19 +1636,50 @@ export function FilesView({ active }: Props) {
                 />
               </div>
             ) : isPdf ? (
-              // Stream off /file-asset/ like audio/video — Chrome
-              // refuses to run its PDF viewer inside a data: iframe
-              // (opaque origin ⇒ implicitly sandboxed; the viewer's
-              // internal about:srcdoc frame logs "Blocked script
-              // execution… 'allow-scripts'"), and a book PDF would
-              // round-trip 5MB+ of base64 through the WS anyway.
-              <iframe
-                key={`pdf-${preview.renderPath ?? preview.path}-${previewVersion}`}
-                src={assetUrl(preview.renderPath ?? preview.path)}
-                className="w-full flex-1 min-h-0 rounded border"
-                style={{ borderColor: "var(--border)", background: "#fff" }}
-                title={preview.path}
-              />
+              preview.slides && preview.slides.length > 0 && !deckAsPdf ? (
+                // A converted `.pptx`: page through the per-slide PNGs
+                // the render already produced. The PDF viewer would
+                // show the same deck as one continuous scroll, which
+                // reads like an export, not a presentation.
+                <SlideDeckViewer
+                  key={`deck-${preview.path}-${previewVersion}`}
+                  slides={preview.slides}
+                  version={previewVersion}
+                  label={preview.path.split("/").pop()}
+                  onShowPdf={() => setDeckAsPdf(true)}
+                />
+              ) : (
+                // Stream off /file-asset/ like audio/video — Chrome
+                // refuses to run its PDF viewer inside a data: iframe
+                // (opaque origin ⇒ implicitly sandboxed; the viewer's
+                // internal about:srcdoc frame logs "Blocked script
+                // execution… 'allow-scripts'"), and a book PDF would
+                // round-trip 5MB+ of base64 through the WS anyway.
+                <div className="flex-1 min-h-0 flex flex-col">
+                  <iframe
+                    key={`pdf-${preview.renderPath ?? preview.path}-${previewVersion}`}
+                    src={assetUrl(preview.renderPath ?? preview.path)}
+                    className="w-full flex-1 min-h-0 rounded border"
+                    style={{
+                      borderColor: "var(--border)",
+                      background: "#fff",
+                    }}
+                    title={preview.path}
+                  />
+                  {preview.slides && preview.slides.length > 0 && (
+                    <div className="flex items-center justify-end px-2 py-1 shrink-0">
+                      <button
+                        onClick={() => setDeckAsPdf(false)}
+                        className="px-2 py-0.5 rounded text-[11px] font-mono hover:bg-white/10"
+                        style={{ color: "var(--text-secondary)" }}
+                        title="Back to one slide at a time"
+                      >
+                        ‹ Slides
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )
             ) : isEpub ? (
               // EPUB renders via epub.js (see EpubViewer): it fetches
               // the bytes off /file-asset and unzips client-side, since
